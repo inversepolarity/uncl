@@ -1,3 +1,11 @@
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+
+pub const TOGGLE_HOTKEY: HotKey = HotKey {
+    id: 1,
+    key: Code::Space,
+    mods: Modifiers::ALT,
+};
+
 #[derive(Copy, Clone, Debug)]
 pub enum ResizeDirection {
     TopLeft,

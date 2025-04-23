@@ -14,6 +14,11 @@ use input::mouse::handle_mouse;
 
 use ui::overlay::Overlay;
 
+use crate::constants::*;
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+use std::sync::mpsc;
+use std::thread;
+
 pub fn run() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -22,7 +27,20 @@ pub fn run() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut overlay = Overlay::new();
+    let (tx, rx): (mpsc::Sender<()>, mpsc::Receiver<()>) = mpsc::channel();
+    let manager = GlobalHotKeyManager::new().expect("Failed to create hotkey manager");
 
+    manager
+        .register(TOGGLE_HOTKEY)
+        .expect("Failed to register hotkey");
+
+    thread::spawn(move || {
+        for event in GlobalHotKeyEvent::receiver() {
+            if event.id == TOGGLE_HOTKEY.id {
+                let _ = tx.send(());
+            }
+        }
+    });
     loop {
         let (term_width, term_height) = crossterm::terminal::size()?;
 

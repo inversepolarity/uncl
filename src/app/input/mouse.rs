@@ -34,7 +34,7 @@ pub fn handle_mouse(overlay: &mut Overlay, m: MouseEvent, bounds: (u16, u16)) {
 
         MouseEventKind::Drag(MouseButton::Left) => {
             if overlay.resizing {
-                if let Some(direction) = overlay.resize_direction {
+                if let Some(direction) = &overlay.resize_direction {
                     let rect = overlay.rect;
                     let (new_x, new_y, new_width, new_height) = match direction {
                         ResizeDirection::TopLeft => {

@@ -1,5 +1,10 @@
 mod app;
 mod constants;
-fn main() -> std::io::Result<()> {
-    app::run()
+use anyhow::Result;
+use tokio;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    app::run().await.unwrap();
+    Ok(())
 }

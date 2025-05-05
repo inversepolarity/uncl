@@ -15,8 +15,6 @@ pub async fn handle_keyboard_input(
     let height = overlay.rect.height;
 
     match key_event.code {
-        KeyCode::Char('q') => return true,
-
         KeyCode::Char(input) => sender
             .send(Bytes::from(input.to_string().into_bytes()))
             .await

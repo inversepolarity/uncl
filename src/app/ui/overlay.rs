@@ -1,34 +1,34 @@
 use anyhow::Result;
+
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
     layout::Rect,
     prelude::CrosstermBackend,
-    style::{Color, Style},
-    widgets::{Block, Borders, block::Position},
+    style::{Color, Style, Stylize},
+    widgets::{Block, Borders, Clear, block::Position},
 };
 
 use bytes::Bytes;
-use crossterm::event::{self, Event};
 
 use std::{
-    io::{BufWriter, Read, Write},
+    io::{self, BufWriter, Read, Write},
     sync::{Arc, RwLock},
 };
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     style::ResetColor,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+
 use tokio::{
     sync::mpsc::{Sender, channel},
     task::{self},
 };
 
-use std::io;
 use tui_term::widget::PseudoTerminal;
 use vt100::Screen;
 
@@ -101,11 +101,37 @@ impl Overlay {
         let cwd = std::env::current_dir().unwrap();
         cmd.cwd(cwd);
 
-        //Spawn the shell in pty
+        // Create channels for PTY status
+        let (tx, mut rx) = channel::<Bytes>(32);
+        let (pty_status_tx, mut pty_status_rx) = channel::<bool>(1);
+
+        // Clone the status sender for the child process monitoring
+        let child_status_tx = pty_status_tx.clone();
+
+        //Spawn the shell in pty and monitor for exit
         task::spawn_blocking(move || {
-            let mut child = slave.spawn_command(cmd).unwrap();
-            let _child_exit_status = child.wait().unwrap();
+            let mut child = match slave.spawn_command(cmd) {
+                Ok(child) => child,
+                Err(e) => {
+                    eprintln!("Failed to spawn command: {}", e);
+                    // Signal that the PTY process failed to start
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async {
+                        let _ = child_status_tx.send(true).await;
+                    });
+                    return;
+                }
+            };
+
+            // Wait for the child process to exit
+            let _exit_status = child.wait().unwrap();
             drop(slave);
+
+            // Signal that the PTY process has exited
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let _ = child_status_tx.send(true).await;
+            });
         });
 
         let mut writer = BufWriter::new(master.take_writer().unwrap());
@@ -117,21 +143,41 @@ impl Overlay {
             0,
         )));
 
+        // Clone status sender for the reader task
+        let reader_status_tx = pty_status_tx.clone();
+
         {
             let parser = parser.clone();
             task::spawn_blocking(move || {
                 let mut buf = [0u8; 8192];
                 let mut processed_buf = Vec::new();
                 loop {
-                    let size = reader.read(&mut buf).unwrap();
-                    if size == 0 {
-                        break;
-                    }
+                    // Handle read errors or EOF
+                    let size = match reader.read(&mut buf) {
+                        Ok(0) => {
+                            // EOF detected - terminal process ended
+                            let rt = tokio::runtime::Handle::current();
+                            rt.block_on(async {
+                                let _ = reader_status_tx.send(true).await;
+                            });
+                            break;
+                        }
+                        Ok(size) => size,
+                        Err(e) => {
+                            eprintln!("Read error: {}", e);
+                            // Signal error
+                            let rt = tokio::runtime::Handle::current();
+                            rt.block_on(async {
+                                let _ = reader_status_tx.send(true).await;
+                            });
+                            break;
+                        }
+                    };
+
                     if size > 0 {
                         processed_buf.extend_from_slice(&buf[..size]);
                         let mut parser = parser.write().unwrap();
                         parser.process(&processed_buf);
-
                         // Clear the processed portion of the buffer
                         processed_buf.clear();
                     }
@@ -139,33 +185,39 @@ impl Overlay {
             });
         }
 
+        // Set up terminal
         let mut stdout = io::stdout();
         execute!(stdout, ResetColor)?;
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let (tx, mut rx) = channel::<Bytes>(32);
-        // Drop writer on purpose
+        // Handle writing to PTY with error detection
         tokio::spawn(async move {
             while let Some(bytes) = rx.recv().await {
-                writer.write_all(&bytes).unwrap();
-                writer.flush().unwrap();
+                if let Err(e) = writer.write_all(&bytes) {
+                    eprintln!("Write error: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush() {
+                    eprintln!("Flush error: {}", e);
+                    break;
+                }
             }
+            // Clean up resources
+            drop(writer);
             drop(master);
         });
 
-        self.run(&mut terminal, parser, tx).await?;
+        // Run the terminal UI with PTY status monitoring
+        self.run(&mut terminal, parser, tx, &mut pty_status_rx)
+            .await?;
 
-        // restore terminal
+        // Restore terminal state
         disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
+        execute!(std::io::stdout(), DisableMouseCapture)?;
         terminal.show_cursor()?;
         Ok(())
     }
@@ -179,13 +231,16 @@ impl Overlay {
         terminal: &mut Terminal<B>,
         parser: Arc<RwLock<vt100::Parser>>,
         sender: Sender<Bytes>,
+        pty_status_rx: &mut tokio::sync::mpsc::Receiver<bool>,
     ) -> Result<()> {
         loop {
-            let (term_width, term_height) = crossterm::terminal::size()?;
-
+            // Draw the terminal UI
             terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
 
-            if event::poll(std::time::Duration::from_millis(100))? {
+            // Poll for terminal events with a short timeout
+            if event::poll(std::time::Duration::from_millis(50))? {
+                let (term_width, term_height) = crossterm::terminal::size()?;
+
                 match event::read()? {
                     Event::Key(key_event) => {
                         if handle_keyboard_input(
@@ -195,7 +250,10 @@ impl Overlay {
                             (term_width, term_height),
                         )
                         .await
-                        {}
+                        {
+                            // User pressed 'q' - exit
+                            break;
+                        }
                     }
                     Event::Mouse(m) => handle_mouse(self, m, (term_width, term_height)),
                     Event::FocusGained => {}
@@ -206,21 +264,34 @@ impl Overlay {
                     }
                 };
             }
+
+            // Check if the PTY process has ended (non-blocking)
+            if let Ok(true) = pty_status_rx.try_recv() {
+                // PTY process has ended, exit the loop
+                break;
+            }
+
+            // Small sleep to prevent CPU spinning
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+
+        Ok(())
     }
 
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
+        // Create the terminal block with borders
         let block = Block::default()
             .borders(Borders::ALL)
-            .style(Style::default().fg(Color::White).bg(Color::Reset))
             .title_position(Position::Bottom)
             .title_alignment(ratatui::layout::Alignment::Right)
-            .title("uncl 0.1a");
+            .title("uncl 0.1a")
+            .style(Style::default().bg(Color::Black));
 
-        // Calculate the inner area inside the block (excluding borders)
-        // let inner_area = block.inner(self.rect);
-        let pseudo_term = PseudoTerminal::new(screen).block(block);
+        let pseudo_term = PseudoTerminal::new(screen).block(block.clone());
+
         f.render_widget(pseudo_term, self.rect);
+
+        f.render_widget(block.clone(), self.rect);
     }
 
     pub fn resize_to(

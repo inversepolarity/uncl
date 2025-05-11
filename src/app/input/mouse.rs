@@ -1,4 +1,4 @@
-use crate::app::ui::overlay::Overlay;
+use crate::app::ui::tenant::Overlay;
 use crate::constants::{MIN_HEIGHT, MIN_WIDTH, ResizeDirection};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 

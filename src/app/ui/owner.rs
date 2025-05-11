@@ -6,8 +6,7 @@ use ratatui::{
     backend::Backend,
     layout::Rect,
     prelude::CrosstermBackend,
-    style::{Color, Style, Stylize},
-    widgets::{Block, Borders, Clear, block::Position},
+    widgets::{Block, Borders},
 };
 
 use bytes::Bytes;
@@ -25,7 +24,7 @@ use crossterm::{
 };
 
 use tokio::{
-    sync::mpsc::{Sender, channel},
+    sync::mpsc::{Receiver, Sender, channel},
     task::{self},
 };
 
@@ -37,54 +36,92 @@ pub struct Size {
     rows: u16,
 }
 
-pub struct Overlay {
-    pub visible: bool,
-    pub rect: Rect,
-    pub dragging: bool,
-    pub drag_offset: (u16, u16),
-    pub resizing: bool,
-    pub resize_direction: Option<ResizeDirection>,
-    pub size: Size,
+use crate::app::input::keyboard::{InputSource, handle_keyboard_input};
+use crate::app::input::mouse::handle_mouse;
+use crate::constants::*;
+
+use super::tenant::Overlay;
+
+pub struct Lease {
+    pub tenant: Overlay,
+    pub tenant_parser: Arc<RwLock<vt100::Parser>>,
+    pub tenant_visible: bool,
+    pub tenant_tx: Sender<Bytes>,
+    pub tenant_status_rx: Receiver<bool>,
 }
 
-use crate::app::input::keyboard::handle_keyboard_input;
-use crate::app::input::mouse::handle_mouse;
-use crate::constants::{self, *};
+pub struct Container {
+    pub rect: Rect,
+    pub size: Size,
+    pub parser: Arc<RwLock<vt100::Parser>>,
+    pub tx: Sender<Bytes>,
+    pub rx: Option<Receiver<Bytes>>,
+    pub status_tx: Sender<bool>,
+    pub status_rx: Option<Receiver<bool>>,
+    pub lease: Lease,
+}
 
-impl Overlay {
+impl Container {
     pub fn new() -> Self {
-        let overlay = Self {
-            visible: true,
-            rect: Rect::new(DEFAULT_X, DEFAULT_Y, DEFAULT_WIDTH, DEFAULT_HEIGHT),
-            dragging: false,
-            drag_offset: (0, 0),
-            resizing: false,
-            resize_direction: None,
-            size: Size { cols: 0, rows: 0 },
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
+
+        let rect = Rect::new(0, 0, cols, rows);
+
+        // FIX: we want to scroll back to start of the owner
+        let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 0)));
+        let tparser = Arc::new(RwLock::new(vt100::Parser::new(
+            DEFAULT_HEIGHT,
+            DEFAULT_WIDTH,
+            0,
+        )));
+
+        // Create channels for PTY status
+        let (tx, mut rx) = channel::<Bytes>(32);
+        let (pty_status_tx, mut pty_status_rx) = channel::<bool>(1);
+
+        let (ttx, mut trx) = channel::<Bytes>(32);
+        let (tpty_status_tx, mut tpty_status_rx) = channel::<bool>(1);
+
+        let lease = Lease {
+            tenant_visible: false,
+            tenant: Overlay::new(),
+            tenant_parser: tparser,
+            tenant_tx: ttx,
+            tenant_status_rx: tpty_status_rx,
         };
 
-        overlay
+        let container = Self {
+            rect,
+            parser,
+            size: Size { cols, rows },
+            tx,
+            rx: Some(rx),
+            status_tx: pty_status_tx,
+            status_rx: Some(pty_status_rx),
+            lease,
+        };
+
+        container
+    }
+
+    pub async fn init_tenant(&mut self) {
+        let lease = &mut self.lease;
+        let tenant_ptr: *mut Overlay = &mut lease.tenant;
+        unsafe {
+            (*tenant_ptr).initialize_pty(lease).await.unwrap();
+        }
+    }
+
+    pub fn tenant_running(&mut self) -> bool {
+        !self.lease.tenant_status_rx.is_closed()
     }
 
     pub async fn initialize_pty(&mut self) -> Result<(), anyhow::Error> {
         let pty_system = native_pty_system();
-
-        //Get Terminal Size
-        let term_size = match crossterm::terminal::size() {
-            Ok((cols, rows)) => {
-                self.size = Size { cols, rows };
-                (cols, rows)
-            }
-            Err(e) => {
-                eprintln!("Failed to get terminal size: {}", e);
-                (constants::DEFAULT_WIDTH, constants::DEFAULT_HEIGHT)
-            }
-        };
-
         //Create pty pair
         let pair = match pty_system.openpty(PtySize {
-            rows: term_size.1,
-            cols: term_size.0,
+            rows: self.size.rows,
+            cols: self.size.cols,
             pixel_height: 0,
             pixel_width: 0,
         }) {
@@ -101,14 +138,11 @@ impl Overlay {
         let cwd = std::env::current_dir().unwrap();
         cmd.cwd(cwd);
 
-        // Create channels for PTY status
-        let (tx, mut rx) = channel::<Bytes>(32);
-        let (pty_status_tx, mut pty_status_rx) = channel::<bool>(1);
-
         // Clone the status sender for the child process monitoring
-        let child_status_tx = pty_status_tx.clone();
+        let child_status_tx = self.status_tx.clone();
 
         //Spawn the shell in pty and monitor for exit
+        // TODO: why blocking?
         task::spawn_blocking(move || {
             let mut child = match slave.spawn_command(cmd) {
                 Ok(child) => child,
@@ -137,19 +171,17 @@ impl Overlay {
         let mut writer = BufWriter::new(master.take_writer().unwrap());
         let mut reader = master.try_clone_reader().unwrap();
 
-        let parser = Arc::new(RwLock::new(vt100::Parser::new(
-            self.size.rows,
-            self.size.cols,
-            0,
-        )));
-
         // Clone status sender for the reader task
-        let reader_status_tx = pty_status_tx.clone();
+        let reader_status_tx = self.status_tx.clone();
 
         {
-            let parser = parser.clone();
+            let parser = self.parser.clone();
+
+            // TODO: why blocking?
             task::spawn_blocking(move || {
                 let mut buf = [0u8; 8192];
+                // TODO: magic number?
+
                 let mut processed_buf = Vec::new();
                 loop {
                     // Handle read errors or EOF
@@ -188,11 +220,16 @@ impl Overlay {
         // Set up terminal
         let mut stdout = io::stdout();
         execute!(stdout, ResetColor)?;
+
         enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnableMouseCapture)?;
+
+        execute!(stdout, EnableMouseCapture, EnterAlternateScreen)?;
+
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+
+        let mut rx = self.rx.take().expect("rx already taken");
+        let mut status_rx = self.status_rx.take().expect("status rx already taken");
 
         // Handle writing to PTY with error detection
         tokio::spawn(async move {
@@ -212,18 +249,38 @@ impl Overlay {
         });
 
         // Run the terminal UI with PTY status monitoring
-        self.run(&mut terminal, parser, tx, &mut pty_status_rx)
-            .await?;
+
+        self.run(
+            &mut terminal,
+            self.parser.clone(),
+            self.tx.clone(),
+            &mut status_rx,
+        )
+        .await?;
+
+        if !self.tenant_running() {
+            //FIX: wtf?
+            self.init_tenant().await;
+        }
 
         // Restore terminal state
         disable_raw_mode()?;
-        execute!(std::io::stdout(), DisableMouseCapture)?;
+        execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         terminal.show_cursor()?;
         Ok(())
     }
 
-    pub fn cleanup(&mut self) {
-        //Kill the child if it exists
+    pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
+        // Create the terminal block with borders
+        let block = Block::default().borders(Borders::NONE);
+        let pseudo_term = PseudoTerminal::new(screen).block(block.clone());
+        let inner = block.inner(self.rect);
+        f.render_widget(pseudo_term, inner);
+        f.render_widget(block.clone(), inner);
+
+        if self.lease.tenant_visible {
+            self.lease.tenant.render(f, screen);
+        }
     }
 
     pub async fn run<B: Backend>(
@@ -244,18 +301,21 @@ impl Overlay {
                 match event::read()? {
                     Event::Key(key_event) => {
                         if handle_keyboard_input(
-                            self,
+                            &mut self.lease,
+                            InputSource::Container,
                             &sender,
                             key_event,
                             (term_width, term_height),
                         )
                         .await
                         {
-                            // User pressed 'q' - exit
+                            // exit
                             break;
                         }
                     }
-                    Event::Mouse(m) => handle_mouse(self, m, (term_width, term_height)),
+                    Event::Mouse(m) => {
+                        handle_mouse(&mut self.lease.tenant, m, (term_width, term_height))
+                    }
                     Event::FocusGained => {}
                     Event::FocusLost => {}
                     Event::Paste(_) => {}
@@ -267,7 +327,6 @@ impl Overlay {
 
             // Check if the PTY process has ended (non-blocking)
             if let Ok(true) = pty_status_rx.try_recv() {
-                // PTY process has ended, exit the loop
                 break;
             }
 
@@ -276,76 +335,5 @@ impl Overlay {
         }
 
         Ok(())
-    }
-
-    pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
-        // Create the terminal block with borders
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title_position(Position::Bottom)
-            .title_alignment(ratatui::layout::Alignment::Right)
-            .title("uncl 0.1a")
-            .style(Style::default().bg(Color::Black));
-
-        let pseudo_term = PseudoTerminal::new(screen).block(block.clone());
-
-        f.render_widget(pseudo_term, self.rect);
-
-        f.render_widget(block.clone(), self.rect);
-    }
-
-    pub fn resize_to(
-        &mut self,
-        mut x: u16,
-        mut y: u16,
-        mut width: u16,
-        mut height: u16,
-        bounds: (u16, u16),
-    ) {
-        // Ignore any resize attempts that fall below the minimum constraints
-        if width < MIN_WIDTH || height < MIN_HEIGHT {
-            return;
-        }
-
-        // Safeguard: Ensure x and y are within bounds (can't move beyond the bounds of the screen)
-        x = x.max(0).min(bounds.0.saturating_sub(1)); // Prevent x from exceeding bounds width
-        y = y.max(0).min(bounds.1.saturating_sub(1)); // Prevent y from exceeding bounds height
-
-        // Calculate the max width and height that are available for resizing
-        let max_width = bounds.0.saturating_sub(x);
-        let max_height = bounds.1.saturating_sub(y);
-
-        // Safeguard against overflow by ensuring we do not resize past bounds or minimum sizes
-        width = width.min(max_width).max(MIN_WIDTH);
-        height = height.min(max_height).max(MIN_HEIGHT);
-
-        // Ensure the x and y positions are within bounds based on the new size
-        // This ensures the new window does not go out of bounds when resizing
-        if x > bounds.0.saturating_sub(width) {
-            x = bounds.0.saturating_sub(width); // Prevent x from going past bounds
-        }
-        if y > bounds.1.saturating_sub(height) {
-            y = bounds.1.saturating_sub(height); // Prevent y from going past bounds
-        }
-
-        // Set the new window dimensions (x, y, width, height)
-        self.rect.x = x;
-        self.rect.y = y;
-        self.rect.width = width;
-        self.rect.height = height;
-    }
-
-    pub fn move_to(&mut self, target_x: u16, target_y: u16, bounds: (u16, u16)) {
-        let max_x = bounds.0.saturating_sub(self.rect.width);
-        let max_y = bounds.1.saturating_sub(self.rect.height);
-
-        self.rect.x = target_x.min(max_x);
-        self.rect.y = target_y.min(max_y);
-    }
-}
-
-impl Drop for Overlay {
-    fn drop(&mut self) {
-        self.cleanup();
     }
 }

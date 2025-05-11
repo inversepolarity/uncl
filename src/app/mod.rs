@@ -2,11 +2,10 @@ pub mod input;
 pub mod ui;
 use anyhow::Result;
 
-use ui::overlay::Overlay;
+use ui::owner::Container;
 
 pub async fn run() -> Result<()> {
-    let mut overlay = Overlay::new();
-    overlay.initialize_pty().await.unwrap();
-
+    let mut uncl = Container::new();
+    uncl.initialize_pty().await.unwrap();
     Ok(())
 }

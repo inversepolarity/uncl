@@ -36,7 +36,7 @@ pub struct Size {
     rows: u16,
 }
 
-use crate::app::input::keyboard::{InputSource, handle_keyboard_input};
+use crate::app::input::keyboard::handle_keyboard_input;
 use crate::app::input::mouse::handle_mouse;
 use crate::constants::*;
 
@@ -47,6 +47,8 @@ pub struct Lease {
     pub tenant_parser: Arc<RwLock<vt100::Parser>>,
     pub tenant_visible: bool,
     pub tenant_tx: Sender<Bytes>,
+    pub tenant_rx: Option<Receiver<Bytes>>,
+    pub tenant_status_tx: Sender<bool>,
     pub tenant_status_rx: Receiver<bool>,
 }
 
@@ -87,6 +89,8 @@ impl Container {
             tenant: Overlay::new(),
             tenant_parser: tparser,
             tenant_tx: ttx,
+            tenant_rx: Some(trx),
+            tenant_status_tx: tpty_status_tx,
             tenant_status_rx: tpty_status_rx,
         };
 
@@ -181,7 +185,6 @@ impl Container {
             task::spawn_blocking(move || {
                 let mut buf = [0u8; 8192];
                 // TODO: magic number?
-
                 let mut processed_buf = Vec::new();
                 loop {
                     // Handle read errors or EOF
@@ -249,19 +252,8 @@ impl Container {
         });
 
         // Run the terminal UI with PTY status monitoring
-
-        self.run(
-            &mut terminal,
-            self.parser.clone(),
-            self.tx.clone(),
-            &mut status_rx,
-        )
-        .await?;
-
-        if !self.tenant_running() {
-            //FIX: wtf?
-            self.init_tenant().await;
-        }
+        self.run(&mut terminal, self.parser.clone(), &mut status_rx)
+            .await?;
 
         // Restore terminal state
         disable_raw_mode()?;
@@ -273,13 +265,15 @@ impl Container {
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
         // Create the terminal block with borders
         let block = Block::default().borders(Borders::NONE);
-        let pseudo_term = PseudoTerminal::new(screen).block(block.clone());
+        let pseudo_term_owner = PseudoTerminal::new(screen).block(block.clone());
         let inner = block.inner(self.rect);
-        f.render_widget(pseudo_term, inner);
+        f.render_widget(pseudo_term_owner, inner);
         f.render_widget(block.clone(), inner);
 
         if self.lease.tenant_visible {
-            self.lease.tenant.render(f, screen);
+            self.lease
+                .tenant
+                .render(f, self.lease.tenant_parser.read().unwrap().screen());
         }
     }
 
@@ -287,12 +281,19 @@ impl Container {
         &mut self,
         terminal: &mut Terminal<B>,
         parser: Arc<RwLock<vt100::Parser>>,
-        sender: Sender<Bytes>,
         pty_status_rx: &mut tokio::sync::mpsc::Receiver<bool>,
     ) -> Result<()> {
         loop {
             // Draw the terminal UI
             terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
+
+            let kb_sender: Sender<Bytes>;
+
+            if !self.lease.tenant_visible {
+                kb_sender = self.tx.clone();
+            } else {
+                kb_sender = self.lease.tenant_tx.clone();
+            }
 
             // Poll for terminal events with a short timeout
             if event::poll(std::time::Duration::from_millis(50))? {
@@ -302,8 +303,7 @@ impl Container {
                     Event::Key(key_event) => {
                         if handle_keyboard_input(
                             &mut self.lease,
-                            InputSource::Container,
-                            &sender,
+                            &kb_sender,
                             key_event,
                             (term_width, term_height),
                         )

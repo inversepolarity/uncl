@@ -1,4 +1,4 @@
-use crate::app::{input::keyboard::InputSource, ui::owner::Lease};
+use crate::app::ui::owner::Lease;
 use anyhow::Result;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -100,12 +100,8 @@ impl Overlay {
         let cwd = std::env::current_dir().unwrap();
         cmd.cwd(cwd);
 
-        // Create channels for PTY status
-        let (tx, mut rx) = channel::<Bytes>(32);
-        let (pty_status_tx, mut pty_status_rx) = channel::<bool>(1);
-
         // Clone the status sender for the child process monitoring
-        let child_status_tx = pty_status_tx.clone();
+        let child_status_tx = lease.tenant_status_tx.clone();
 
         //Spawn the shell in pty and monitor for exit
         // TODO: why blocking?
@@ -137,18 +133,10 @@ impl Overlay {
         let mut writer = BufWriter::new(master.take_writer().unwrap());
         let mut reader = master.try_clone_reader().unwrap();
 
-        let parser = Arc::new(RwLock::new(vt100::Parser::new(
-            self.size.rows,
-            self.size.cols,
-            // FIX: we want to scroll back to start of the owner
-            0,
-        )));
-
         // Clone status sender for the reader task
-        let reader_status_tx = pty_status_tx.clone();
-
+        let reader_status_tx = lease.tenant_status_tx.clone();
         {
-            let parser = parser.clone();
+            let parser = lease.tenant_parser.clone();
             // TODO: why blocking?
             task::spawn_blocking(move || {
                 let mut buf = [0u8; 8192];
@@ -199,6 +187,8 @@ impl Overlay {
 
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+
+        let mut rx = lease.tenant_rx.take().unwrap();
 
         // Handle writing to PTY with error detection
         tokio::spawn(async move {
@@ -262,7 +252,6 @@ impl Overlay {
                         // Only mutable borrow of lease here
                         if handle_keyboard_input(
                             lease,
-                            InputSource::Overlay,
                             &tenant_tx,
                             key_event,
                             (term_width, term_height),
@@ -303,9 +292,7 @@ impl Overlay {
             .style(Style::default().bg(Color::Black));
 
         let pseudo_term = PseudoTerminal::new(screen).block(block.clone());
-
         let inner = block.inner(self.rect);
-
         f.render_widget(pseudo_term, inner);
         f.render_widget(block.clone(), inner);
     }

@@ -4,14 +4,8 @@ use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::Sender;
 
-pub enum InputSource {
-    Container,
-    Overlay,
-}
-
 pub async fn handle_keyboard_input(
     lease: &mut Lease,
-    source: InputSource,
     sender: &Sender<Bytes>,
     key_event: KeyEvent,
     term_size: (u16, u16),
@@ -21,10 +15,7 @@ pub async fn handle_keyboard_input(
     let width = lease.tenant.rect.width;
     let height = lease.tenant.rect.height;
 
-    let target_sender = match source {
-        InputSource::Container => sender,
-        InputSource::Overlay => &lease.tenant_tx,
-    };
+    let target_sender = sender;
 
     match key_event.code {
         KeyCode::Char(input) => target_sender

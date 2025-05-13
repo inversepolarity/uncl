@@ -3,9 +3,8 @@ use anyhow::Result;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::{
     Frame, Terminal,
-    backend::Backend,
+    backend::{Backend, CrosstermBackend},
     layout::Rect,
-    prelude::CrosstermBackend,
     widgets::{Block, Borders},
 };
 
@@ -17,6 +16,7 @@ use std::{
 };
 
 use crossterm::{
+    cursor,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     style::ResetColor,
@@ -78,11 +78,11 @@ impl Container {
         )));
 
         // Create channels for PTY status
-        let (tx, mut rx) = channel::<Bytes>(32);
-        let (pty_status_tx, mut pty_status_rx) = channel::<bool>(1);
+        let (tx, rx) = channel::<Bytes>(32);
+        let (pty_status_tx, pty_status_rx) = channel::<bool>(1);
 
-        let (ttx, mut trx) = channel::<Bytes>(32);
-        let (tpty_status_tx, mut tpty_status_rx) = channel::<bool>(1);
+        let (ttx, trx) = channel::<Bytes>(32);
+        let (tpty_status_tx, tpty_status_rx) = channel::<bool>(1);
 
         let lease = Lease {
             tenant_visible: false,
@@ -108,12 +108,14 @@ impl Container {
         container
     }
 
-    pub async fn init_tenant(&mut self) {
+    pub async fn init_tenant(&mut self) -> Result<(), anyhow::Error> {
         let lease = &mut self.lease;
         let tenant_ptr: *mut Overlay = &mut lease.tenant;
         unsafe {
             (*tenant_ptr).initialize_pty(lease).await.unwrap();
         }
+
+        Ok(())
     }
 
     pub fn tenant_running(&mut self) -> bool {
@@ -121,6 +123,8 @@ impl Container {
     }
 
     pub async fn initialize_pty(&mut self) -> Result<(), anyhow::Error> {
+        self.init_tenant().await?;
+
         let pty_system = native_pty_system();
         //Create pty pair
         let pair = match pty_system.openpty(PtySize {
@@ -174,7 +178,6 @@ impl Container {
 
         let mut writer = BufWriter::new(master.take_writer().unwrap());
         let mut reader = master.try_clone_reader().unwrap();
-
         // Clone status sender for the reader task
         let reader_status_tx = self.status_tx.clone();
 
@@ -226,7 +229,14 @@ impl Container {
 
         enable_raw_mode()?;
 
-        execute!(stdout, EnableMouseCapture, EnterAlternateScreen)?;
+        //TODO: enable cursor::SetCursorStyle
+        execute!(
+            stdout,
+            EnableMouseCapture,
+            EnterAlternateScreen,
+            cursor::EnableBlinking,
+            cursor::SetCursorStyle::BlinkingBlock
+        )?;
 
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -264,13 +274,14 @@ impl Container {
 
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
         // Create the terminal block with borders
+
         let block = Block::default().borders(Borders::NONE);
         let pseudo_term_owner = PseudoTerminal::new(screen).block(block.clone());
         let inner = block.inner(self.rect);
         f.render_widget(pseudo_term_owner, inner);
         f.render_widget(block.clone(), inner);
 
-        if self.lease.tenant_visible {
+        if self.lease.tenant_visible && self.tenant_running() {
             self.lease
                 .tenant
                 .render(f, self.lease.tenant_parser.read().unwrap().screen());
@@ -283,8 +294,11 @@ impl Container {
         parser: Arc<RwLock<vt100::Parser>>,
         pty_status_rx: &mut tokio::sync::mpsc::Receiver<bool>,
     ) -> Result<()> {
+        terminal.clear()?;
+
         loop {
             // Draw the terminal UI
+
             terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
 
             let kb_sender: Sender<Bytes>;

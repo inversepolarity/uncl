@@ -11,12 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, block::Position},
 };
 
-use bytes::Bytes;
-
-use std::{
-    io::{self, BufWriter, Read, Write},
-    sync::{Arc, RwLock},
-};
+use std::io::{self, BufWriter, Read, Write};
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
@@ -25,10 +20,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 
-use tokio::{
-    sync::mpsc::{Sender, channel},
-    task::{self},
-};
+use tokio::task::{self};
 
 use tui_term::widget::PseudoTerminal;
 use vt100::Screen;
@@ -79,7 +71,6 @@ impl Overlay {
 
     pub async fn initialize_pty(&mut self, lease: &mut Lease) -> Result<(), anyhow::Error> {
         let pty_system = native_pty_system();
-
         //Create pty pair
         let pair = match pty_system.openpty(PtySize {
             rows: self.size.rows,

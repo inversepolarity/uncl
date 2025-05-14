@@ -37,6 +37,7 @@ pub struct Overlay {
     pub resizing: bool,
     pub resize_direction: Option<ResizeDirection>,
     pub size: Size,
+    pub is_dead: bool,
 }
 
 use crate::app::input::keyboard::handle_keyboard_input;
@@ -64,6 +65,7 @@ impl Overlay {
                 cols: term_size.0,
                 rows: term_size.1,
             },
+            is_dead: false,
         };
 
         overlay
@@ -224,6 +226,7 @@ impl Overlay {
         // Clone shared references needed in the loop to avoid repeated immutable borrows
         let tenant_parser = lease.tenant_parser.clone();
         let tenant_tx = lease.tenant_tx.clone();
+        terminal.clear()?;
 
         loop {
             // Immutable borrow only of tenant_parser
@@ -235,7 +238,7 @@ impl Overlay {
             terminal.draw(|f| self.render(f, &screen))?;
 
             // Poll for terminal events with a short timeout
-            if event::poll(std::time::Duration::from_millis(50))? {
+            if event::poll(std::time::Duration::from_millis(10))? {
                 let (term_width, term_height) = crossterm::terminal::size()?;
 
                 match event::read()? {
@@ -254,7 +257,11 @@ impl Overlay {
                     }
                     Event::Mouse(m) => handle_mouse(self, m, (term_width, term_height)),
                     Event::FocusGained => {}
-                    Event::FocusLost => {}
+                    Event::FocusLost => {
+                        //FIX:
+                        println!("focus lost");
+                        lease.tenant_visible = false;
+                    }
                     Event::Paste(_) => {}
                     Event::Resize(cols, rows) => {
                         tenant_parser.write().unwrap().set_size(rows, cols);
@@ -270,6 +277,9 @@ impl Overlay {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
+        terminal.clear()?;
+        lease.tenant_visible = false;
+        self.is_dead = true;
         Ok(())
     }
 
@@ -282,7 +292,13 @@ impl Overlay {
             .title("uncl 0.1a")
             .style(Style::default().bg(Color::Black));
 
-        let pseudo_term = PseudoTerminal::new(screen).block(block.clone());
+        let pseudo_term = PseudoTerminal::new(screen).block(block.clone()).cursor(
+            tui_term::widget::Cursor::default().style(
+                ratatui::style::Style::default()
+                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK),
+            ),
+        );
+
         let inner = block.inner(self.rect);
         f.render_widget(pseudo_term, inner);
         f.render_widget(block.clone(), inner);
@@ -341,7 +357,6 @@ impl Overlay {
 }
 
 impl Drop for Overlay {
-    // FIX: Artifacts
     fn drop(&mut self) {
         self.cleanup();
     }

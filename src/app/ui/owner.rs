@@ -16,11 +16,14 @@ use std::{
 };
 
 use crossterm::{
-    cursor,
+    cursor::MoveTo,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
-    execute,
+    execute, queue,
     style::ResetColor,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 
 use tokio::{
@@ -63,26 +66,16 @@ pub struct Container {
     pub lease: Lease,
 }
 
-impl Container {
+impl Lease {
     pub fn new() -> Self {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
+        let (ttx, trx) = channel::<Bytes>(32);
+        let (tpty_status_tx, tpty_status_rx) = channel::<bool>(1);
 
-        let rect = Rect::new(0, 0, cols, rows);
-
-        // FIX: we want to scroll back to start of the owner
-        let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 0)));
         let tparser = Arc::new(RwLock::new(vt100::Parser::new(
             DEFAULT_HEIGHT,
             DEFAULT_WIDTH,
             0,
         )));
-
-        // Create channels for PTY status
-        let (tx, rx) = channel::<Bytes>(32);
-        let (pty_status_tx, pty_status_rx) = channel::<bool>(1);
-
-        let (ttx, trx) = channel::<Bytes>(32);
-        let (tpty_status_tx, tpty_status_rx) = channel::<bool>(1);
 
         let lease = Lease {
             tenant_visible: false,
@@ -93,6 +86,24 @@ impl Container {
             tenant_status_tx: tpty_status_tx,
             tenant_status_rx: tpty_status_rx,
         };
+
+        lease
+    }
+}
+
+impl Container {
+    pub fn new() -> Self {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
+
+        let rect = Rect::new(0, 0, cols, rows);
+
+        // FIX: we want to scroll back to start of the owner
+        let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 0)));
+        // Create channels for PTY status
+        let (tx, rx) = channel::<Bytes>(32);
+        let (pty_status_tx, pty_status_rx) = channel::<bool>(1);
+
+        let lease = Lease::new();
 
         let container = Self {
             rect,
@@ -229,14 +240,7 @@ impl Container {
 
         enable_raw_mode()?;
 
-        //TODO: enable cursor::SetCursorStyle
-        execute!(
-            stdout,
-            EnableMouseCapture,
-            EnterAlternateScreen,
-            cursor::EnableBlinking,
-            cursor::SetCursorStyle::BlinkingBlock
-        )?;
+        execute!(stdout, EnableMouseCapture, EnterAlternateScreen,)?;
 
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -276,7 +280,13 @@ impl Container {
         // Create the terminal block with borders
 
         let block = Block::default().borders(Borders::NONE);
-        let pseudo_term_owner = PseudoTerminal::new(screen).block(block.clone());
+        let pseudo_term_owner = PseudoTerminal::new(screen).block(block.clone()).cursor(
+            tui_term::widget::Cursor::default().style(
+                ratatui::style::Style::default()
+                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK),
+            ),
+        );
+
         let inner = block.inner(self.rect);
         f.render_widget(pseudo_term_owner, inner);
         f.render_widget(block.clone(), inner);
@@ -294,6 +304,9 @@ impl Container {
         parser: Arc<RwLock<vt100::Parser>>,
         pty_status_rx: &mut tokio::sync::mpsc::Receiver<bool>,
     ) -> Result<()> {
+        let mut stdout = io::stdout();
+        queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
+        stdout.flush()?;
         terminal.clear()?;
 
         loop {
@@ -301,16 +314,16 @@ impl Container {
 
             terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
 
-            let kb_sender: Sender<Bytes>;
+            let mut kb_sender: Sender<Bytes> = self.tx.clone();
 
-            if !self.lease.tenant_visible {
-                kb_sender = self.tx.clone();
-            } else {
-                kb_sender = self.lease.tenant_tx.clone();
+            if self.lease.tenant_visible {
+                if self.tenant_running() {
+                    kb_sender = self.lease.tenant_tx.clone();
+                }
             }
 
             // Poll for terminal events with a short timeout
-            if event::poll(std::time::Duration::from_millis(50))? {
+            if event::poll(std::time::Duration::from_millis(10))? {
                 let (term_width, term_height) = crossterm::terminal::size()?;
 
                 match event::read()? {
@@ -342,6 +355,16 @@ impl Container {
             // Check if the PTY process has ended (non-blocking)
             if let Ok(true) = pty_status_rx.try_recv() {
                 break;
+            }
+
+            if let Ok(true) = self.lease.tenant_status_rx.try_recv() {
+                self.lease.tenant_visible = false;
+            }
+
+            if self.lease.tenant.is_dead {
+                self.lease.tenant = Overlay::new();
+                self.lease = Lease::new();
+                println!("tenant has expired");
             }
 
             // Small sleep to prevent CPU spinning

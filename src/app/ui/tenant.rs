@@ -1,4 +1,3 @@
-use crate::app::ui::owner::Lease;
 use anyhow::Result;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -14,16 +13,19 @@ use ratatui::{
 use std::io::{self, BufWriter, Read, Write};
 
 use crossterm::{
+    cursor::MoveTo,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     style::ResetColor,
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
 };
 
 use tokio::task::{self};
 
 use tui_term::widget::PseudoTerminal;
 use vt100::Screen;
+
+use crate::app::lease::Lease;
 
 pub struct Size {
     cols: u16,
@@ -65,7 +67,7 @@ impl Overlay {
                 cols: term_size.0,
                 rows: term_size.1,
             },
-            is_dead: false,
+            is_dead: true,
         };
 
         overlay
@@ -200,6 +202,8 @@ impl Overlay {
             drop(master);
         });
 
+        self.is_dead = false;
+
         // Run the terminal UI with PTY status monitoring
         self.run(lease, &mut terminal).await?;
 
@@ -210,8 +214,26 @@ impl Overlay {
         Ok(())
     }
 
-    pub fn cleanup(&mut self) {
-        //Kill the child if it exists
+    pub fn cleanup<B: Backend + std::io::Write>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> Result<()> {
+        // Properly clean up terminal state before returning to owner
+        // This is crucial to prevent control characters and input issues
+        disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            DisableMouseCapture,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+
+        // Important: Re-enable raw mode for the owner terminal
+        enable_raw_mode()?;
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+
+        terminal.clear()?;
+        Ok(())
     }
 
     pub async fn run<B: Backend>(
@@ -243,7 +265,6 @@ impl Overlay {
 
                 match event::read()? {
                     Event::Key(key_event) => {
-                        // Only mutable borrow of lease here
                         if handle_keyboard_input(
                             lease,
                             &tenant_tx,
@@ -271,15 +292,13 @@ impl Overlay {
 
             // Only immutable borrow of tenant_status_rx here
             if let Ok(true) = lease.tenant_status_rx.try_recv() {
+                self.is_dead = true;
                 break;
             }
 
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        terminal.clear()?;
-        lease.tenant_visible = false;
-        self.is_dead = true;
         Ok(())
     }
 
@@ -347,17 +366,10 @@ impl Overlay {
     }
 
     pub fn move_to(&mut self, target_x: u16, target_y: u16, bounds: (u16, u16)) {
-        // FIX: ARTIFACTS
         let max_x = bounds.0.saturating_sub(self.rect.width);
         let max_y = bounds.1.saturating_sub(self.rect.height);
 
         self.rect.x = target_x.min(max_x);
         self.rect.y = target_y.min(max_y);
-    }
-}
-
-impl Drop for Overlay {
-    fn drop(&mut self) {
-        self.cleanup();
     }
 }

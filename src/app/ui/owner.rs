@@ -41,19 +41,10 @@ pub struct Size {
 
 use crate::app::input::keyboard::handle_keyboard_input;
 use crate::app::input::mouse::handle_mouse;
+use crate::app::lease::Lease;
 use crate::constants::*;
 
 use super::tenant::Overlay;
-
-pub struct Lease {
-    pub tenant: Overlay,
-    pub tenant_parser: Arc<RwLock<vt100::Parser>>,
-    pub tenant_visible: bool,
-    pub tenant_tx: Sender<Bytes>,
-    pub tenant_rx: Option<Receiver<Bytes>>,
-    pub tenant_status_tx: Sender<bool>,
-    pub tenant_status_rx: Receiver<bool>,
-}
 
 pub struct Container {
     pub rect: Rect,
@@ -66,31 +57,6 @@ pub struct Container {
     pub lease: Lease,
 }
 
-impl Lease {
-    pub fn new() -> Self {
-        let (ttx, trx) = channel::<Bytes>(32);
-        let (tpty_status_tx, tpty_status_rx) = channel::<bool>(1);
-
-        let tparser = Arc::new(RwLock::new(vt100::Parser::new(
-            DEFAULT_HEIGHT,
-            DEFAULT_WIDTH,
-            0,
-        )));
-
-        let lease = Lease {
-            tenant_visible: false,
-            tenant: Overlay::new(),
-            tenant_parser: tparser,
-            tenant_tx: ttx,
-            tenant_rx: Some(trx),
-            tenant_status_tx: tpty_status_tx,
-            tenant_status_rx: tpty_status_rx,
-        };
-
-        lease
-    }
-}
-
 impl Container {
     pub fn new() -> Self {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
@@ -99,6 +65,7 @@ impl Container {
 
         // FIX: we want to scroll back to start of the owner
         let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 0)));
+
         // Create channels for PTY status
         let (tx, rx) = channel::<Bytes>(32);
         let (pty_status_tx, pty_status_rx) = channel::<bool>(1);
@@ -298,7 +265,7 @@ impl Container {
         }
     }
 
-    pub async fn run<B: Backend>(
+    pub async fn run<B: Backend + std::io::Write>(
         &mut self,
         terminal: &mut Terminal<B>,
         parser: Arc<RwLock<vt100::Parser>>,
@@ -311,7 +278,6 @@ impl Container {
 
         loop {
             // Draw the terminal UI
-
             terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
 
             let mut kb_sender: Sender<Bytes> = self.tx.clone();
@@ -319,6 +285,9 @@ impl Container {
             if self.lease.tenant_visible {
                 if self.tenant_running() {
                     kb_sender = self.lease.tenant_tx.clone();
+                } else {
+                    // Important: If tenant is visible but not running, reset state
+                    self.lease.tenant_visible = false;
                 }
             }
 
@@ -336,7 +305,6 @@ impl Container {
                         )
                         .await
                         {
-                            // exit
                             break;
                         }
                     }
@@ -359,12 +327,25 @@ impl Container {
 
             if let Ok(true) = self.lease.tenant_status_rx.try_recv() {
                 self.lease.tenant_visible = false;
+                self.lease.tenant.is_dead = true;
+
+                // Flush any pending output
+                terminal.flush()?;
             }
 
-            if self.lease.tenant.is_dead {
-                self.lease.tenant = Overlay::new();
-                self.lease = Lease::new();
-                println!("tenant has expired");
+            if self.lease.expired() {
+                self.lease.tenant.cleanup(terminal)?;
+                self.lease = self.lease.renew();
+                let mut stdout = io::stdout();
+                queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
+                stdout.flush()?;
+                terminal.clear()?;
+                self.init_tenant().await?;
+                execute!(stdout, ResetColor)?;
+
+                enable_raw_mode()?;
+
+                execute!(stdout, EnableMouseCapture, EnterAlternateScreen,)?;
             }
 
             // Small sleep to prevent CPU spinning

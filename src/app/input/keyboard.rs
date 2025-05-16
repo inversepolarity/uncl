@@ -1,4 +1,4 @@
-use crate::app::ui::owner::Lease;
+use crate::app::lease::Lease;
 
 use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -29,6 +29,7 @@ pub async fn handle_keyboard_input(
 
         KeyCode::Home => {
             lease.tenant_visible = !lease.tenant_visible;
+            return false;
         }
 
         KeyCode::Enter => {
@@ -91,7 +92,7 @@ pub async fn handle_keyboard_input(
                 .unwrap()
         }
 
-        _ => {}
+        _ => return false,
     }
 
     false

@@ -12,4 +12,4 @@ pub const DEFAULT_WIDTH: u16 = 80;
 pub const DEFAULT_HEIGHT: u16 = 25;
 
 pub const DEFAULT_X: u16 = 10;
-pub const DEFAULT_Y: u16 = 10;
+pub const DEFAULT_Y: u16 = 5;

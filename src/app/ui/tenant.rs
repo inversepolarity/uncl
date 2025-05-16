@@ -15,7 +15,7 @@ use std::io::{self, BufWriter, Read, Write};
 use crossterm::{
     cursor::MoveTo,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
-    execute,
+    execute, queue,
     style::ResetColor,
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
 };
@@ -99,7 +99,6 @@ impl Overlay {
         let child_status_tx = lease.tenant_status_tx.clone();
 
         //Spawn the shell in pty and monitor for exit
-        // TODO: why blocking?
         task::spawn_blocking(move || {
             let mut child = match slave.spawn_command(cmd) {
                 Ok(child) => child,
@@ -132,7 +131,6 @@ impl Overlay {
         let reader_status_tx = lease.tenant_status_tx.clone();
         {
             let parser = lease.tenant_parser.clone();
-            // TODO: why blocking?
             task::spawn_blocking(move || {
                 let mut buf = [0u8; 8192];
                 // TODO: magic number?
@@ -185,6 +183,13 @@ impl Overlay {
 
         let mut rx = lease.tenant_rx.take().unwrap();
 
+        // Critical addition: Clear terminal buffer before displaying anything
+        let stdout = terminal.backend_mut();
+        queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
+        std::io::Write::flush(stdout)?;
+
+        terminal.clear()?;
+
         // Handle writing to PTY with error detection
         tokio::spawn(async move {
             while let Some(bytes) = rx.recv().await {
@@ -228,10 +233,6 @@ impl Overlay {
             MoveTo(0, 0)
         )?;
 
-        // Important: Re-enable raw mode for the owner terminal
-        enable_raw_mode()?;
-        execute!(terminal.backend_mut(), EnableMouseCapture)?;
-
         terminal.clear()?;
         Ok(())
     }
@@ -244,11 +245,14 @@ impl Overlay {
         if !lease.tenant_visible {
             return Ok(());
         }
+        let mut stdout = io::stdout();
+        queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
+        stdout.flush()?;
+        terminal.clear()?;
 
         // Clone shared references needed in the loop to avoid repeated immutable borrows
         let tenant_parser = lease.tenant_parser.clone();
         let tenant_tx = lease.tenant_tx.clone();
-        terminal.clear()?;
 
         loop {
             // Immutable borrow only of tenant_parser
@@ -260,7 +264,7 @@ impl Overlay {
             terminal.draw(|f| self.render(f, &screen))?;
 
             // Poll for terminal events with a short timeout
-            if event::poll(std::time::Duration::from_millis(10))? {
+            if event::poll(std::time::Duration::from_millis(0))? {
                 let (term_width, term_height) = crossterm::terminal::size()?;
 
                 match event::read()? {

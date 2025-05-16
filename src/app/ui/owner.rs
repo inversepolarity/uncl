@@ -128,7 +128,6 @@ impl Container {
         let child_status_tx = self.status_tx.clone();
 
         //Spawn the shell in pty and monitor for exit
-        // TODO: why blocking?
         task::spawn_blocking(move || {
             let mut child = match slave.spawn_command(cmd) {
                 Ok(child) => child,
@@ -162,7 +161,6 @@ impl Container {
         {
             let parser = self.parser.clone();
 
-            // TODO: why blocking?
             task::spawn_blocking(move || {
                 let mut buf = [0u8; 8192];
                 // TODO: magic number?
@@ -277,7 +275,6 @@ impl Container {
         terminal.clear()?;
 
         loop {
-            // Draw the terminal UI
             terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
 
             let mut kb_sender: Sender<Bytes> = self.tx.clone();
@@ -292,7 +289,7 @@ impl Container {
             }
 
             // Poll for terminal events with a short timeout
-            if event::poll(std::time::Duration::from_millis(10))? {
+            if event::poll(std::time::Duration::from_millis(0))? {
                 let (term_width, term_height) = crossterm::terminal::size()?;
 
                 match event::read()? {
@@ -328,24 +325,13 @@ impl Container {
             if let Ok(true) = self.lease.tenant_status_rx.try_recv() {
                 self.lease.tenant_visible = false;
                 self.lease.tenant.is_dead = true;
-
-                // Flush any pending output
-                terminal.flush()?;
             }
 
             if self.lease.expired() {
                 self.lease.tenant.cleanup(terminal)?;
                 self.lease = self.lease.renew();
-                let mut stdout = io::stdout();
-                queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
-                stdout.flush()?;
-                terminal.clear()?;
                 self.init_tenant().await?;
-                execute!(stdout, ResetColor)?;
-
                 enable_raw_mode()?;
-
-                execute!(stdout, EnableMouseCapture, EnterAlternateScreen,)?;
             }
 
             // Small sleep to prevent CPU spinning

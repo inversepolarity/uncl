@@ -155,12 +155,12 @@ impl Container {
 
         let mut writer = BufWriter::new(master.take_writer().unwrap());
         let mut reader = master.try_clone_reader().unwrap();
+
         // Clone status sender for the reader task
         let reader_status_tx = self.status_tx.clone();
 
         {
             let parser = self.parser.clone();
-
             task::spawn_blocking(move || {
                 let mut buf = [0u8; 8192];
                 // TODO: magic number?
@@ -235,6 +235,10 @@ impl Container {
             .await?;
 
         // Restore terminal state
+        //if self.tenant_running() {
+        // TODO: kill tenant here
+        //}
+
         disable_raw_mode()?;
         execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         terminal.show_cursor()?;
@@ -242,8 +246,6 @@ impl Container {
     }
 
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
-        // Create the terminal block with borders
-
         let block = Block::default().borders(Borders::NONE);
         let pseudo_term_owner = PseudoTerminal::new(screen).block(block.clone()).cursor(
             tui_term::widget::Cursor::default().style(
@@ -306,13 +308,20 @@ impl Container {
                         }
                     }
                     Event::Mouse(m) => {
-                        handle_mouse(&mut self.lease.tenant, m, (term_width, term_height))
+                        handle_mouse(&mut self.lease, m, (term_width, term_height));
                     }
                     Event::FocusGained => {}
                     Event::FocusLost => {}
                     Event::Paste(_) => {}
                     Event::Resize(cols, rows) => {
                         parser.write().unwrap().set_size(rows, cols);
+                        if self.lease.tenant_visible {
+                            println!("did resize");
+                            self.lease.resize_screen(
+                                self.lease.tenant.rect.height,
+                                self.lease.tenant.rect.width,
+                            );
+                        }
                     }
                 };
             }

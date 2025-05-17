@@ -14,7 +14,7 @@ use std::io::{self, BufWriter, Read, Write};
 
 use crossterm::{
     cursor::MoveTo,
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute, queue,
     style::ResetColor,
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
@@ -26,6 +26,10 @@ use tui_term::widget::PseudoTerminal;
 use vt100::Screen;
 
 use crate::app::lease::Lease;
+
+use crate::constants::{
+    DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_X, DEFAULT_Y, MIN_HEIGHT, MIN_WIDTH, ResizeDirection,
+};
 
 pub struct Size {
     cols: u16,
@@ -42,21 +46,8 @@ pub struct Overlay {
     pub is_dead: bool,
 }
 
-use crate::app::input::keyboard::handle_keyboard_input;
-use crate::app::input::mouse::handle_mouse;
-use crate::constants::{self, *};
-
 impl Overlay {
     pub fn new() -> Self {
-        //Get Terminal Size
-        let term_size = match crossterm::terminal::size() {
-            Ok((cols, rows)) => (cols, rows),
-            Err(e) => {
-                eprintln!("Failed to get terminal size: {}", e);
-                (constants::DEFAULT_WIDTH, constants::DEFAULT_HEIGHT)
-            }
-        };
-
         let overlay = Self {
             rect: Rect::new(DEFAULT_X, DEFAULT_Y, DEFAULT_WIDTH, DEFAULT_HEIGHT),
             dragging: false,
@@ -64,8 +55,8 @@ impl Overlay {
             resizing: false,
             resize_direction: None,
             size: Size {
-                cols: term_size.0,
-                rows: term_size.1,
+                cols: DEFAULT_WIDTH,
+                rows: DEFAULT_HEIGHT,
             },
             is_dead: true,
         };
@@ -183,7 +174,7 @@ impl Overlay {
 
         let mut rx = lease.tenant_rx.take().unwrap();
 
-        // Critical addition: Clear terminal buffer before displaying anything
+        // Critical: Clear terminal buffer before displaying anything
         let stdout = terminal.backend_mut();
         queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
         std::io::Write::flush(stdout)?;
@@ -208,9 +199,6 @@ impl Overlay {
         });
 
         self.is_dead = false;
-
-        // Run the terminal UI with PTY status monitoring
-        self.run(lease, &mut terminal).await?;
 
         // Restore terminal state
         disable_raw_mode()?;
@@ -237,83 +225,13 @@ impl Overlay {
         Ok(())
     }
 
-    pub async fn run<B: Backend>(
-        &mut self,
-        lease: &mut Lease,
-        terminal: &mut Terminal<B>,
-    ) -> Result<()> {
-        if !lease.tenant_visible {
-            return Ok(());
-        }
-        let mut stdout = io::stdout();
-        queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
-        stdout.flush()?;
-        terminal.clear()?;
-
-        // Clone shared references needed in the loop to avoid repeated immutable borrows
-        let tenant_parser = lease.tenant_parser.clone();
-        let tenant_tx = lease.tenant_tx.clone();
-
-        loop {
-            // Immutable borrow only of tenant_parser
-            let screen = {
-                let parser = tenant_parser.read().unwrap();
-                parser.screen().clone()
-            };
-
-            terminal.draw(|f| self.render(f, &screen))?;
-
-            // Poll for terminal events with a short timeout
-            if event::poll(std::time::Duration::from_millis(0))? {
-                let (term_width, term_height) = crossterm::terminal::size()?;
-
-                match event::read()? {
-                    Event::Key(key_event) => {
-                        if handle_keyboard_input(
-                            lease,
-                            &tenant_tx,
-                            key_event,
-                            (term_width, term_height),
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    Event::Mouse(m) => handle_mouse(self, m, (term_width, term_height)),
-                    Event::FocusGained => {}
-                    Event::FocusLost => {
-                        //FIX:
-                        println!("focus lost");
-                        lease.tenant_visible = false;
-                    }
-                    Event::Paste(_) => {}
-                    Event::Resize(cols, rows) => {
-                        tenant_parser.write().unwrap().set_size(rows, cols);
-                    }
-                };
-            }
-
-            // Only immutable borrow of tenant_status_rx here
-            if let Ok(true) = lease.tenant_status_rx.try_recv() {
-                self.is_dead = true;
-                break;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        Ok(())
-    }
-
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
-        // Create the terminal block with borders
         let block = Block::default()
             .borders(Borders::ALL)
             .title_position(Position::Bottom)
             .title_alignment(ratatui::layout::Alignment::Right)
             .title("uncl 0.1a")
-            .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(Color::Reset));
 
         let pseudo_term = PseudoTerminal::new(screen).block(block.clone()).cursor(
             tui_term::widget::Cursor::default().style(

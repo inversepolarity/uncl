@@ -67,4 +67,8 @@ impl Lease {
             tenant_status_rx: tpty_status_rx,
         }
     }
+
+    pub fn resize_screen(&mut self, rows: u16, cols: u16) {
+        self.tenant_parser.write().unwrap().set_size(rows, cols);
+    }
 }

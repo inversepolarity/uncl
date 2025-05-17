@@ -1,8 +1,9 @@
-use crate::app::ui::tenant::Overlay;
+use crate::app::lease::Lease;
 use crate::constants::{MIN_HEIGHT, MIN_WIDTH, ResizeDirection};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
-pub fn handle_mouse(overlay: &mut Overlay, m: MouseEvent, bounds: (u16, u16)) {
+pub fn handle_mouse(lease: &mut Lease, m: MouseEvent, bounds: (u16, u16)) {
+    let overlay = &mut lease.tenant;
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let rect = overlay.rect;
@@ -68,6 +69,7 @@ pub fn handle_mouse(overlay: &mut Overlay, m: MouseEvent, bounds: (u16, u16)) {
 
                     if new_width >= MIN_WIDTH && new_height >= MIN_HEIGHT {
                         overlay.resize_to(new_x, new_y, new_width, new_height, bounds);
+                        lease.resize_screen(new_height, new_width);
                     }
                 }
             } else if overlay.dragging {

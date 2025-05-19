@@ -6,6 +6,5 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
   <img src="screenshot.jpg" height="200" /> 
 </p>
 
-
 > [!WARNING]
 > Early alpha release, expect glitches and bugs.

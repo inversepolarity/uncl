@@ -85,7 +85,7 @@ pub async fn handle_keyboard_input(
         }
 
         KeyCode::Enter => {
-            sender.send(Bytes::from(vec![b'\n'])).await.unwrap();
+            sender.send(Bytes::from(vec![b'\r'])).await.unwrap();
         }
 
         KeyCode::Backspace => {

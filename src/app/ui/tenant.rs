@@ -285,6 +285,8 @@ impl Overlay {
         self.rect.y = y;
         self.rect.width = width;
         self.rect.height = height;
+        self.size.cols = width;
+        self.size.rows = height;
     }
 
     pub fn move_to(&mut self, target_x: u16, target_y: u16, bounds: (u16, u16)) {

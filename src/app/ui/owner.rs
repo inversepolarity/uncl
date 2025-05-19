@@ -120,9 +120,12 @@ impl Container {
         let slave = pair.slave;
 
         //Prepare the shell command
-        let mut cmd = CommandBuilder::new_default_prog();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let mut cmd = CommandBuilder::new(shell);
         let cwd = std::env::current_dir().unwrap();
+        cmd.args(&["-y", "-i", "--login"]);
         cmd.cwd(cwd);
+        cmd.env("TERM", "xterm-256color");
 
         // Clone the status sender for the child process monitoring
         let child_status_tx = self.status_tx.clone();
@@ -275,6 +278,7 @@ impl Container {
         queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
         stdout.flush()?;
         terminal.clear()?;
+        terminal.flush()?;
 
         loop {
             terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
@@ -314,6 +318,7 @@ impl Container {
                     Event::FocusLost => {}
                     Event::Paste(_) => {}
                     Event::Resize(cols, rows) => {
+                        //TODO: fix
                         parser.write().unwrap().set_size(rows, cols);
                         if self.lease.tenant_visible {
                             println!("did resize");

@@ -4,6 +4,8 @@ use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::Sender;
 
+/// Handle keyboard input events for terminal multiplexer
+/// Returns a boolean indicating whether the application should exit
 pub async fn handle_keyboard_input(
     lease: &mut Lease,
     sender: &Sender<Bytes>,
@@ -15,81 +17,186 @@ pub async fn handle_keyboard_input(
     let width = lease.tenant.rect.width;
     let height = lease.tenant.rect.height;
 
-    let target_sender = sender;
+    // Special multiplexer commands handled first (these DON'T pass through to the application)
+    // Using Home key as the "leader" key for multiplexer commands
+    if key_event.code == KeyCode::Home {
+        // Toggle tenant visibility
+        lease.tenant_visible = !lease.tenant_visible;
+        return false;
+    }
 
-    match key_event.code {
-        KeyCode::Char(input) => target_sender
-            .send(Bytes::from(input.to_string().into_bytes()))
-            .await
-            .unwrap(),
-
-        KeyCode::Backspace => {
-            target_sender.send(Bytes::from(vec![8])).await.unwrap();
-        }
-
-        KeyCode::Home => {
-            lease.tenant_visible = !lease.tenant_visible;
-            return false;
-        }
-
-        KeyCode::Enter => {
-            target_sender.send(Bytes::from(vec![b'\n'])).await.unwrap();
-        }
-
-        KeyCode::Left => {
-            if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+    // Multiplexer resize/move commands with Shift/Ctrl modifiers
+    // These control the terminal window itself and don't send anything to the app
+    if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+        match key_event.code {
+            KeyCode::Left => {
                 lease
                     .tenant
                     .resize_to(x, y, width.saturating_sub(1), height, term_size);
-            } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                lease.tenant.move_to(x.saturating_sub(1), y, term_size);
+                return false;
             }
-
-            target_sender
-                .send(Bytes::from(vec![27, 91, 68]))
-                .await
-                .unwrap()
-        }
-
-        KeyCode::Right => {
-            if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+            KeyCode::Right => {
                 lease.tenant.resize_to(x, y, width + 1, height, term_size);
-            } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                lease.tenant.move_to(x + 1, y, term_size);
+                return false;
             }
-
-            target_sender
-                .send(Bytes::from(vec![27, 91, 67]))
-                .await
-                .unwrap()
-        }
-
-        KeyCode::Up => {
-            if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+            KeyCode::Up => {
                 lease
                     .tenant
                     .resize_to(x, y, width, height.saturating_sub(1), term_size);
-            } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                lease.tenant.move_to(x, y.saturating_sub(1), term_size);
+                return false;
             }
+            KeyCode::Down => {
+                lease.tenant.resize_to(x, y, width, height + 1, term_size);
+                return false;
+            }
+            _ => {} // Pass other keys through
+        }
+    } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+        match key_event.code {
+            KeyCode::Left => {
+                lease.tenant.move_to(x.saturating_sub(1), y, term_size);
+                return false;
+            }
+            KeyCode::Right => {
+                lease.tenant.move_to(x + 1, y, term_size);
+                return false;
+            }
+            KeyCode::Up => {
+                lease.tenant.move_to(x, y.saturating_sub(1), term_size);
+                return false;
+            }
+            KeyCode::Down => {
+                lease.tenant.move_to(x, y + 1, term_size);
+                return false;
+            }
+            _ => {} // Pass other control keys through to the application
+        }
+    }
 
-            target_sender
-                .send(Bytes::from(vec![27, 91, 65]))
+    // For all other keys, pass them through to the application
+
+    // Handle regular characters
+    match key_event.code {
+        KeyCode::Char(c) => {
+            if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                // Handle control characters (ASCII 1-26)
+                let ctrl_char = (c as u8) & 0x1F;
+                sender.send(Bytes::from(vec![ctrl_char])).await.unwrap();
+            } else if key_event.modifiers.contains(KeyModifiers::ALT) {
+                // For Alt+key, send ESC followed by the key
+                sender.send(Bytes::from(vec![27, c as u8])).await.unwrap();
+            } else {
+                // Regular character
+                sender
+                    .send(Bytes::from(c.to_string().into_bytes()))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        KeyCode::Enter => {
+            sender.send(Bytes::from(vec![b'\n'])).await.unwrap();
+        }
+
+        KeyCode::Backspace => {
+            sender.send(Bytes::from(vec![8])).await.unwrap();
+        }
+
+        KeyCode::Delete => {
+            // Send the standard escape sequence for Delete key
+            sender
+                .send(Bytes::from(vec![27, 91, 51, 126]))
                 .await
-                .unwrap()
+                .unwrap();
+        }
+
+        KeyCode::Tab => {
+            sender.send(Bytes::from(vec![9])).await.unwrap();
+        }
+
+        KeyCode::BackTab => {
+            sender.send(Bytes::from(vec![27, 91, 90])).await.unwrap();
+        }
+
+        KeyCode::Left => {
+            sender.send(Bytes::from(vec![27, 91, 68])).await.unwrap();
+        }
+
+        KeyCode::Right => {
+            sender.send(Bytes::from(vec![27, 91, 67])).await.unwrap();
+        }
+
+        KeyCode::Up => {
+            sender.send(Bytes::from(vec![27, 91, 65])).await.unwrap();
         }
 
         KeyCode::Down => {
-            if key_event.modifiers.contains(KeyModifiers::SHIFT) {
-                lease.tenant.resize_to(x, y, width, height + 1, term_size);
-            } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                lease.tenant.move_to(x, y + 1, term_size);
-            }
+            sender.send(Bytes::from(vec![27, 91, 66])).await.unwrap();
+        }
 
-            target_sender
-                .send(Bytes::from(vec![27, 91, 66]))
+        KeyCode::Esc => {
+            sender.send(Bytes::from(vec![27])).await.unwrap();
+        }
+
+        KeyCode::End => {
+            sender.send(Bytes::from(vec![27, 91, 70])).await.unwrap();
+        }
+
+        KeyCode::PageUp => {
+            sender
+                .send(Bytes::from(vec![27, 91, 53, 126]))
                 .await
-                .unwrap()
+                .unwrap();
+        }
+
+        KeyCode::PageDown => {
+            sender
+                .send(Bytes::from(vec![27, 91, 54, 126]))
+                .await
+                .unwrap();
+        }
+
+        KeyCode::F(n) => {
+            // Function keys
+            match n {
+                1 => sender.send(Bytes::from(vec![27, 79, 80])).await.unwrap(),
+                2 => sender.send(Bytes::from(vec![27, 79, 81])).await.unwrap(),
+                3 => sender.send(Bytes::from(vec![27, 79, 82])).await.unwrap(),
+                4 => sender.send(Bytes::from(vec![27, 79, 83])).await.unwrap(),
+                5 => sender
+                    .send(Bytes::from(vec![27, 91, 49, 53, 126]))
+                    .await
+                    .unwrap(),
+                6 => sender
+                    .send(Bytes::from(vec![27, 91, 49, 55, 126]))
+                    .await
+                    .unwrap(),
+                7 => sender
+                    .send(Bytes::from(vec![27, 91, 49, 56, 126]))
+                    .await
+                    .unwrap(),
+                8 => sender
+                    .send(Bytes::from(vec![27, 91, 49, 57, 126]))
+                    .await
+                    .unwrap(),
+                9 => sender
+                    .send(Bytes::from(vec![27, 91, 50, 48, 126]))
+                    .await
+                    .unwrap(),
+                10 => sender
+                    .send(Bytes::from(vec![27, 91, 50, 49, 126]))
+                    .await
+                    .unwrap(),
+                11 => sender
+                    .send(Bytes::from(vec![27, 91, 50, 51, 126]))
+                    .await
+                    .unwrap(),
+                12 => sender
+                    .send(Bytes::from(vec![27, 91, 50, 52, 126]))
+                    .await
+                    .unwrap(),
+                _ => {}
+            }
         }
 
         _ => return false,
@@ -97,3 +204,4 @@ pub async fn handle_keyboard_input(
 
     false
 }
+

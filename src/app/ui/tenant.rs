@@ -230,6 +230,8 @@ impl Overlay {
             .borders(Borders::ALL)
             .title_position(Position::Bottom)
             .title_alignment(ratatui::layout::Alignment::Right)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Color::Green)
             .title("uncl 0.1a")
             .style(Style::default().bg(Color::Reset));
 

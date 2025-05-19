@@ -4,8 +4,6 @@ use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::Sender;
 
-/// Handle keyboard input events for terminal multiplexer
-/// Returns a boolean indicating whether the application should exit
 pub async fn handle_keyboard_input(
     lease: &mut Lease,
     sender: &Sender<Bytes>,
@@ -17,16 +15,11 @@ pub async fn handle_keyboard_input(
     let width = lease.tenant.rect.width;
     let height = lease.tenant.rect.height;
 
-    // Special multiplexer commands handled first (these DON'T pass through to the application)
-    // Using Home key as the "leader" key for multiplexer commands
     if key_event.code == KeyCode::Home {
-        // Toggle tenant visibility
         lease.tenant_visible = !lease.tenant_visible;
         return false;
     }
 
-    // Multiplexer resize/move commands with Shift/Ctrl modifiers
-    // These control the terminal window itself and don't send anything to the app
     if key_event.modifiers.contains(KeyModifiers::SHIFT) {
         match key_event.code {
             KeyCode::Left => {
@@ -73,8 +66,6 @@ pub async fn handle_keyboard_input(
         }
     }
 
-    // For all other keys, pass them through to the application
-
     // Handle regular characters
     match key_event.code {
         KeyCode::Char(c) => {
@@ -83,7 +74,6 @@ pub async fn handle_keyboard_input(
                 let ctrl_char = (c as u8) & 0x1F;
                 sender.send(Bytes::from(vec![ctrl_char])).await.unwrap();
             } else if key_event.modifiers.contains(KeyModifiers::ALT) {
-                // For Alt+key, send ESC followed by the key
                 sender.send(Bytes::from(vec![27, c as u8])).await.unwrap();
             } else {
                 // Regular character
@@ -204,4 +194,3 @@ pub async fn handle_keyboard_input(
 
     false
 }
-

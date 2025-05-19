@@ -8,3 +8,9 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 
 > [!WARNING]
 > Early alpha release, expect glitches and bugs.
+
+## features
+
+- spawn a floating terminal with a single key [Home], toggleable
+- floating term is draggable and resizeable with mouse
+- floating term is draggable and resizeable with keyboard

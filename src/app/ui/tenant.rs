@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, block::Position},
 };
 
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
 
 use crossterm::{
     cursor::MoveTo,
@@ -162,20 +162,19 @@ impl Overlay {
         }
 
         // Set up terminal
-        let mut stdout = io::stdout();
+        let backend = CrosstermBackend::new(std::io::stdout());
+        let mut terminal = Terminal::new(backend)?;
+
+        let mut rx = lease.tenant_rx.take().unwrap();
+
+        let stdout = terminal.backend_mut();
         execute!(stdout, ResetColor)?;
 
         enable_raw_mode()?;
 
         execute!(stdout, EnableMouseCapture)?;
 
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-
-        let mut rx = lease.tenant_rx.take().unwrap();
-
         // Critical: Clear terminal buffer before displaying anything
-        let stdout = terminal.backend_mut();
         queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
         std::io::Write::flush(stdout)?;
 
@@ -226,15 +225,15 @@ impl Overlay {
     }
 
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
+        let t = format!("s:{}:{}", self.size.rows, self.size.cols);
         let block = Block::default()
             .borders(Borders::ALL)
             .title_position(Position::Bottom)
             .title_alignment(ratatui::layout::Alignment::Right)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(Color::Green)
-            .title("uncl 0.1a")
+            .title(t)
             .style(Style::default().bg(Color::Reset));
-
         let pseudo_term = PseudoTerminal::new(screen).block(block.clone()).cursor(
             tui_term::widget::Cursor::default().style(
                 ratatui::style::Style::default()

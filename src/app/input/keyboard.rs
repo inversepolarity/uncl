@@ -72,6 +72,7 @@ pub async fn handle_keyboard_input(
             if key_event.modifiers.contains(KeyModifiers::CONTROL) {
                 // Handle control characters (ASCII 1-26)
                 let ctrl_char = (c as u8) & 0x1F;
+                //TODO: try sync send
                 sender.send(Bytes::from(vec![ctrl_char])).await.unwrap();
             } else if key_event.modifiers.contains(KeyModifiers::ALT) {
                 sender.send(Bytes::from(vec![27, c as u8])).await.unwrap();

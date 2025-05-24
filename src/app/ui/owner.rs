@@ -17,7 +17,9 @@ use std::{
 
 use crossterm::{
     cursor::MoveTo,
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind, poll, read,
+    },
     execute, queue,
     style::ResetColor,
     terminal::{
@@ -239,28 +241,28 @@ impl Container {
 
         // Restore terminal state
         //if self.tenant_running() {
-        // TODO: kill tenant here
+        // TODO: kill tenant processes here
         //}
 
         disable_raw_mode()?;
         execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
         Ok(())
     }
 
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
         let block = Block::default().borders(Borders::NONE);
         let pseudo_term_owner = PseudoTerminal::new(screen).block(block.clone()).cursor(
-            tui_term::widget::Cursor::default().style(
-                ratatui::style::Style::default()
-                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK),
-            ),
+            tui_term::widget::Cursor::default()
+                .visibility(!self.lease.tenant_visible)
+                .style(
+                    ratatui::style::Style::default()
+                        .add_modifier(ratatui::style::Modifier::RAPID_BLINK),
+                ),
         );
 
         let inner = block.inner(self.rect);
         f.render_widget(pseudo_term_owner, inner);
         f.render_widget(block.clone(), inner);
-
         if self.lease.tenant_visible && self.tenant_running() {
             self.lease
                 .tenant
@@ -283,11 +285,11 @@ impl Container {
         loop {
             terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
 
-            let mut kb_sender: Sender<Bytes> = self.tx.clone();
+            let mut sender: Sender<Bytes> = self.tx.clone();
 
             if self.lease.tenant_visible {
                 if self.tenant_running() {
-                    kb_sender = self.lease.tenant_tx.clone();
+                    sender = self.lease.tenant_tx.clone();
                 } else {
                     // Important: If tenant is visible but not running, reset state
                     self.lease.tenant_visible = false;
@@ -295,14 +297,14 @@ impl Container {
             }
 
             // Poll for terminal events with a short timeout
-            if event::poll(std::time::Duration::from_millis(0))? {
+            if poll(std::time::Duration::from_millis(0))? {
                 let (term_width, term_height) = crossterm::terminal::size()?;
 
-                match event::read()? {
+                match read()? {
                     Event::Key(key_event) => {
                         if handle_keyboard_input(
                             &mut self.lease,
-                            &kb_sender,
+                            &sender,
                             key_event,
                             (term_width, term_height),
                         )
@@ -312,6 +314,15 @@ impl Container {
                         }
                     }
                     Event::Mouse(m) => {
+                        match m.kind {
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                //TODO: handle click
+                            }
+                            MouseEventKind::Up(MouseButton::Right) => {
+                                //TODO: handle click
+                            }
+                            _ => {}
+                        }
                         handle_mouse(&mut self.lease, m, (term_width, term_height));
                     }
                     Event::FocusGained => {}
@@ -346,6 +357,7 @@ impl Container {
                 self.lease = self.lease.renew();
                 self.init_tenant().await?;
                 enable_raw_mode()?;
+                execute!(stdout, EnableMouseCapture)?;
             }
 
             // Small sleep to prevent CPU spinning

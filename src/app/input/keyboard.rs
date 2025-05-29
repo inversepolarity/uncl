@@ -23,44 +23,116 @@ pub async fn handle_keyboard_input(
     if key_event.modifiers.contains(KeyModifiers::SHIFT) {
         match key_event.code {
             KeyCode::Left => {
-                lease
-                    .tenant
-                    .resize_to(x, y, width.saturating_sub(1), height, term_size);
-                return false;
+                if lease.tenant_visible {
+                    lease
+                        .tenant
+                        .resize_to(x, y, width.saturating_sub(1), height, term_size);
+                    return false;
+                } else {
+                    // Send Shift+Left escape sequence
+                    sender
+                        .send(Bytes::from(b"\x1b[1;2D".to_vec()))
+                        .await
+                        .unwrap();
+                    return false;
+                }
             }
             KeyCode::Right => {
-                lease.tenant.resize_to(x, y, width + 1, height, term_size);
-                return false;
+                if lease.tenant_visible {
+                    lease.tenant.resize_to(x, y, width + 1, height, term_size);
+                    return false;
+                } else {
+                    // Send Shift+Right escape sequence
+                    sender
+                        .send(Bytes::from(b"\x1b[1;2C".to_vec()))
+                        .await
+                        .unwrap();
+                    return false;
+                }
             }
             KeyCode::Up => {
-                lease
-                    .tenant
-                    .resize_to(x, y, width, height.saturating_sub(1), term_size);
-                return false;
+                if lease.tenant_visible {
+                    lease
+                        .tenant
+                        .resize_to(x, y, width, height.saturating_sub(1), term_size);
+                    return false;
+                } else {
+                    // Send Shift+Up escape sequence
+                    sender
+                        .send(Bytes::from(b"\x1b[1;2A".to_vec()))
+                        .await
+                        .unwrap();
+                    return false;
+                }
             }
             KeyCode::Down => {
-                lease.tenant.resize_to(x, y, width, height + 1, term_size);
-                return false;
+                if lease.tenant_visible {
+                    lease.tenant.resize_to(x, y, width, height + 1, term_size);
+                    return false;
+                } else {
+                    // Send Shift+Down escape sequence
+                    sender
+                        .send(Bytes::from(b"\x1b[1;2B".to_vec()))
+                        .await
+                        .unwrap();
+                    return false;
+                }
             }
             _ => {} // Pass other keys through
         }
     } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
         match key_event.code {
             KeyCode::Left => {
-                lease.tenant.move_to(x.saturating_sub(1), y, term_size);
-                return false;
+                if lease.tenant_visible {
+                    lease.tenant.move_to(x.saturating_sub(1), y, term_size);
+                    return false;
+                } else {
+                    // Send Ctrl+Left escape sequence
+                    sender
+                        .send(Bytes::from(b"\x1b[1;5D".to_vec()))
+                        .await
+                        .unwrap();
+                    return false;
+                }
             }
             KeyCode::Right => {
-                lease.tenant.move_to(x + 1, y, term_size);
-                return false;
+                if lease.tenant_visible {
+                    lease.tenant.move_to(x + 1, y, term_size);
+                    return false;
+                } else {
+                    // Send Ctrl+Right escape sequence
+                    sender
+                        .send(Bytes::from(b"\x1b[1;5C".to_vec()))
+                        .await
+                        .unwrap();
+                    return false;
+                }
             }
             KeyCode::Up => {
-                lease.tenant.move_to(x, y.saturating_sub(1), term_size);
-                return false;
+                if lease.tenant_visible {
+                    lease.tenant.move_to(x, y.saturating_sub(1), term_size);
+                    return false;
+                } else {
+                    // Send Ctrl+Up escape sequence
+                    sender
+                        .send(Bytes::from(b"\x1b[1;5A".to_vec()))
+                        .await
+                        .unwrap();
+                    return false;
+                }
             }
             KeyCode::Down => {
-                lease.tenant.move_to(x, y + 1, term_size);
-                return false;
+                if lease.tenant_visible {
+                    lease.tenant.move_to(x, y + 1, term_size);
+                    return false;
+                } else {
+                    // Send Ctrl+Down escape sequence
+                    sender
+                        .send(Bytes::from(b"\x1b[1;5B".to_vec()))
+                        .await
+                        .unwrap();
+                    return false;
+                }
             }
             _ => {} // Pass other control keys through to the application
         }

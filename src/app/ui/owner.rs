@@ -1,5 +1,4 @@
 use anyhow::Result;
-
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::{
     Frame, Terminal,
@@ -12,7 +11,10 @@ use bytes::Bytes;
 
 use std::{
     io::{self, BufWriter, Read, Write},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crossterm::{
@@ -57,6 +59,7 @@ pub struct Container {
     pub status_tx: Sender<bool>,
     pub status_rx: Option<Receiver<bool>>,
     pub lease: Lease,
+    pub mouse_mode_enabled: Arc<AtomicBool>,
 }
 
 impl Container {
@@ -73,7 +76,7 @@ impl Container {
         let (pty_status_tx, pty_status_rx) = channel::<bool>(1);
 
         let lease = Lease::new();
-
+        let mouse_mode_enabled = Arc::new(AtomicBool::new(false));
         let container = Self {
             rect,
             parser,
@@ -83,6 +86,7 @@ impl Container {
             status_tx: pty_status_tx,
             status_rx: Some(pty_status_rx),
             lease,
+            mouse_mode_enabled,
         };
 
         container
@@ -117,6 +121,7 @@ impl Container {
             Err(e) => return Err(e.into()),
         };
 
+        enable_raw_mode()?;
         //Get pty master/slave
         let master = pair.master;
         let slave = pair.slave;
@@ -166,6 +171,8 @@ impl Container {
 
         {
             let parser = self.parser.clone();
+            let mouse_tracker = self.mouse_mode_enabled.clone();
+
             task::spawn_blocking(move || {
                 let mut buf = [0u8; 8192];
                 // TODO: magic number?
@@ -195,6 +202,58 @@ impl Container {
 
                     if size > 0 {
                         processed_buf.extend_from_slice(&buf[..size]);
+
+                        let data_str = String::from_utf8_lossy(&processed_buf);
+
+                        // Check for mouse mode ENABLE sequences (more comprehensive)
+                        if data_str.contains("\x1b[?1000h") ||  // VT200 mouse tracking
+                        data_str.contains("\x1b[?1002h") ||  // VT200 button event mouse tracking
+                        data_str.contains("\x1b[?1003h") ||  // VT200 any event mouse tracking  
+                        data_str.contains("\x1b[?1006h") ||  // SGR mouse mode
+                        data_str.contains("\x1b[?1015h") ||  // URXVT mouse mode
+                        data_str.contains("\x1b[?9h") ||     // X10 mouse tracking
+                        data_str.contains("\x1b[?1005h") ||  // UTF-8 mouse mode
+                        data_str.contains("\x1b[?1004h")
+                        {
+                            // Focus events (often used with mouse)
+                            mouse_tracker.store(true, Ordering::Relaxed);
+                        }
+
+                        // Check for mouse mode DISABLE sequences
+                        if data_str.contains("\x1b[?1000l")
+                            || data_str.contains("\x1b[?1002l")
+                            || data_str.contains("\x1b[?1003l")
+                            || data_str.contains("\x1b[?1006l")
+                            || data_str.contains("\x1b[?1015l")
+                            || data_str.contains("\x1b[?9l")
+                            || data_str.contains("\x1b[?1005l")
+                            || data_str.contains("\x1b[?1004l")
+                        {
+                            mouse_tracker.store(false, Ordering::Relaxed);
+                        }
+
+                        // Additional check: Look for DECSET sequences that might indicate mouse capability
+                        if data_str.contains("\x1b[?47h") ||    // Alternate screen buffer (often used with mouse apps)
+                        data_str.contains("\x1b[?1047h") ||   // Alternate screen buffer
+                        data_str.contains("\x1b[?1049h")
+                        {
+                            // Alternate screen buffer + cursor save
+                            // Many mouse-capable apps use alternate screen, so enable mouse preemptively
+                            // but only if we're in a terminal that likely supports it
+                            if std::env::var("TERM").unwrap_or_default().contains("xterm")
+                                || std::env::var("TERM").unwrap_or_default().contains("screen")
+                            {
+                                mouse_tracker.store(true, Ordering::Relaxed);
+                            }
+                        }
+
+                        // Check for alternate screen disable (often means mouse apps are exiting)
+                        if data_str.contains("\x1b[?47l")
+                            || data_str.contains("\x1b[?1047l")
+                            || data_str.contains("\x1b[?1049l")
+                        {
+                            mouse_tracker.store(false, Ordering::Relaxed);
+                        }
                         let mut parser = parser.write().unwrap();
                         parser.process(&processed_buf);
                         // Clear the processed portion of the buffer
@@ -207,9 +266,6 @@ impl Container {
         // Set up terminal
         let mut stdout = io::stdout();
         execute!(stdout, ResetColor)?;
-
-        enable_raw_mode()?;
-
         execute!(stdout, EnableMouseCapture, EnterAlternateScreen,)?;
 
         let backend = CrosstermBackend::new(stdout);
@@ -283,8 +339,6 @@ impl Container {
         terminal.flush()?;
 
         loop {
-            terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
-
             let mut sender: Sender<Bytes> = self.tx.clone();
 
             if self.lease.tenant_visible {
@@ -314,16 +368,43 @@ impl Container {
                         }
                     }
                     Event::Mouse(m) => {
-                        match m.kind {
-                            MouseEventKind::Up(MouseButton::Left) => {
-                                //TODO: handle click
+                        if !self.lease.tenant_visible {
+                            // Only send mouse events if application has enabled mouse mode
+                            if self.mouse_mode_enabled.load(Ordering::Relaxed) {
+                                let (button_code, action) = match m.kind {
+                                    MouseEventKind::Down(MouseButton::Left) => (0, 'M'),
+                                    MouseEventKind::Up(MouseButton::Left) => (0, 'm'),
+                                    MouseEventKind::Down(MouseButton::Right) => (2, 'M'),
+                                    MouseEventKind::Up(MouseButton::Right) => (2, 'm'),
+                                    MouseEventKind::Down(MouseButton::Middle) => (1, 'M'),
+                                    MouseEventKind::Up(MouseButton::Middle) => (1, 'm'),
+                                    MouseEventKind::Drag(MouseButton::Left) => (32, 'M'),
+                                    MouseEventKind::Drag(MouseButton::Right) => (34, 'M'),
+                                    MouseEventKind::Drag(MouseButton::Middle) => (33, 'M'),
+                                    MouseEventKind::ScrollUp => (64, 'M'),
+                                    MouseEventKind::ScrollDown => (65, 'M'),
+                                    _ => (-1, ' '),
+                                };
+
+                                if button_code >= 0 {
+                                    let mouse_sequence = format!(
+                                        "\x1b[<{};{};{}{}",
+                                        button_code,
+                                        m.column + 1,
+                                        m.row + 1,
+                                        action
+                                    );
+
+                                    let bytes = Bytes::from(mouse_sequence.into_bytes());
+                                    if let Err(e) = sender.try_send(bytes) {
+                                        eprintln!("Failed to send mouse event: {}", e);
+                                    }
+                                }
                             }
-                            MouseEventKind::Up(MouseButton::Right) => {
-                                //TODO: handle click
-                            }
-                            _ => {}
+                            // If mouse mode not enabled, ignore mouse events completely
+                        } else {
+                            handle_mouse(&mut self.lease, m, (term_width, term_height));
                         }
-                        handle_mouse(&mut self.lease, m, (term_width, term_height));
                     }
                     Event::FocusGained => {}
                     Event::FocusLost => {}
@@ -332,7 +413,6 @@ impl Container {
                         //TODO: fix
                         parser.write().unwrap().set_size(rows, cols);
                         if self.lease.tenant_visible {
-                            println!("did resize");
                             self.lease.resize_screen(
                                 self.lease.tenant.rect.height,
                                 self.lease.tenant.rect.width,
@@ -362,6 +442,7 @@ impl Container {
 
             // Small sleep to prevent CPU spinning
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
         }
 
         Ok(())

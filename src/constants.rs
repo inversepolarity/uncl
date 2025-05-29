@@ -5,11 +5,6 @@ pub enum ResizeDirection {
     BottomRight,
 }
 
-pub enum ScrollDirection {
-    Up,
-    Down,
-}
-
 pub const MIN_WIDTH: u16 = 10;
 pub const MIN_HEIGHT: u16 = 10;
 

@@ -403,7 +403,7 @@ impl Container {
                             }
                             // If mouse mode not enabled, ignore mouse events completely
                         } else {
-                            handle_mouse(&mut self.lease, m, (term_width, term_height));
+                            handle_mouse(&mut self.lease, m, (term_width, term_height)).await;
                         }
                     }
                     Event::FocusGained => {}
@@ -413,10 +413,12 @@ impl Container {
                         //TODO: fix
                         parser.write().unwrap().set_size(rows, cols);
                         if self.lease.tenant_visible {
-                            self.lease.resize_screen(
-                                self.lease.tenant.rect.height,
-                                self.lease.tenant.rect.width,
-                            );
+                            self.lease
+                                .resize_screen(
+                                    self.lease.tenant.rect.height,
+                                    self.lease.tenant.rect.width,
+                                )
+                                .await;
                         }
                     }
                 };

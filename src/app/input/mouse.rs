@@ -3,7 +3,7 @@ use crate::constants::{MIN_HEIGHT, MIN_WIDTH, ResizeDirection};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-pub fn handle_mouse(lease: &mut Lease, m: MouseEvent, bounds: (u16, u16)) {
+pub async fn handle_mouse(lease: &mut Lease, m: MouseEvent, bounds: (u16, u16)) {
     let overlay = &mut lease.tenant;
     let rect = overlay.rect;
     let x = m.column;
@@ -78,7 +78,7 @@ pub fn handle_mouse(lease: &mut Lease, m: MouseEvent, bounds: (u16, u16)) {
 
                     if new_width >= MIN_WIDTH && new_height >= MIN_HEIGHT {
                         overlay.resize_to(new_x, new_y, new_width, new_height, bounds);
-                        lease.resize_screen(new_height, new_width);
+                        lease.resize_screen(new_height, new_width).await;
                     }
                 }
             } else if overlay.dragging {

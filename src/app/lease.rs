@@ -72,7 +72,7 @@ impl Lease {
         }
     }
 
-    pub fn resize_screen(&mut self, rows: u16, cols: u16) {
+    pub async fn resize_screen(&mut self, rows: u16, cols: u16) {
         // Update the parser size
         self.tenant_parser.write().unwrap().set_size(rows, cols);
 

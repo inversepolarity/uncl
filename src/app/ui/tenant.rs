@@ -81,6 +81,12 @@ impl Overlay {
         let master = pair.master;
         let slave = pair.slave;
 
+        // Create a channel for resize operations
+        let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(10);
+
+        // Set the resize sender in the lease
+        lease.set_resize_sender(resize_tx);
+
         //Prepare the shell command
         let mut cmd = CommandBuilder::new_default_prog();
         let cwd = std::env::current_dir().unwrap();
@@ -88,6 +94,30 @@ impl Overlay {
 
         // Clone the status sender for the child process monitoring
         let child_status_tx = lease.tenant_status_tx.clone();
+        let resize_status_tx = lease.tenant_status_tx.clone();
+
+        let mut writer = BufWriter::new(master.take_writer().unwrap());
+        let mut reader = master.try_clone_reader().unwrap();
+
+        task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                while let Some((rows, cols)) = resize_rx.recv().await {
+                    if let Err(e) = master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_height: 0,
+                        pixel_width: 0,
+                    }) {
+                        eprintln!("Failed to resize PTY: {}", e);
+                        // Optionally signal error
+                        let _ = resize_status_tx.send(true).await;
+                        break;
+                    }
+                }
+            });
+            drop(master);
+        });
 
         //Spawn the shell in pty and monitor for exit
         task::spawn_blocking(move || {
@@ -114,9 +144,6 @@ impl Overlay {
                 let _ = child_status_tx.send(true).await;
             });
         });
-
-        let mut writer = BufWriter::new(master.take_writer().unwrap());
-        let mut reader = master.try_clone_reader().unwrap();
 
         // Clone status sender for the reader task
         let reader_status_tx = lease.tenant_status_tx.clone();
@@ -192,9 +219,6 @@ impl Overlay {
                     break;
                 }
             }
-            // Clean up resources
-            drop(writer);
-            drop(master);
         });
 
         self.is_dead = false;

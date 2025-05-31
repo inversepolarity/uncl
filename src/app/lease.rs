@@ -1,6 +1,7 @@
 use crate::app::ui::tenant::Overlay;
 use crate::constants::*;
 use bytes::Bytes;
+
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
@@ -12,6 +13,7 @@ pub struct Lease {
     pub tenant_rx: Option<Receiver<Bytes>>,
     pub tenant_status_tx: Sender<bool>,
     pub tenant_status_rx: Receiver<bool>,
+    pub tenant_resize_tx: Option<Sender<(u16, u16)>>,
 }
 
 impl Lease {
@@ -33,6 +35,7 @@ impl Lease {
             tenant_rx: Some(trx),
             tenant_status_tx: tpty_status_tx,
             tenant_status_rx: tpty_status_rx,
+            tenant_resize_tx: None,
         };
 
         lease
@@ -65,10 +68,23 @@ impl Lease {
             tenant_rx: Some(trx),
             tenant_status_tx: tpty_status_tx,
             tenant_status_rx: tpty_status_rx,
+            tenant_resize_tx: None,
         }
     }
 
     pub fn resize_screen(&mut self, rows: u16, cols: u16) {
+        // Update the parser size
         self.tenant_parser.write().unwrap().set_size(rows, cols);
+
+        // Send resize command through channel if available
+        if let Some(resize_tx) = &self.tenant_resize_tx {
+            if let Err(e) = resize_tx.try_send((rows, cols)) {
+                eprintln!("Failed to send resize command: {}", e);
+            }
+        }
+    }
+
+    pub fn set_resize_sender(&mut self, resize_tx: Sender<(u16, u16)>) {
+        self.tenant_resize_tx = Some(resize_tx);
     }
 }

@@ -249,7 +249,7 @@ impl Overlay {
     }
 
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
-        let t = format!("s:{}:{}", self.size.rows, self.size.cols);
+        let t = format!("uncl 0.1b | {}:{}", self.size.rows, self.size.cols);
         let block = Block::default()
             .borders(Borders::ALL)
             .title_position(Position::Bottom)

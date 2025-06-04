@@ -27,7 +27,7 @@ pub async fn handle_keyboard_input(
                     lease
                         .tenant
                         .resize_to(x, y, width.saturating_sub(1), height, term_size);
-                    lease.resize_screen(height, width.saturating_sub(1));
+                    lease.resize_screen(height, width.saturating_sub(1)).await;
                     return false;
                 } else {
                     // Send Shift+Left escape sequence
@@ -41,7 +41,7 @@ pub async fn handle_keyboard_input(
             KeyCode::Right => {
                 if lease.tenant_visible {
                     lease.tenant.resize_to(x, y, width + 1, height, term_size);
-                    lease.resize_screen(height, width + 1);
+                    lease.resize_screen(height, width + 1).await;
                     return false;
                 } else {
                     // Send Shift+Right escape sequence
@@ -57,7 +57,7 @@ pub async fn handle_keyboard_input(
                     lease
                         .tenant
                         .resize_to(x, y, width, height.saturating_sub(1), term_size);
-                    lease.resize_screen(height.saturating_sub(1), width);
+                    lease.resize_screen(height.saturating_sub(1), width).await;
                     return false;
                 } else {
                     // Send Shift+Up escape sequence
@@ -71,7 +71,7 @@ pub async fn handle_keyboard_input(
             KeyCode::Down => {
                 if lease.tenant_visible {
                     lease.tenant.resize_to(x, y, width, height + 1, term_size);
-                    lease.resize_screen(height + 1, width);
+                    lease.resize_screen(height + 1, width).await;
                     return false;
                 } else {
                     // Send Shift+Down escape sequence

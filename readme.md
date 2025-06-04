@@ -5,7 +5,7 @@
 
 ## inspiration
 
-terminal multiplexers are overkill. tmux involves a learning curve most could do without and zellij is ... an acquired taste lets just say. what if there was something for the terminal monotasker among us, something simpler than existing solutions that makes that extra terminal tab unncessary, minimizing context-switch cognitive load and looks cool while doing it.
+terminal multiplexers are overkill. tmux involves a learning curve most could do without and zellij is ... an acquired taste lets just say. what if there was something for the terminal monotasker among us, something simpler than existing solutions that makes that extra terminal tab unncessary, something that minimises context-switch cognitive load and looks cool while doing it.
 
 ## introduction
 

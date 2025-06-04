@@ -68,8 +68,8 @@ impl Overlay {
         let pty_system = native_pty_system();
         //Create pty pair
         let pair = match pty_system.openpty(PtySize {
-            rows: self.size.rows,
-            cols: self.size.cols,
+            rows: self.size.rows - 4,
+            cols: self.size.cols - 4,
             pixel_height: 0,
             pixel_width: 0,
         }) {
@@ -104,8 +104,8 @@ impl Overlay {
             rt.block_on(async {
                 while let Some((rows, cols)) = resize_rx.recv().await {
                     if let Err(e) = master.resize(PtySize {
-                        rows,
-                        cols,
+                        rows: rows - 4,
+                        cols: cols - 4,
                         pixel_height: 0,
                         pixel_width: 0,
                     }) {

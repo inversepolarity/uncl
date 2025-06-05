@@ -23,5 +23,16 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - supports most shells, tested on zsh, bash
 - supports most terminal emulators, tested on wezterm, windows terminal
 
+## demo 
+
+![demo](demo.gif)
+
+## installation
+
+no binaries available until stable beta, build from source
+
+## build 
+
+`cargo run --release`
 
 P.S. you can run tmux/zellij inside it!

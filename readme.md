@@ -19,7 +19,7 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - floating term is draggable and resizeable with mouse
 - floating term is draggable and resizeable with keyboard
 - supports most shells, tested on zsh, bash
-- supports most terminal emulators, tested on wezterm
+- supports most terminal emulators, tested on wezterm, windows terminal
 
 
 P.S. you can run tmux/zellij inside it!

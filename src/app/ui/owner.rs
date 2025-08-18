@@ -443,7 +443,7 @@ impl Container {
             }
 
             // Small sleep to prevent CPU spinning
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
         }
 

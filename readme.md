@@ -13,7 +13,7 @@ terminal multiplexers are overkill. tmux involves a learning curve most could do
 
 uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable floating term window as an accomplice to your worst terminal misdeeds, written in rust.
 
-![uncl](screenshot.jpg)
+![uncl](screenshot.png)
 
 ## features
 

@@ -34,9 +34,13 @@ pub const INPUT_DRAIN_BUDGET: usize = 512;
 /// Cap on how many bytes we coalesce into a single write to a child PTY.
 pub const PTY_WRITE_BATCH: usize = 64 * 1024;
 
-/// Rows/cols consumed by the floating window's border, title and padding.
-pub const TENANT_CHROME_ROWS: u16 = 4;
-pub const TENANT_CHROME_COLS: u16 = 4;
+/// Cells the floating window's border eats on each side.
+///
+/// This used to be a flat `- 4` applied to the pty *and* the grid while the
+/// widget painted into `rect - 2`, so a full-screen app drew for a size we never
+/// rendered. The border is one cell per side, so this is the only number that
+/// keeps the pty, the parser and the painted area in agreement.
+pub const TENANT_BORDER: u16 = 1;
 
 /// `vt100` 0.18 requires non-zero dimensions (it used to panic on zero), so
 /// every size that comes from the environment goes through here.

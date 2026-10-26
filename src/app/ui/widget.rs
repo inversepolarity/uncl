@@ -4,51 +4,22 @@
 //! terminal modes (mouse protocol, cursor visibility, …) instead of sniffing the
 //! byte stream. Rather than vendor 1,200 lines of widget plumbing for the ~50 we
 //! use, this draws a `vt100::Screen` into a `ratatui::Buffer` directly.
+//!
+//! The cursor is deliberately *not* painted here. Painting it as a styled cell
+//! is what broke the cursor in S0: a `RAPID_BLINK` modifier on a blank cell is
+//! indistinguishable from no cursor, and it can never blink the way the user's
+//! terminal blinks. The real hardware cursor is placed by the owner loop with
+//! `Frame::set_cursor_position`, so it blinks, and takes the shape, that the
+//! user's terminal is configured for.
 
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-    widgets::{Block, Clear, Widget},
-};
+use ratatui::{buffer::Buffer, layout::Rect, widgets::Block, widgets::Clear, widgets::Widget};
 use vt100::Screen;
 
 use super::adapter::apply_cell;
 
-/// How to draw the cursor on top of the grid.
-#[derive(Clone, Debug)]
-pub struct Cursor {
-    /// Whether this pane is allowed to show a cursor at all. The parser's own
-    /// "hide cursor" mode always wins (`vt100::Screen::hide_cursor`).
-    pub show: bool,
-    pub style: Style,
-}
-
-impl Default for Cursor {
-    fn default() -> Self {
-        Self {
-            show: true,
-            style: Style::default().add_modifier(Modifier::REVERSED),
-        }
-    }
-}
-
-impl Cursor {
-    pub fn visibility(mut self, show: bool) -> Self {
-        self.show = show;
-        self
-    }
-
-    pub fn style(mut self, style: Style) -> Self {
-        self.style = style;
-        self
-    }
-}
-
 pub struct PseudoTerminal<'a> {
     screen: &'a Screen,
     block: Option<Block<'a>>,
-    cursor: Cursor,
 }
 
 impl<'a> PseudoTerminal<'a> {
@@ -56,10 +27,6 @@ impl<'a> PseudoTerminal<'a> {
         Self {
             screen,
             block: None,
-            cursor: Cursor {
-                show: true,
-                style: Style::new(),
-            },
         }
     }
 
@@ -67,15 +34,18 @@ impl<'a> PseudoTerminal<'a> {
         self.block = Some(block);
         self
     }
-
-    pub fn cursor(mut self, cursor: Cursor) -> Self {
-        self.cursor = cursor;
-        self
-    }
 }
 
 impl Widget for PseudoTerminal<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // A float dragged or resized past the screen edge hands us an area that
+        // extends outside the buffer. Clip up front instead of relying on every
+        // primitive below to do it.
+        let area = area.intersection(buf.area);
+        if area.is_empty() {
+            return;
+        }
+
         Clear.render(area, buf);
 
         let inner = match self.block {
@@ -87,11 +57,11 @@ impl Widget for PseudoTerminal<'_> {
             None => area,
         };
 
-        render_screen(self.screen, inner, buf, &self.cursor);
+        render_screen(self.screen, inner, buf);
     }
 }
 
-fn render_screen(screen: &Screen, area: Rect, buf: &mut Buffer, cursor: &Cursor) {
+fn render_screen(screen: &Screen, area: Rect, buf: &mut Buffer) {
     for row in 0..area.height {
         for col in 0..area.width {
             let Some(screen_cell) = screen.cell(row, col) else {
@@ -104,29 +74,11 @@ fn render_screen(screen: &Screen, area: Rect, buf: &mut Buffer, cursor: &Cursor)
             }
         }
     }
-
-    if !cursor.show || screen.hide_cursor() {
-        return;
-    }
-
-    let (row, col) = screen.cursor_position();
-    if row >= area.height || col >= area.width {
-        return;
-    }
-    let x = area.x.saturating_add(col);
-    let y = area.y.saturating_add(row);
-    if let Some(buf_cell) = buf.cell_mut((x, y)) {
-        // Patch rather than replace, so the character under the cursor keeps
-        // its colours and only gains the cursor's modifiers.
-        let style = buf_cell.style().patch(cursor.style);
-        buf_cell.set_style(style);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::{Color, Modifier};
     use crate::constants::nz;
 
     fn buffer(width: u16, height: u16) -> Buffer {
@@ -156,12 +108,12 @@ mod tests {
 
         let cell = buf.cell((0, 0)).unwrap();
         assert_eq!(cell.symbol(), "X");
-        assert_eq!(cell.style().fg, Some(Color::Indexed(1)));
-        assert_eq!(cell.style().bg, Some(Color::Indexed(4)));
+        assert_eq!(cell.style().fg, Some(ratatui::style::Color::Indexed(1)));
+        assert_eq!(cell.style().bg, Some(ratatui::style::Color::Indexed(4)));
     }
 
     #[test]
-    fn blank_cell_is_not_painted_over_its_neighbour() {
+    fn blank_cell_does_not_disturb_its_neighbour() {
         let mut parser = vt100::Parser::new(nz(2), nz(20), 0);
         parser.process(b"a b");
 
@@ -173,52 +125,46 @@ mod tests {
     }
 
     #[test]
-    fn hidden_cursor_is_not_drawn() {
+    fn grid_painter_never_paints_a_cursor() {
+        // Regression guard: the widget must not style cells to fake a cursor.
         let mut parser = vt100::Parser::new(nz(2), nz(20), 0);
-        parser.process(b"\x1b[?25labc");
+        parser.process(b"abc");
 
         let mut buf = buffer(20, 2);
-        let cursor = Cursor::default().style(Style::default().add_modifier(Modifier::REVERSED));
-        PseudoTerminal::new(parser.screen())
-            .cursor(cursor)
-            .render(buf.area, &mut buf);
+        PseudoTerminal::new(parser.screen()).render(buf.area, &mut buf);
 
-        for x in 0..3 {
+        for x in 0..4 {
             let cell = buf.cell((x, 0)).unwrap();
             assert!(
-                !cell.style().add_modifier.contains(Modifier::REVERSED),
-                "cell {x} should not carry the cursor style"
+                !cell
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::RAPID_BLINK)
+            );
+            assert!(
+                !cell
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
             );
         }
     }
 
     #[test]
-    fn shown_cursor_patches_the_cell_under_it() {
-        let mut parser = vt100::Parser::new(nz(2), nz(20), 0);
-        // red text, cursor left after it (column 2)
-        parser.process(b"\x1b[31mab");
+    fn block_shrinks_the_drawing_area() {
+        use ratatui::widgets::{Block, Borders};
 
-        let mut buf = buffer(20, 2);
-        let cursor = Cursor::default().style(Style::default().add_modifier(Modifier::REVERSED));
+        let mut parser = vt100::Parser::new(nz(4), nz(20), 0);
+        parser.process(b"xy");
+
+        let mut buf = buffer(20, 4);
+        let block = Block::default().borders(Borders::ALL);
         PseudoTerminal::new(parser.screen())
-            .cursor(cursor)
+            .block(block)
             .render(buf.area, &mut buf);
 
-        let cell = buf.cell((2, 0)).unwrap();
-        assert!(cell.style().add_modifier.contains(Modifier::REVERSED));
-    }
-
-    #[test]
-    fn cursor_is_suppressed_when_the_pane_is_not_focused() {
-        let mut parser = vt100::Parser::new(nz(2), nz(20), 0);
-        parser.process(b"ab");
-
-        let mut buf = buffer(20, 2);
-        PseudoTerminal::new(parser.screen())
-            .cursor(Cursor::default().visibility(false))
-            .render(buf.area, &mut buf);
-
-        let cell = buf.cell((2, 0)).unwrap();
-        assert!(!cell.style().add_modifier.contains(Modifier::REVERSED));
+        // "x" lands one cell right and down, inside the border.
+        assert_eq!(buf.cell((1, 1)).unwrap().symbol(), "x");
+        assert_eq!(buf.cell((2, 1)).unwrap().symbol(), "y");
     }
 }

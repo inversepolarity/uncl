@@ -6,9 +6,10 @@ use bytes::Bytes;
 
 use std::sync::{Arc, RwLock};
 
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::UnboundedSender;
 
-/// A floating shell: its geometry, its parser, and the channels to its child.
+/// A floating shell: its geometry, its parser, and the session of its child.
 ///
 /// S0 keeps this deliberately thin — it owns the child's lifecycle and the grid
 /// it renders from. Input routing and geometry unification are S1.
@@ -16,10 +17,9 @@ pub struct Lease {
     pub tenant: Overlay,
     pub tenant_parser: Arc<RwLock<vt100::Parser>>,
     pub tenant_visible: bool,
-    /// Bytes to the tenant's child; `None` until it has been spawned.
-    pub tenant_tx: Option<UnboundedSender<Bytes>>,
-    pub tenant_resize_tx: Option<UnboundedSender<(u16, u16)>>,
-    pub tenant_exited: Option<UnboundedReceiver<()>>,
+    /// Kept whole (not just its channels) so that dropping the lease kills the
+    /// child and unblocks its reader thread.
+    session: Option<PtySession>,
 }
 
 impl Lease {
@@ -28,39 +28,49 @@ impl Lease {
             tenant_visible: false,
             tenant: Overlay::new(),
             tenant_parser: new_parser(),
-            tenant_tx: None,
-            tenant_resize_tx: None,
-            tenant_exited: None,
+            session: None,
         }
     }
 
     /// Wire up a freshly spawned tenant process.
     pub fn attach(&mut self, session: PtySession) {
-        self.tenant_tx = Some(session.writer);
-        self.tenant_resize_tx = Some(session.resize);
-        self.tenant_exited = Some(session.exited);
+        self.session = Some(session);
     }
 
-    /// Whether the tenant's child is still alive (its writer has not been
-    /// dropped). Cheap and lock-free, unlike the old `status_rx.is_closed()`.
+    pub fn writer(&self) -> Option<UnboundedSender<Bytes>> {
+        self.session.as_ref().map(|session| session.writer.clone())
+    }
+
+    /// Whether the tenant's child is still alive. Cheap and lock-free, unlike
+    /// the old `status_rx.is_closed()`.
     pub fn running(&self) -> bool {
-        self.tenant_tx.as_ref().is_some_and(|tx| !tx.is_closed())
+        self.session.as_ref().is_some_and(PtySession::writer_open)
     }
 
-    /// Non-blocking check for child exit; marks the overlay dead when it fires.
+    /// Non-blocking check for child exit; tears the session down when it fires.
     pub fn poll_exit(&mut self) -> bool {
-        let Some(rx) = self.tenant_exited.as_mut() else {
+        let Some(session) = self.session.as_mut() else {
             return false;
         };
-        match rx.try_recv() {
-            Ok(()) | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+
+        match session.exited.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => {
                 self.tenant.is_dead = true;
-                self.tenant_tx = None;
-                self.tenant_resize_tx = None;
+                // Drops the session: kills the (already dead) child and lets
+                // its threads finish.
+                self.session = None;
                 true
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+            Err(TryRecvError::Empty) => false,
         }
+    }
+
+    /// Kill the tenant's child and let its threads finish.
+    pub fn shutdown(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.shutdown();
+        }
+        self.session = None;
     }
 
     pub fn expired(&mut self) -> bool {
@@ -84,8 +94,11 @@ impl Lease {
             .unwrap()
             .set_size(nz(rows), nz(cols));
 
-        if let Some(resize_tx) = &self.tenant_resize_tx {
-            if resize_tx.send((rows, cols)).is_err() {
+        // The child is told the size of the area it actually draws into, i.e.
+        // inside the border. The parser is told the same number, so a
+        // full-screen app can no longer draw for a size we never render.
+        if let Some(session) = &self.session {
+            if session.resize.send((rows, cols)).is_err() {
                 eprintln!("failed to send resize to tenant");
             }
         }

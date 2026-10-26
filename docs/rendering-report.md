@@ -487,9 +487,57 @@ cargo run             # then, in the shell: btop, nvim, lazgit, less, fzf
 | Paste/queue no longer stall the loop (§2.3) | hold a key down / drag while a child floods output | typing stays responsive, no freeze |
 | Mode tracking is now real (§2.5) | `htop` in the float, then move the mouse in the *owner* area | no phantom reports when the child never enabled mouse mode |
 
+### S0.1 — cursor and shutdown fixes (reported after first run)
+
+Two regressions from S0, both fixed:
+
+**1. No cursor at all.** S0 replaced `tui-term`'s cursor painting with
+`buf_cell.set_style(buf_cell.style().patch(cursor.style))` where the style was
+`Modifier::RAPID_BLINK` and nothing else. A blink modifier on a blank cell is
+invisible, and ratatui hides the hardware cursor unless `Frame::set_cursor_position`
+is called — so the result was no visible cursor in either pane.
+
+Fix: stop painting a fake cursor entirely. The widget is now a pure grid painter
+and the owner loop calls `Frame::set_cursor_position` at the *focused* pane's
+cursor cell, so the real hardware cursor is used: it blinks with the user's own
+blink rate, takes the shape their terminal is configured for, and disappears
+when the child hides it (`hide_cursor()`, e.g. BTOP). One cursor, in the focused
+pane; the unfocused pane has none, which is what a multiplexer should do.
+`Frame::area()` guards against placing it off-screen.
+
+This also removes a whole class of "cursor looks wrong" bugs that S1 would
+otherwise inherit: shape (DECSCUSR) and visibility now come from the terminal and
+the parser, not from our painting.
+
+**2. Unclean exits / prompt not restored.** Three separate causes:
+
+- The restore block ran only on the `Ok` path of `initialize_pty`, after
+  `run()`; any `?` early return, or a panic, skipped it and left the terminal in
+  raw mode on the alternate screen.
+- Nothing ever killed the children. Their readers block in `read()` forever, so
+  the blocking pool never drained and `#[tokio::main]`'s runtime shutdown could
+  wait on them — the process hung *after* the UI was gone, with the terminal
+  still owned by uncl.
+- The blocking input pump had no stop condition: it polled every 50 ms forever.
+
+Fix: a `TerminalGuard` whose `Drop` disables raw mode, mouse capture and
+bracketed paste, leaves the alternate screen, shows the cursor and resets SGR —
+declared right after the first state change so it runs on every exit path
+including unwinding. `PtySession` now owns a `ChildKiller` and SIGHUPs its child
+on drop (also when a float is replaced), which closes the pty and unblocks the
+reader. The input pump checks an `AtomicBool`. And `main` builds its own runtime
+so it can `shutdown_timeout(250ms)` instead of waiting indefinitely.
+
+Also fixed while in there: the float's pty/parser/painted area now agree on one
+number (`Overlay::content_rect()`, border-inset only). They previously disagreed
+by two cells, and the cursor would have been placed at the wrong cell inside the
+float. The widget also clips its area to the buffer, which is the same bug class
+as the open "crash on exit fullscreen in wezterm (out of bounds)" issue.
+
 ### Known behaviours kept on purpose (so the diff stays reviewable)
 
 - `Home` still toggles the float and is still not forwardable to the child (S1 gives it back and moves the toggle).
 - Backspace still sends `0x08` (not `0x7f`) — unchanged from before, tracked in S1 with the mode-aware encoder.
-- Mouse reports are still always SGR; the per-mode encoder is S1.
-- The float title still shows a size, now the *child's* size rather than the overlay's, so it stops lying about what the PTY was told.
+- Mouse reports to the *owner* shell are still always SGR; the per-mode encoder is S1.
+- **Clicks inside a visible float still go to drag/resize, not to the child.** This is S1's region routing and it needs the local-chord decision in §9.1; until then a float running `btop`/`htop`/`nvim` is keyboard-only.
+- The float title shows the *child's* size (inside the border), which is now the size the pty was actually told.

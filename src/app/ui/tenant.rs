@@ -2,7 +2,7 @@ use crate::app::pty::{self, PtySession};
 use crate::app::signal::Signal;
 use crate::constants::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_X, DEFAULT_Y, MIN_HEIGHT, MIN_WIDTH, ResizeDirection,
-    TENANT_CHROME_COLS, TENANT_CHROME_ROWS, nz,
+    TENANT_BORDER, nz,
 };
 
 use anyhow::Result;
@@ -21,7 +21,7 @@ use std::sync::{Arc, RwLock};
 
 use vt100::Screen;
 
-use super::widget::{Cursor, PseudoTerminal};
+use super::widget::PseudoTerminal;
 
 pub struct Size {
     pub cols: u16,
@@ -54,15 +54,25 @@ impl Overlay {
         }
     }
 
-    /// The size the child is told it has, i.e. the area inside the border.
+    /// The area the child actually draws into: the rect minus its border.
     ///
-    /// S0 makes the PTY and the parser agree on this number (they used to
-    /// disagree by two cells); unifying it with what the widget paints is S1.
+    /// This is the single source of truth for three numbers that used to
+    /// disagree by two cells: the size the pty is told, the size the parser
+    /// grid is set to, and the area the widget paints into (`Block::inner`).
+    pub fn content_rect(&self) -> Rect {
+        let inset = TENANT_BORDER;
+        Rect {
+            x: self.rect.x.saturating_add(inset),
+            y: self.rect.y.saturating_add(inset),
+            width: self.rect.width.saturating_sub(inset * 2).max(1),
+            height: self.rect.height.saturating_sub(inset * 2).max(1),
+        }
+    }
+
+    /// `(rows, cols)` of [`Self::content_rect`].
     pub fn content_size(&self) -> (u16, u16) {
-        (
-            self.size.rows.saturating_sub(TENANT_CHROME_ROWS).max(1),
-            self.size.cols.saturating_sub(TENANT_CHROME_COLS).max(1),
-        )
+        let content = self.content_rect();
+        (content.height, content.width)
     }
 
     /// Spawn the floating shell. No terminal state is touched here: the owner
@@ -97,11 +107,7 @@ impl Overlay {
             .title_bottom(Line::from(format!("s:{rows}:{cols}")).right_aligned())
             .style(Style::default().bg(Color::Reset));
 
-        let pseudo_term = PseudoTerminal::new(screen)
-            .block(block)
-            .cursor(Cursor::default().visibility(true));
-
-        f.render_widget(pseudo_term, self.rect);
+        f.render_widget(PseudoTerminal::new(screen).block(block), self.rect);
     }
 
     pub fn resize_to(
@@ -155,24 +161,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn content_size_leaves_room_for_the_border() {
+    fn content_rect_matches_the_border_the_widget_paints() {
+        let overlay = Overlay::new();
+        let content = overlay.content_rect();
+        assert_eq!(content.x, overlay.rect.x + TENANT_BORDER);
+        assert_eq!(content.y, overlay.rect.y + TENANT_BORDER);
+        assert_eq!(content.width, overlay.rect.width - TENANT_BORDER * 2);
+        assert_eq!(content.height, overlay.rect.height - TENANT_BORDER * 2);
+    }
+
+    #[test]
+    fn content_size_is_derived_from_content_rect() {
         let overlay = Overlay::new();
         let (rows, cols) = overlay.content_size();
-        assert_eq!(rows, DEFAULT_HEIGHT - TENANT_CHROME_ROWS);
-        assert_eq!(cols, DEFAULT_WIDTH - TENANT_CHROME_COLS);
+        assert_eq!((cols, rows), (overlay.content_rect().width, overlay.content_rect().height));
     }
 
     #[test]
     fn content_size_never_reaches_zero() {
         let mut overlay = Overlay::new();
-        overlay.size = Size { cols: 1, rows: 1 };
+        overlay.rect = Rect::new(0, 0, 1, 1);
         assert_eq!(overlay.content_size(), (1, 1));
     }
 
     #[test]
     fn resize_keeps_the_float_inside_the_screen() {
         let mut overlay = Overlay::new();
-        // ask for something absurd; it must be clamped, not overflow
         overlay.resize_to(100, 100, 500, 500, (120, 40));
         assert!(overlay.rect.x + overlay.rect.width <= 120);
         assert!(overlay.rect.y + overlay.rect.height <= 40);

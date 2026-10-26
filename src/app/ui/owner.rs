@@ -3,27 +3,29 @@ use portable_pty::CommandBuilder;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::Rect,
-    style::{Modifier, Style},
+    layout::{Position, Rect},
 };
 
 use bytes::Bytes;
 
 use std::{
     io::{self, Stdout},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use crossterm::{
+    cursor::Show,
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    },
+    style::{Attribute, ResetColor, SetAttribute},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 
 use tokio::sync::mpsc::error::TryRecvError;
@@ -38,7 +40,7 @@ use crate::app::pty::{self, PtySession};
 use crate::app::signal::Signal;
 use crate::constants::*;
 
-use super::widget::{Cursor, PseudoTerminal};
+use super::widget::PseudoTerminal;
 
 pub struct Size {
     pub cols: u16,
@@ -54,6 +56,36 @@ enum Flow {
     Quit,
 }
 
+/// Restores the terminal on every exit path, including `?` early returns and
+/// panics.
+///
+/// This replaces the old "restore at the end of initialize_pty" code, which was
+/// skipped whenever `run()` returned early or the process was torn down from
+/// under us — leaving the user's terminal in raw mode on the alternate screen
+/// with no cursor, which reads as "uncl ate my prompt".
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn engage() -> Self {
+        Self
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show,
+            SetAttribute(Attribute::Reset),
+            ResetColor
+        );
+    }
+}
+
 pub struct Container {
     pub rect: Rect,
     pub size: Size,
@@ -61,6 +93,8 @@ pub struct Container {
     pub session: Option<PtySession>,
     pub lease: Lease,
     pub signal: Arc<Signal>,
+    /// Set on the way out so the input pump thread stops polling forever.
+    stop: Arc<AtomicBool>,
 }
 
 impl Container {
@@ -74,10 +108,11 @@ impl Container {
             session: None,
             lease: Lease::new(),
             signal: Signal::new(),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Spawn the floating shell and store its channels on the lease.
+    /// Spawn the floating shell and store its session on the lease.
     fn init_tenant(&mut self) -> Result<()> {
         let parser = self.lease.tenant_parser.clone();
         let signal = self.signal.clone();
@@ -115,32 +150,41 @@ impl Container {
         )?;
         self.session = Some(session);
 
+        // Engage the guard *before* the first state change it has to undo, and
+        // declare it before `terminal` so it is dropped after the terminal.
         enable_raw_mode()?;
+        let _guard = TerminalGuard::engage();
 
-        let mut stdout = io::stdout();
         execute!(
-            stdout,
+            io::stdout(),
             EnableMouseCapture,
             EnableBracketedPaste,
             EnterAlternateScreen
         )?;
 
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         terminal.clear()?;
 
         let result = self.run(&mut terminal).await;
 
-        // Restore the terminal exactly once, in one batch.
-        disable_raw_mode()?;
-        execute!(
-            std::io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        )?;
+        // Stop the input pump and the children while the alternate screen is
+        // still up, so their teardown cannot smear the user's real screen.
+        self.stop.store(true, Ordering::Release);
+        self.shutdown_children();
 
+        // `_guard` restores raw mode / mouse capture / alt screen / cursor here.
         result
+    }
+
+    /// Kill both shells. Dropping a session SIGHUPs its child and unblocks the
+    /// reader thread, which is what lets the process exit instead of hanging on
+    /// runtime shutdown.
+    fn shutdown_children(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.shutdown();
+        }
+        self.session = None;
+        self.lease.shutdown();
     }
 
     /// Paint the whole screen. Both grids are cloned under their locks first, so
@@ -150,35 +194,24 @@ impl Container {
         let tenant: Screen = self.lease.tenant_parser.read().unwrap().screen().clone();
         let tenant_visible = self.lease.tenant_visible && self.tenant_running();
 
-        terminal.draw(|f| self.render(f, &owner, &tenant, tenant_visible))?;
+        terminal.draw(|f| {
+            f.render_widget(PseudoTerminal::new(&owner), self.rect);
+
+            if tenant_visible {
+                let content = self.lease.tenant.content_rect();
+                self.lease.tenant.render(f, &tenant);
+                place_cursor(f, &tenant, content);
+            } else {
+                place_cursor(f, &owner, self.rect);
+            }
+        })?;
         Ok(())
-    }
-
-    pub fn render(
-        &mut self,
-        f: &mut Frame,
-        owner: &Screen,
-        tenant: &Screen,
-        tenant_visible: bool,
-    ) {
-        let cursor = Cursor::default()
-            .visibility(!tenant_visible)
-            .style(Style::default().add_modifier(Modifier::RAPID_BLINK));
-
-        f.render_widget(
-            PseudoTerminal::new(owner).cursor(cursor),
-            self.rect,
-        );
-
-        if tenant_visible {
-            self.lease.tenant.render(f, tenant);
-        }
     }
 
     /// Send bytes to whichever pane currently owns the keyboard.
     fn active_sender(&self) -> Option<UnboundedSender<Bytes>> {
         if self.lease.tenant_visible && self.tenant_running() {
-            self.lease.tenant_tx.clone()
+            self.lease.writer()
         } else {
             self.session.as_ref().map(|session| session.writer.clone())
         }
@@ -217,12 +250,7 @@ impl Container {
     /// reporting. Mode-awareness replaces the old hand-rolled byte sniffing;
     /// per-mode encoding (X10/UTF-8) is S1.
     fn forward_mouse(&self, m: MouseEvent) {
-        let mouse_mode = self
-            .parser
-            .read()
-            .unwrap()
-            .screen()
-            .mouse_protocol_mode();
+        let mouse_mode = self.parser.read().unwrap().screen().mouse_protocol_mode();
         if matches!(mouse_mode, MouseProtocolMode::None) {
             return;
         }
@@ -242,11 +270,7 @@ impl Container {
             _ => return,
         };
 
-        let Some(sender) = self
-            .session
-            .as_ref()
-            .map(|session| session.writer.clone())
-        else {
+        let Some(sender) = self.session.as_ref().map(|session| session.writer.clone()) else {
             return;
         };
 
@@ -281,12 +305,7 @@ impl Container {
                     return Flow::Continue;
                 };
 
-                let quit = handle_keyboard_input(
-                    &mut self.lease,
-                    &sender,
-                    key,
-                    term_size,
-                );
+                let quit = handle_keyboard_input(&mut self.lease, &sender, key, term_size);
 
                 if quit { Flow::Quit } else { Flow::Continue }
             }
@@ -309,10 +328,7 @@ impl Container {
             Event::Resize(cols, rows) => {
                 self.size = Size { cols, rows };
                 self.rect = Rect::new(0, 0, cols, rows);
-                self.parser
-                    .write()
-                    .unwrap()
-                    .set_size(nz(rows), nz(cols));
+                self.parser.write().unwrap().set_size(nz(rows), nz(cols));
                 // TODO(S1): move the float back inside the new bounds and
                 // resize its child; today we only re-anchor the owner grid.
                 Flow::Redraw
@@ -323,11 +339,11 @@ impl Container {
     }
 
     /// Blocking crossterm reads run on their own thread so the event loop can
-    /// `select!` over input, PTY output and a frame timer instead of sleeping.
-    fn spawn_input_pump() -> UnboundedReceiver<Event> {
+    /// `select!` over input, PTY output and a timer instead of sleeping.
+    fn spawn_input_pump(stop: Arc<AtomicBool>) -> UnboundedReceiver<Event> {
         let (tx, rx) = unbounded_channel::<Event>();
         tokio::task::spawn_blocking(move || {
-            loop {
+            while !stop.load(Ordering::Acquire) {
                 match event::poll(Duration::from_millis(INPUT_POLL_INTERVAL_MS)) {
                     Ok(true) => match event::read() {
                         Ok(event) => {
@@ -351,11 +367,8 @@ impl Container {
         rx
     }
 
-    pub async fn run(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> Result<()> {
-        let mut input_rx = Self::spawn_input_pump();
+    pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        let mut input_rx = Self::spawn_input_pump(self.stop.clone());
         let signal = self.signal.clone();
         let mut ticker = tokio::time::interval(Duration::from_millis(IDLE_TICK_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -365,7 +378,7 @@ impl Container {
 
         loop {
             // 1. Housekeeping first, so a child flooding output cannot starve
-            //    exit detection (all three checks are non-blocking).
+            //    exit detection (all checks are non-blocking).
             if self.lease.poll_exit() {
                 self.lease.tenant_visible = false;
                 redraw = true;
@@ -442,4 +455,30 @@ impl Container {
 
         Ok(())
     }
+}
+
+/// Put the *real* terminal cursor where the focused child's cursor is.
+///
+/// This is what restores a blinking cursor: the hardware cursor blinks with the
+/// user's own settings and takes the shape their terminal is configured for,
+/// which a painted cell can never do. When the child hides its cursor (BTOP
+/// does) nothing is placed and ratatui keeps it hidden.
+fn place_cursor(f: &mut Frame, screen: &Screen, area: Rect) {
+    if screen.hide_cursor() {
+        return;
+    }
+
+    let (row, col) = screen.cursor_position();
+    if row >= area.height || col >= area.width {
+        return;
+    }
+
+    let x = area.x.saturating_add(col);
+    let y = area.y.saturating_add(row);
+    let bounds = f.area();
+    if x >= bounds.right() || y >= bounds.bottom() {
+        return;
+    }
+
+    f.set_cursor_position(Position::new(x, y));
 }

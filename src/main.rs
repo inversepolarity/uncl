@@ -1,5 +1,6 @@
 mod app;
 mod constants;
+mod geometry;
 
 use anyhow::Result;
 use std::time::Duration;

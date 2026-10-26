@@ -3,27 +3,17 @@ use crate::app::term::callbacks::ReplySink;
 use crate::app::signal::Signal;
 use crate::constants::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_X, DEFAULT_Y, MIN_HEIGHT, MIN_WIDTH, ResizeDirection,
-    TENANT_BORDER, nz,
+    content_rect, nz,
 };
+use crate::geometry::Rect;
 
 use anyhow::Result;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::{Color, Style},
-    text::Line,
-    widgets::{Block, Borders},
-};
 
 use portable_pty::CommandBuilder;
 
 use std::sync::{Arc, RwLock};
-
-use vt100::Screen;
-
-use super::widget::PseudoTerminal;
 
 pub struct Size {
     pub cols: u16,
@@ -64,15 +54,9 @@ impl Overlay {
     ///
     /// This is the single source of truth for three numbers that used to
     /// disagree by two cells: the size the pty is told, the size the parser
-    /// grid is set to, and the area the widget paints into (`Block::inner`).
+    /// grid is set to, and the area the renderer paints into.
     pub fn content_rect(&self) -> Rect {
-        let inset = TENANT_BORDER;
-        Rect {
-            x: self.rect.x.saturating_add(inset),
-            y: self.rect.y.saturating_add(inset),
-            width: self.rect.width.saturating_sub(inset * 2).max(1),
-            height: self.rect.height.saturating_sub(inset * 2).max(1),
-        }
+        content_rect(self.rect)
     }
 
     /// `(rows, cols)` of [`Self::content_rect`].
@@ -103,20 +87,6 @@ impl Overlay {
         let session = pty::spawn(cmd, rows, cols, parser, sink, signal)?;
         self.is_dead = false;
         Ok(session)
-    }
-
-    pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
-        let (rows, cols) = self.content_size();
-        // ratatui 0.30 dropped `title_alignment`: the title carries its own
-        // alignment now, and `title_bottom` replaces `title_position(Bottom)`.
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Color::Green)
-            .title_bottom(Line::from(format!("s:{rows}:{cols}")).right_aligned())
-            .style(Style::default().bg(Color::Reset));
-
-        f.render_widget(PseudoTerminal::new(screen).block(block), self.rect);
     }
 
     /// Resize the float, clamped to the terminal and to [`MIN_WIDTH`] x
@@ -251,13 +221,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn content_rect_matches_the_border_the_widget_paints() {
+    fn content_rect_is_inset_by_the_border() {
         let overlay = Overlay::new();
         let content = overlay.content_rect();
-        assert_eq!(content.x, overlay.rect.x + TENANT_BORDER);
-        assert_eq!(content.y, overlay.rect.y + TENANT_BORDER);
-        assert_eq!(content.width, overlay.rect.width - TENANT_BORDER * 2);
-        assert_eq!(content.height, overlay.rect.height - TENANT_BORDER * 2);
+        assert_eq!(content.x, overlay.rect.x + crate::constants::TENANT_BORDER);
+        assert_eq!(content.y, overlay.rect.y + crate::constants::TENANT_BORDER);
+        assert_eq!(content.width, overlay.rect.width - crate::constants::TENANT_BORDER * 2);
+        assert_eq!(content.height, overlay.rect.height - crate::constants::TENANT_BORDER * 2);
     }
 
     #[test]

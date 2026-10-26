@@ -4,12 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# 0.29 pins `unicode-width = "=0.2.0"`, which makes every `vt100` >= 0.16
-# unresolvable (they need >= 0.2.1). 0.30 relaxed that pin to `>=0.2.0`, so the
-# parser upgrade and the UI toolkit can coexist. ratatui disappears entirely in
-# S2 (docs/rendering-report.md §6.3), so this bump is temporary plumbing.
+# No UI toolkit: `app::render` writes the frame itself (docs/rendering-report.md
+# §6.3). That dropped `ratatui` and the `unicode-width` pin it dragged in, and
+# removed the second copy of the grid that every frame used to walk.
 crossterm = "0.29"
-ratatui = "0.30.2"
 portable-pty = "0.8.1"
 anyhow = "1.0.98"
 # pinned to the version that exposes parser callbacks + terminal modes, so we
@@ -17,7 +15,8 @@ anyhow = "1.0.98"
 vt100 = "0.18.1"
 tokio = { version = "1.44.2", features = ["full"] }
 bytes = "1.10.1"
-# tui-term removed: its adapter is vendored in src/app/ui/adapter.rs and the
-# widget it provided is reimplemented in src/app/ui/widget.rs (S0, step 1).
+# tui-term/ratatui removed: the grid adapter and the pseudo-terminal widget were
+# replaced by `src/app/render` (S2), so a frame no longer passes through a
+# second, ratatui-shaped copy of the parser's grid.
 #regex = "1.11.1"
 #nix = {version="0.30.1",features=[ "term"]}

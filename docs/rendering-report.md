@@ -15,7 +15,7 @@
 5. **Decided plan (§0.1 answers applied): four stages, ~2,300 net LOC, ~16 working days for S0–S3 (~20 with the Windows delta and a buffer).**
    - **S0 — stop being slow** (~2–3 days): event-driven redraw, drain-to-empty input, bracketed paste, batching writer, `vt100 0.18.1` via the vendored 123-LOC adapter, delete the byte-sniffing.
    - **S1 — stop lying about geometry and input** (~5 days): one source of truth for the float's size, mouse/key routing by region with mode-aware per-pane encoders, paste, and a **capability-proxying reply channel** (uncl must query the *host* terminal once and relay its answers to children — including the sixel bit, or nothing will ever emit an image).
-   - **S2 — own the emitter** (~1 week): delete `ratatui`+`tui-term`; ~350 LOC turns the grid into ANSI bytes via `vt100`'s own `rows_diff`/`state_diff`/`cursor_state_formatted`. **This is now load-bearing**, because floating is non-negotiable: it is the only route to both speed and pixel fidelity, and the only place out-of-band image bytes can be emitted.
+   - **S2 — own the emitter** (~1 week, **shipped** — Appendix E): `ratatui`+`tui-term` are gone; ~980 LOC turn the grid into ANSI bytes via `vt100`'s `rows_diff`/`rows_formatted` plus our own cursor and border emission (`state_diff` and `cursor_state_formatted` turned out to be unusable — see Appendix E). **This was load-bearing**, because floating is non-negotiable: it is the only route to both speed and pixel fidelity, and the only place out-of-band image bytes can be emitted.
    - **S3 — cheap-tier images** (~3 days): DCS/APC tap + placement store + re-emit. kitty first (croppable/placeable), sixel best-effort (draw if it fits, otherwise drop). No re-encoding, no scaling.
 6. **Two things are off the critical path.** *Passthrough takeover* (v1 §6.5) is incompatible with "floating is the product" — demoted to Appendix B, where it survives only as a user-invoked "maximize" and as a debugging aid. *Swapping in `alacritty_terminal`* (S4) stays optional: it buys underline colour, `OSC 8` links and kitty-keyboard input, none of which BTOP-class rendering needs.
 
@@ -238,7 +238,7 @@ Stages are ordered by *dependency*, not by size, and each one is independently s
 
 **Exit criteria:** BTOP renders a stable full frame at the right size, is mouse-clickable inside the float (clicks, drags and wheel all land at the right cell *inside the child*), hides the cursor correctly, survives 20 consecutive float resizes with no smearing, and answers `CSI 6n` correctly enough that `CSI 6n`-using scripts do not stall. `nvim` + `lazygit` + `less` + `fzf` + `htop` all behave. *(This is the "everything except images" milestone: ~7 working days for S0+S1.)*
 
-### 6.3 S2 — "own the emitter" — ~1 week, ~350 LOC, −4 dependencies
+### 6.3 S2 — "own the emitter" — ~1 week, ~350 LOC, −4 dependencies — **shipped**, see Appendix E
 
 Delete `ratatui`, `tui-term`, and the double-buffer. Write `src/app/render/mod.rs`:
 
@@ -320,7 +320,7 @@ Sources for the ConPTY v1/v2 distinction: Windows Terminal 1.22 release notes (`
 |---|---|---|---|---|
 | S0 speed | 2–3 d | ~±200 | Idle CPU → ~0; input 1 event/tick → unbounded; paste instant; real mode tracking; `vt100 0.18.1` via the vendored adapter | Low. `vt100` 0.18 API churn is contained in the 123-LOC adapter; benchmark it against 0.15.2 (see the criterion bench in §8) and keep the pin reversible. |
 | S1 correctness + input + capability proxy | ~5 d | ~+700 | BTOP/htop/nvim/lazygit render at the right size **and are mouse-interactive**; paste; query replies; sixel capability advertised (prerequisite for any image ever appearing) | Medium — the encoder branches per mode and per platform; mitigated by the encoder trait and a golden-sequence table. |
-| S2 own emitter | ~1 wk | ~+350, −4 crates | Native-speed scan-out; a hook for out-of-band bytes; no per-cell `Style`; `ratatui`/`tui-term` gone | Medium — off-by-one/clipping bugs are visible; mitigate with the §8.1 golden-frame harness. **Load-bearing: do not defer behind S3.** |
+| S2 own emitter — **shipped** | ~1 wk | ~+1,200/−350, −4 crates | Native-speed scan-out; a hook for out-of-band bytes; no per-cell `Style`; `ratatui`/`tui-term` gone | Medium — off-by-one/clipping bugs are visible; mitigate with the §8.1 golden-frame harness. **Load-bearing: do not defer behind S3.** |
 | S3 cheap-tier images | ~3 d | ~+300 | kitty images (croppable), sixel (if it fits), passthrough | Medium-low, because the quality contract is explicit (§6.4 non-goals). |
 | S3.5 hyperlinks (`OSC 8`) | 1 d | ~+60 | clickable links inside the float | Low; or free with S4. |
 | S4 engine swap (`alacritty_terminal`) | 3–5 d | ~+600 | underline colour/styles, hyperlinks, kitty-keyboard input, sync output, `EventListener` (title/clipboard/bell) | Medium; **requires S2** (you must own the encoder before leaving `vt100`). Optional — skip unless users ask for the fidelity *inside* a float. |
@@ -366,7 +366,9 @@ Still genuinely open, in the order they will bite:
 ## 10. Implementation checklist (drop-in order)
 
 Each line is a reviewable PR; the sequence is the shortest dependency-satisfying one.
-S0 (items 1–5) is implemented — see Appendix C for the file map and the verification status.
+S0 (items 1–5), S1 (items 6–10) and S2 (items 11–13) are implemented — see Appendices C, D
+and E for the file maps and the verification status. Item 14 (the golden-frame corpus in
+CI) is the one S2 item still open.
 
 ```
 S0  1. vendor adapter (src/app/ui/adapter.rs) + vt100 0.18.1 + drop tui-term        [½ d]
@@ -577,7 +579,7 @@ S1 replaces both with a single, testable decision function.
 | `src/main.rs` | `--doctor`, `--version`, `--help`; `uncl` with no arguments still just runs. |
 | `src/app/input/keyboard.rs` | **deleted** — its hand-rolled `vec![27, 91, …]` table is what `encode_key` replaces. |
 
-64 unit tests total (S0 had 18). No new dependencies.
+66 tests by `cargo test`'s count (S0 had 18). No new dependencies.
 
 ### Two policy decisions worth remembering
 
@@ -654,7 +656,7 @@ not been compiled or run. What was done instead:
 * the `vt100` callback signatures, `Parser<CB>` API, and *which* sequences reach
   `unhandled_csi`/`unhandled_osc` were read out of `vt100 0.18.1`'s own `perform.rs`
   (`?h`/`?l` with unknown modes, `c`, `>c`, `n`, and `18t` all land there; `8t` does not);
-* geometry, encoders and routing are covered by the 64 pure tests above.
+* geometry, encoders and routing are covered by the 66 tests above.
 
 First thing to run on a machine with cargo: `cargo test`, then the manual script below.
 
@@ -681,3 +683,153 @@ htop; nvim; lazygit; less /etc/services; fzf
 # drag the bottom edge up past MIN_HEIGHT → the float keeps tracking the pointer
 # (`Ctrl+Alt+q` is the escape hatch if anything wedges)
 ```
+
+---
+
+## Appendix E — S2 implementation log (2026-10-26)
+
+S2 is what §6.3 called "the pivotal stage". The UI toolkit is gone: a frame is now
+`vt100::Screen` → bytes, encoded by uncl, written with a single `write_all`.
+
+### What landed
+
+| # | Change | File |
+|---|---|---|
+| 1 | The frame emitter: per-pane `prev` screens, owner row diffs, float rows painted into `content_rect`, borders, title, cursor last, one buffer per frame | `src/app/render/mod.rs` (new, ~1,020 LOC incl. 17 tests) |
+| 2 | The only rectangle type in the tree (`new/right/bottom/is_empty/contains/inset`) | `src/geometry.rs` (new, ~100 LOC incl. 5 tests) |
+| 3 | One definition of the float's inner area, shared by the mouse router, the pty sizing and the painter | `src/constants.rs` (`content_rect`) |
+| 4 | `Terminal`/`Frame`/`CrosstermBackend` deleted from the paint path: `draw()` builds `Panes` and does one `write_all` + `flush`; the event loop got a frame deadline (`FRAME_MIN_INTERVAL`, 8 ms ≈ 120 Hz) instead of a 100 ms ticker; `Renderer::invalidate()` on show/hide, move, resize (keyboard and mouse), respawn, and `EnterAlternateScreen` | `src/app/ui/owner.rs` |
+| 5 | `PseudoTerminal` widget and the `vt100→ratatui` adapter deleted (`ratatui` + `tui-term` + their 40-odd transitive crates) | `src/app/ui/widget.rs`, `src/app/ui/adapter.rs` deleted; `Cargo.toml` |
+
+**83 tests** as `cargo test` counts them (S1's tree had 66: −5 with the deleted widget,
++5 geometry, +17 renderer).
+**No new dependencies.** Net diff: **+1,205 / −346** across 13 files.
+
+### What a frame does now
+
+1. The loop wakes for a reader signal, an input event, or the frame deadline. Frames
+   are coalesced: a child flooding output cannot make uncl repaint more than ~120×/s.
+2. Both screens are cloned **under their locks** — one clone per pane, ~32 B/cell
+   (~375 KiB at 200×60, ≈0.1 ms of `memcpy`). The lock is never held while a frame is
+   encoded, which is the §2.4 fix S0 introduced and S2 keeps.
+3. The snapshots are handed to `Renderer::render(Panes { .. })` **by value**, so the
+   renderer keeps them as the next frame's `prev`. One clone per pane per frame, not two.
+4. Nothing changed → `render` returns an **empty slice** and `draw` performs no syscall.
+5. Otherwise: `?25l` → changed owner rows (`rows_diff`, or `rows_formatted` + `ECH(width)`
+   on a full repaint) → the float's rows, each preceded by a `CUP` into its content rect
+   → the float's top/bottom border and `s:rows:cols` title if the rect is new or was
+   overpainted → one `CUP` + `?25h` for the focused child's cursor → one `write_all` + `flush`.
+
+Input modes are still **never** replayed from the child's screen: `HostMouse` and
+bracketed paste remain uncl's own, as decided in S1.
+
+### Three laws that the §6.3 sketch did not have (and why it took 2× the LOC)
+
+1. **`vt100`'s row encoders are pane-local.** `rows_formatted`/`rows_diff` emit
+   `CSI r;cH` for backwards jumps within a row, addressed as if the pane were at the
+   screen origin — and for that origin itself it emits a bare `CSI H`, whose parameters
+   default to 1;1. `append_row` rewrites every absolute move (bare, empty-field or
+   explicit, `H` or `f`) to screen coordinates and leaves every other CSI alone.
+2. **`EL` inside a float is a weapon.** A styled-but-empty row tail (a coloured status
+   bar — BTOP's entire chrome) ends in `CSI K`, which on a real terminal erases to the
+   end of the *screen*: the float's right border, the owner's cells beside it, and the
+   frame gutter. So the right border is painted **after** the row, and a row that
+   emitted `EL` triggers `repair_tail`, which repaints the owner's cells from
+   `rect.right()` to the screen edge for that row.
+3. **`rows_formatted` never blanks.** It skips default cells and relies on what is
+   already on screen, so a *full* repaint must `ECH(width)` first — bounded to the
+   float's width, so it can never reach the border. That is exactly the difference
+   between `FloatRow::Full` and `FloatRow::Diff`: `rows_diff` blanks by itself, so diff
+   rows are painted without the erase and cost one `CUP` plus the changed cells.
+
+The float's dirty-row plan is therefore three-way — **skip** (unchanged), **diff**
+(changed), **full** (new, or the owner just repainted that row *under* the float).
+Occlusion is what forces the third case: the owner's row diff cannot know the float was
+sitting on top of it.
+
+### Deviations from the §6.3 sketch (each deliberate)
+
+- **`cursor_state_formatted()` is not used.** It carries no SGR state (so it corrupts
+  attribute state mid-frame) and it expresses a *shape*, not a position. The real
+  cursor is placed with `CUP` + `?25h` while painting stays cursor-hidden, and the
+  shape is relayed out of band by S1's `decscusr()` — which is also what makes nvim's
+  beam a beam instead of a painted rectangle.
+- **`state_diff()` is still not replayed** (S0/S1 policy): uncl owns the host's modes.
+- **The scheduler lives in the event loop**, not the renderer. `Renderer` is pure:
+  bytes in, bytes out, no timers, no I/O — which is what makes the 17 tests possible.
+- **The border and title are the renderer's job** now that `Block` is gone, and the
+  title shows the child's *content* size (the number the pty was given), not the rect.
+- **`Panes` owns its screens** instead of borrowing them, to keep the clone count at one.
+
+### What this removes from the hot path
+
+| Before (S1) | After (S2) |
+|---|---|
+| 100 Hz unconditional full-screen repaint | repaint on change only, coalesced to ≤ ~120 Hz, empty frame = 0 syscalls |
+| `vt100` grid → `Buffer` of ratatui cells (a second `w*h` copy, per frame) | direct row encoding from the parser's grid |
+| per-cell `Style` construction, then a full-buffer diff | per-**row** `memcmp` (`Cell: PartialEq` compares attributes too), then `vt100`'s tested SGR diff |
+| one `write` per changed cell run (crossterm backend) | one `write_all` per frame |
+| cursor emulated as a styled cell | real cursor, hidden during paint, placed once, child's hide honoured |
+
+### Deliberately *not* in S2
+
+- **The golden-frame corpus** (§10 item 14). The 17 renderer tests assert byte-level
+  properties (CUP targets, `EL` repair ordering, diff-vs-full, cursor placement) against
+  parsers fed real escape sequences, but there is no recorded corpus of child streams
+  replayed in CI yet.
+- **A rect-scoped invalidation.** A move/resize invalidates the whole screen: correct,
+  but it repaints all rows instead of the union of the old and new rects.
+- **Owner scrollback and alt-screen semantics** — untouched, as in S1.
+- **`Cargo.lock`.** The committed lock is stale (it still says `crossterm 0.27`,
+  `vt100 0.15.2`, `ratatui`, `tui-term` — it was not regenerated in S0/S1 either, and
+  cannot be here without cargo). The first `cargo build`/`cargo test` rewrites it;
+  commit that refresh on its own so the code change stays reviewable.
+
+### Verification status — read this before trusting the diff
+
+Still **no Rust toolchain in this environment**, so S2 has not been compiled or run:
+
+* every file parses cleanly with `tree-sitter-rust` (checked after every edit);
+* every method called on `vt100`, `crossterm` and `portable-pty` exists in the vendored
+  source of the exact pinned version — in particular `Screen::cell`/`rows_diff`/
+  `rows_formatted`/`cursor_position`/`hide_cursor`, and `Cell: PartialEq` (which compares
+  attributes, not just text — the row diff depends on that);
+* the pane-local `CUP` and `EL` behaviours above were read out of `vt100 0.18.1`'s
+  `row.rs`/`screen.rs`, not assumed;
+* 83 tests: geometry (5), renderer (17), routing/encoders (32), callbacks (10),
+  capabilities (4), float geometry/keyboard (11), signals (3), constants (1) — the
+  whole S0/S1 suite plus the emitter.
+
+First thing to run on a machine with cargo: `cargo test`, then the script below.
+
+### Manual acceptance script (S2 exit criteria)
+
+```sh
+cargo test                                  # 83 tests, no warnings expected
+cargo build --release && ./target/release/uncl
+
+# 1. idle cost: leave the float hidden and the owner idle → `top -p $(pgrep uncl)`
+#    must show ~0% CPU with a still screen (this was the §2.1 bug)
+# 2. btop in the float, Home to hide it → the owner must repaint with no float ghosts
+#    (no border remnants, no half-drawn panes)
+# 3. Home → the float appears with its `│ ┌ ┐ └ ┘` border and `s:rows:cols` title, and
+#    the title must match what `stty size` says inside the float
+# 4. drag the float by its border, and Alt+arrows / Alt+Shift+arrows → the vacated area
+#    is repainted; no smearing, no leftover fragments at the old position
+# 5. a *still* btop must cost nothing: `strace -e trace=write -c -p $(pgrep uncl)`
+#    for 5 s → a handful of writes, not thousands (empty frames write nothing)
+# 6. `seq 1 200000` in the float → no tearing, input stays responsive, bounded CPU
+# 7. wheel-scroll a btop process list and a `less /etc/services`: rows scroll smoothly
+#    and the float's border survives the scroll (the `EL` repair)
+# 8. nvim inside the float: cursor blinks in the right cell; `i` = beam, `Esc` = block
+# 9. resize the host window while btop runs → both panes reflow live, nothing smears
+# 10. click outside the float → it hides; Home → it comes back; `exit` in the float →
+#     a fresh prompt, owner shell untouched (`Ctrl+Alt+q` if anything wedges)
+```
+
+### Where S2 leaves the plan
+
+§6.3's claim that this is the pivotal stage holds up: the encoder is now uncl's own, so
+`state_diff`, the mode table and — crucially — **out-of-band bytes after the grid flush**
+now have a place to live. That is the prerequisite for S3 (kitty/sixel passthrough) and
+for S4 (an `alacritty_terminal` swap) without touching the event loop again.

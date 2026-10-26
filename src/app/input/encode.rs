@@ -9,7 +9,7 @@
 //! advertised (see `term::caps`), so a child never asks us for it.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
-use ratatui::layout::Rect;
+use crate::geometry::Rect;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// The input-relevant modes of one child, read from its parser.

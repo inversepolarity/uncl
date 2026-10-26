@@ -1,15 +1,10 @@
 use anyhow::Result;
 use portable_pty::CommandBuilder;
-use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
-    layout::{Position, Rect},
-};
 
 use bytes::Bytes;
 
 use std::{
-    io::{self, Stdout, Write},
+    io::{self, Write},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -18,14 +13,17 @@ use std::{
 };
 
 use crossterm::{
-    cursor::Show,
+    cursor::{MoveTo, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
         KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     style::{Attribute, ResetColor, SetAttribute},
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 
 use tokio::sync::mpsc::error::TryRecvError;
@@ -38,11 +36,11 @@ use crate::app::input::mouse::{self, MouseRoute};
 use crate::app::lease::{Lease, new_parser};
 use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::signal::Signal;
-use crate::app::term::caps::Capabilities;
+use crate::app::render::{Panes, Renderer};
 use crate::app::term::callbacks::ReplySink;
+use crate::app::term::caps::Capabilities;
 use crate::constants::*;
-
-use super::widget::PseudoTerminal;
+use crate::geometry::Rect;
 
 pub struct Size {
     pub cols: u16,
@@ -160,6 +158,8 @@ pub struct Container {
     /// Effects children addressed to the *host* terminal (clipboard copies).
     host_tx: UnboundedSender<Vec<u8>>,
     host_rx: UnboundedReceiver<Vec<u8>>,
+    /// The frame emitter (S2: uncl writes the ANSI stream itself).
+    renderer: Renderer,
 }
 
 impl Container {
@@ -185,6 +185,7 @@ impl Container {
             tenant_retry_after: None,
             host_tx,
             host_rx,
+            renderer: Renderer::new(),
         }
     }
 
@@ -232,21 +233,28 @@ impl Container {
         )?;
         self.session = Some(session);
 
-        // Engage the guard *before* the first state change it has to undo, and
-        // declare it before `terminal` so it is dropped after the terminal.
+        // Engage the guard *before* the first state change it has to undo, so
+        // every exit path (including `?` and a panic) restores the terminal.
         enable_raw_mode()?;
         let _guard = TerminalGuard::engage();
 
         // Mouse reporting is *not* enabled here: it is driven per focused
         // child by `sync_host_mouse`, which is what stops a `?1003`-less child
         // from drowning us in motion events (see `HostMouse`).
-        execute!(io::stdout(), EnableBracketedPaste, EnterAlternateScreen)?;
+        execute!(
+            io::stdout(),
+            EnableBracketedPaste,
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
         self.sync_host_mouse();
 
-        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        terminal.clear()?;
+        // The first frame paints every cell; nothing is inherited from the
+        // screen that was there before.
+        self.renderer.invalidate();
 
-        let result = self.run(&mut terminal).await;
+        let result = self.run().await;
 
         // Stop the input pump and the children while the alternate screen is
         // still up, so their teardown cannot smear the user's real screen.
@@ -268,24 +276,38 @@ impl Container {
         self.lease.shutdown();
     }
 
-    /// Paint the whole screen. Both grids are cloned under their locks first, so
-    /// the parser is never blocked for the duration of a frame.
-    fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    /// Paint the whole screen with one `write_all`.
+    ///
+    /// Both grids are cloned under their locks first (a `Screen` clone is a
+    /// `memcpy` of ~32 bytes per cell), so the parser is never blocked while the
+    /// frame is encoded — a reader thread that has to wait for the lock is a
+    /// reader thread that is not draining the child's pty. The snapshots are then
+    /// handed to the renderer, which keeps them as the next frame's `prev`.
+    fn draw(&mut self) -> Result<()> {
         let owner: Screen = self.parser.read().unwrap().screen().clone();
-        let tenant: Screen = self.lease.tenant_parser.read().unwrap().screen().clone();
-        let tenant_visible = self.lease.tenant_visible && self.tenant_running();
+        let visible = self.lease.tenant_visible && self.tenant_running();
+        let float: Option<(Screen, Rect)> = if visible {
+            let screen = self.lease.tenant_parser.read().unwrap().screen().clone();
+            Some((screen, self.lease.tenant.rect))
+        } else {
+            None
+        };
 
-        terminal.draw(|f| {
-            f.render_widget(PseudoTerminal::new(&owner), self.rect);
+        // Bind what the frame needs before borrowing the renderer mutably.
+        let owner_area = self.rect;
 
-            if tenant_visible {
-                let content = self.lease.tenant.content_rect();
-                self.lease.tenant.render(f, &tenant);
-                place_cursor(f, &tenant, content);
-            } else {
-                place_cursor(f, &owner, self.rect);
-            }
-        })?;
+        let bytes = self.renderer.render(Panes {
+            owner,
+            owner_area,
+            float,
+            float_focused: visible,
+        });
+
+        if !bytes.is_empty() {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(bytes)?;
+            stdout.flush()?;
+        }
         Ok(())
     }
 
@@ -454,6 +476,7 @@ impl Container {
             // Children that asked for `?1004` must see the focus move, or every
             // TUI in the float keeps painting its "unfocused" cursor style.
             self.refocus(self.float_focused());
+            self.renderer.invalidate();
             return Flow::Redraw;
         }
 
@@ -462,6 +485,7 @@ impl Container {
         // Float geometry: Alt+arrows move, Alt+Shift+arrows resize.
         if self.float_focused() && self.lease.tenant.geometry_key(key, term_size) {
             self.lease.sync_size();
+            self.renderer.invalidate();
             return Flow::Redraw;
         }
 
@@ -513,11 +537,13 @@ impl Container {
                     if mouse::end(&mut self.lease.tenant) {
                         // A finished resize changes the child's grid size.
                         self.lease.sync_size();
+                        self.renderer.invalidate();
                     }
                 } else if mouse::drag(&mut self.lease.tenant, m, term_size) {
                     // Live-resize the child while the pointer moves, so a
                     // full-screen app reflows during the drag.
                     self.lease.sync_size();
+                    self.renderer.invalidate();
                 }
                 Flow::Redraw
             }
@@ -526,6 +552,7 @@ impl Container {
                 if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                     self.lease.tenant_visible = false;
                     self.lease.tenant.child_grab = false;
+                    self.renderer.invalidate();
                     return Flow::Redraw;
                 }
                 Flow::Continue
@@ -585,6 +612,7 @@ impl Container {
                 // Keep the float on screen and take the child's grid with it.
                 self.lease.tenant.clamp_to((cols, rows));
                 self.lease.sync_size();
+                self.renderer.invalidate();
 
                 Flow::Redraw
             }
@@ -620,14 +648,16 @@ impl Container {
         rx
     }
 
-    pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         let mut input_rx = Self::spawn_input_pump(self.stop.clone());
         let signal = self.signal.clone();
-        let mut ticker = tokio::time::interval(Duration::from_millis(IDLE_TICK_MS));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await; // the first tick is immediate
 
         let mut redraw = true;
+        // Frame pacing: a child that floods output raises `Signal` far more often
+        // than a terminal can usefully repaint. Frames are coalesced to at most
+        // one per `FRAME_MIN_INTERVAL`; input is never delayed by this, because
+        // the select below still wakes for it immediately.
+        let mut next_frame = Instant::now();
 
         loop {
             // 1. Housekeeping first, so a child flooding output cannot starve
@@ -660,6 +690,7 @@ impl Container {
                         Ok(()) => {
                             self.lease.tenant_visible = was_visible;
                             self.tenant_retry_after = None;
+                            self.renderer.invalidate();
                         }
                         Err(_) => {
                             self.tenant_retry_after = Some(now + TENANT_RESPAWN_BACKOFF);
@@ -678,11 +709,26 @@ impl Container {
 
             // 2. Paint only when something actually changed: the grid moved on
             //    (reader signal) or the pane layout/visibility did.
-            let parsed = signal.take();
-            if redraw || parsed {
-                self.draw(terminal)?;
-                redraw = false;
+            if signal.take() {
+                redraw = true;
             }
+
+            let now = Instant::now();
+            if redraw && now >= next_frame {
+                self.draw()?;
+                redraw = false;
+                next_frame = now + FRAME_MIN_INTERVAL;
+            }
+
+            // How long the loop may sleep: until the next allowed frame if one
+            // is pending, otherwise the coarse housekeeping tick.
+            let sleep_for = if redraw {
+                next_frame
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(IDLE_TICK_MS))
+            } else {
+                Duration::from_millis(IDLE_TICK_MS)
+            };
 
             // 3. Sleep until there is work, never on a fixed frame timer.
             //    No `biased;` on purpose: input must not be able to starve
@@ -728,7 +774,7 @@ impl Container {
                     redraw = true;
                 }
 
-                _ = ticker.tick() => {}
+                _ = tokio::time::sleep(sleep_for) => {}
             }
         }
 
@@ -736,12 +782,6 @@ impl Container {
     }
 }
 
-/// Put the *real* terminal cursor where the focused child's cursor is.
-///
-/// This is what restores a blinking cursor: the hardware cursor blinks with the
-/// user's own settings and takes the shape their terminal is configured for,
-/// which a painted cell can never do. When the child hides its cursor (BTOP
-/// does) nothing is placed and ratatui keeps it hidden.
 /// `DECSCUSR` parameter for a `vt100` cursor style.
 fn decscusr(style: CursorStyle) -> u16 {
     match style {
@@ -755,22 +795,3 @@ fn decscusr(style: CursorStyle) -> u16 {
     }
 }
 
-fn place_cursor(f: &mut Frame, screen: &Screen, area: Rect) {
-    if screen.hide_cursor() {
-        return;
-    }
-
-    let (row, col) = screen.cursor_position();
-    if row >= area.height || col >= area.width {
-        return;
-    }
-
-    let x = area.x.saturating_add(col);
-    let y = area.y.saturating_add(row);
-    let bounds = f.area();
-    if x >= bounds.right() || y >= bounds.bottom() {
-        return;
-    }
-
-    f.set_cursor_position(Position::new(x, y));
-}

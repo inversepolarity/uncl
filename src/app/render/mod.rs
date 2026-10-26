@@ -1,0 +1,1025 @@
+//! The frame emitter: uncl's own ANSI writer.
+//!
+//! Until S2 a frame was built like this: `vt100` grid → `ratatui::Buffer` of
+//! styled cells → ratatui's diff → its crossterm backend → bytes. Every one of
+//! those steps walks the whole screen and allocates, and the middle one is a
+//! second copy of a grid we already have.
+//!
+//! This module writes the frame directly from the parser's screens:
+//!
+//! * **The owner pane** is painted with `vt100`'s row diff, so an unchanged row
+//!   costs nothing and a scrolling shell only repaints what moved.
+//! * **The float** is painted *over* it into its content rectangle. Because S1
+//!   made the child's PTY exactly as wide as that rectangle, no horizontal
+//!   clipping is needed — every row the child produces is exactly one row here.
+//! * **One buffer per frame**: the caller does a single `write_all` + `flush`.
+//! * **The cursor** is hidden while painting and placed once at the end, so it
+//!   blinks at the position and in the shape the child asked for, with no cell
+//!   ever styled to imitate it.
+//!
+//! Two things go wrong when a `vt100` row encoder is reused for a pane that is
+//! *not* at the top-left of the screen, and both are handled here:
+//!
+//! 1. `vt100` emits **pane-local absolute** cursor moves (`CSI r;cH`) for
+//!    backwards jumps within a row. Inside the float those addresses are wrong,
+//!    so `append_row` rewrites them to screen coordinates.
+//! 2. `vt100` ends a row with `EL` (`CSI K`) when the row's tail is styled but
+//!    empty (a coloured status bar, a `btop` pane border). On a full-width pane
+//!    that is only wasteful; inside a float it erases the float's border *and*
+//!    everything to the right of it. Such rows are followed by `repair_tail`,
+//!    which repaints the owner's tail segment for that row.
+//!
+//! Input modes (`?1000`, `?2004`, `DECCKM`) are deliberately **never** replayed
+//! from the child's screen: uncl owns the host terminal's modes (see
+//! `ui::owner::HostMouse`), and replaying `state_diff` would make the host start
+//! reporting in a protocol the child never asked for.
+
+use vt100::Screen;
+
+use crate::constants::content_rect;
+use crate::geometry::Rect;
+
+const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+const RESET: &[u8] = b"\x1b[0m";
+const BORDER_COLOR: &[u8] = b"\x1b[32m";
+const BORDER_VERTICAL: &str = "│";
+
+/// Everything one frame needs: the two snapshots and where they go.
+///
+/// The screens are **owned**: the caller takes one clone per pane under the
+/// parser lock (so the lock is never held while a frame is encoded) and hands the
+/// snapshots over, which becomes the `prev` state for the next frame. Taking
+/// ownership is what keeps this at one clone per pane per frame instead of two.
+pub struct Panes {
+    pub owner: Screen,
+    pub owner_area: Rect,
+    /// The float's screen and its rectangle *including* the border.
+    pub float: Option<(Screen, Rect)>,
+    pub float_focused: bool,
+}
+
+/// Per-frame state: what the host terminal was last told to display.
+pub struct Renderer {
+    out: Vec<u8>,
+    owner_prev: Option<Screen>,
+    float_prev: Option<Screen>,
+    /// Is the cursor currently shown, as far as we have told the terminal?
+    cursor_shown: bool,
+    /// Where we last put it, or `None` when painting has moved it since.
+    cursor_at: Option<(u16, u16)>,
+    force_full: bool,
+}
+
+impl Renderer {
+    pub fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            owner_prev: None,
+            float_prev: None,
+            // Terminals start with a visible cursor, and the guard shows it again
+            // on the way out.
+            cursor_shown: true,
+            cursor_at: None,
+            force_full: true,
+        }
+    }
+
+    /// Repaint everything on the next frame.
+    ///
+    /// Required whenever the answer to "what is already on the screen?" is no
+    /// longer the previous frame: show/hide, a resize, or a new child.
+    pub fn invalidate(&mut self) {
+        self.force_full = true;
+        self.owner_prev = None;
+        self.float_prev = None;
+    }
+
+    /// Build one frame. The returned bytes are empty when nothing changed.
+    pub fn render(&mut self, panes: Panes) -> &[u8] {
+        self.out.clear();
+
+        let Panes {
+            owner,
+            owner_area,
+            float,
+            float_focused,
+        } = panes;
+        let float_at = float.as_ref().map(|(screen, rect)| (screen, *rect));
+
+        let owner_full = self.force_full || self.owner_prev.is_none();
+        let float_full = self.force_full || self.float_prev.is_none();
+
+        let owner_rows = if owner_area.is_empty() {
+            Vec::new()
+        } else {
+            dirty_rows(&owner, self.owner_prev.as_ref(), owner_area, owner_full)
+        };
+
+        let (float_plan, borders) = match float_at {
+            Some((screen, rect)) => {
+                let plan = plan_float(
+                    screen,
+                    self.float_prev.as_ref(),
+                    content_rect(rect),
+                    &owner_rows,
+                    owner_area,
+                    float_full,
+                );
+
+                // The owner painted over the float's top/bottom border rows, or
+                // the whole float is new: both borders have to be redrawn.
+                let borders = float_full
+                    || owner_rows
+                        .iter()
+                        .any(|row| *row == rect.y || *row == rect.bottom().saturating_sub(1));
+
+                (plan, borders)
+            }
+            None => (Vec::new(), false),
+        };
+
+        if !owner_rows.is_empty() || !float_plan.is_empty() || borders {
+            self.begin_paint();
+        }
+
+        if !owner_rows.is_empty() {
+            emit_owner_rows(
+                &mut self.out,
+                &owner,
+                self.owner_prev.as_ref(),
+                owner_area,
+                &owner_rows,
+                owner_full,
+            );
+        }
+
+        if let Some((screen, rect)) = float_at {
+            emit_float(
+                &mut self.out,
+                &owner,
+                screen,
+                self.float_prev.as_ref(),
+                content_rect(rect),
+                rect,
+                owner_area,
+                &float_plan,
+                borders,
+            );
+        }
+
+        let (cursor_screen, cursor_area) = match float_at {
+            Some((screen, rect)) if float_focused => (screen, content_rect(rect)),
+            _ => (&owner, owner_area),
+        };
+        self.place_cursor(cursor_screen, cursor_area);
+
+        // The snapshots become the reference for the next frame.
+        self.owner_prev = Some(owner);
+        self.float_prev = float.map(|(screen, _)| screen);
+        self.force_full = false;
+
+        &self.out
+    }
+
+    /// Hide the cursor before painting: rows are drawn with `CUP` jumps, and a
+    /// visible cursor would run along with them.
+    fn begin_paint(&mut self) {
+        if self.cursor_shown {
+            self.out.extend_from_slice(HIDE_CURSOR);
+            self.cursor_shown = false;
+        }
+        // Painting leaves the terminal's cursor wherever the last row ended.
+        self.cursor_at = None;
+    }
+
+    fn place_cursor(&mut self, screen: &Screen, area: Rect) {
+        if screen.hide_cursor() {
+            if self.cursor_shown {
+                self.out.extend_from_slice(HIDE_CURSOR);
+                self.cursor_shown = false;
+                self.cursor_at = None;
+            }
+            return;
+        }
+
+        let (row, col) = screen.cursor_position();
+        let x = area
+            .x
+            .saturating_add(col)
+            .min(area.right().saturating_sub(1));
+        let y = area
+            .y
+            .saturating_add(row)
+            .min(area.bottom().saturating_sub(1));
+
+        if self.cursor_at != Some((x, y)) {
+            cup(&mut self.out, y, x);
+            self.cursor_at = Some((x, y));
+        }
+        if !self.cursor_shown {
+            self.out.extend_from_slice(SHOW_CURSOR);
+            self.cursor_shown = true;
+        }
+    }
+}
+
+impl Default for Renderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Do the two screens show the same row?
+fn rows_equal(cur: &Screen, prev: &Screen, row: u16, width: u16) -> bool {
+    for col in 0..width {
+        if cur.cell(row, col) != prev.cell(row, col) {
+            return false;
+        }
+    }
+    true
+}
+
+fn dirty_rows(
+    cur: &Screen,
+    prev: Option<&Screen>,
+    area: Rect,
+    full: bool,
+) -> Vec<u16> {
+    if full {
+        return (0..area.height).collect();
+    }
+    let Some(prev) = prev else {
+        return (0..area.height).collect();
+    };
+
+    let mut rows = Vec::new();
+    for row in 0..area.height {
+        if !rows_equal(cur, prev, row, area.width) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// How one float row has to be painted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FloatRow {
+    /// Only the cells that changed: the screen still matches the previous frame,
+    /// so `vt100`'s row diff applies (`rows_diff` costs nothing for a row that
+    /// did not change).
+    Diff(u16),
+    /// The whole row: the float is new, or the owner painted over it.
+    Full(u16),
+}
+
+fn plan_float(
+    cur: &Screen,
+    prev: Option<&Screen>,
+    content: Rect,
+    owner_rows: &[u16],
+    owner_area: Rect,
+    full: bool,
+) -> Vec<FloatRow> {
+    let mut plan = Vec::new();
+
+    for row in 0..content.height {
+        // The owner pane is painted first and covers the whole screen, so a row
+        // it repainted under the float has to be restored in full. (`owner_rows`
+        // is pane-relative; the float's rect is in screen coordinates.)
+        let screen_row = content.y.saturating_add(row);
+        let covered = owner_rows.contains(&screen_row.saturating_sub(owner_area.y));
+
+        let entry = if full || covered {
+            Some(FloatRow::Full(row))
+        } else {
+            match prev {
+                None => Some(FloatRow::Full(row)),
+                Some(prev) if !rows_equal(cur, prev, row, content.width) => {
+                    Some(FloatRow::Diff(row))
+                }
+                Some(_) => None,
+            }
+        };
+
+        if let Some(entry) = entry {
+            plan.push(entry);
+        }
+    }
+
+    plan
+}
+
+fn emit_owner_rows(
+    out: &mut Vec<u8>,
+    cur: &Screen,
+    prev: Option<&Screen>,
+    area: Rect,
+    rows: &[u16],
+    full: bool,
+) {
+    let width = area.width;
+
+    if full || prev.is_none() {
+        // A full repaint has to blank each row first: `rows_formatted` skips
+        // default cells and relies on what is already on screen.
+        for (row, text) in cur.rows_formatted(0, width).enumerate() {
+            let row = row as u16;
+            if !rows.contains(&row) {
+                continue;
+            }
+            cup(out, area.y.saturating_add(row), area.x);
+            reset(out);
+            erase_chars(out, width);
+            append_row(out, &text, area.y, area.x);
+        }
+        return;
+    }
+
+    let prev = prev.unwrap_or(cur);
+    for (row, text) in cur.rows_diff(prev, 0, width).enumerate() {
+        let row = row as u16;
+        if !rows.contains(&row) || text.is_empty() {
+            continue;
+        }
+        cup(out, area.y.saturating_add(row), area.x);
+        reset(out);
+        append_row(out, &text, area.y, area.x);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_float(
+    out: &mut Vec<u8>,
+    owner: &Screen,
+    cur: &Screen,
+    prev: Option<&Screen>,
+    content: Rect,
+    rect: Rect,
+    owner_area: Rect,
+    plan: &[FloatRow],
+    borders: bool,
+) {
+    let width = content.width;
+
+    // Diffs are what keep a busy TUI cheap: `rows_diff` returns an empty string
+    // (and allocates nothing) for a row that did not change.
+    let mut diffs = prev.map(|prev| cur.rows_diff(prev, 0, width));
+    let mut diff_at: u16 = 0;
+
+    for entry in plan {
+        match *entry {
+            FloatRow::Diff(row) => {
+                let Some(diffs) = diffs.as_mut() else {
+                    continue;
+                };
+                let text = diffs
+                    .nth(usize::from(row.saturating_sub(diff_at)))
+                    .unwrap_or_default();
+                diff_at = row.saturating_add(1);
+
+                if !text.is_empty() {
+                    emit_float_row(out, owner, content, rect, owner_area, row, &text, false);
+                }
+            }
+            FloatRow::Full(row) => {
+                let text = cur
+                    .rows_formatted(0, width)
+                    .nth(usize::from(row))
+                    .unwrap_or_default();
+                emit_float_row(out, owner, content, rect, owner_area, row, &text, true);
+            }
+        }
+    }
+
+    if borders {
+        emit_horizontal_border(out, rect, rect.y, Corner::TopLeft, Corner::TopRight);
+        emit_horizontal_border(
+            out,
+            rect,
+            rect.bottom().saturating_sub(1),
+            Corner::BottomLeft,
+            Corner::BottomRight,
+        );
+        emit_title(out, rect, content);
+    }
+}
+
+/// Paint one row of the float: both border cells, the child's cells, and — when
+/// the child's row erased to the end of the line — the owner's tail beyond it.
+#[allow(clippy::too_many_arguments)]
+fn emit_float_row(
+    out: &mut Vec<u8>,
+    owner: &Screen,
+    content: Rect,
+    rect: Rect,
+    owner_area: Rect,
+    row: u16,
+    text: &str,
+    blank_first: bool,
+) {
+    let screen_row = content.y.saturating_add(row);
+
+    cup(out, screen_row, rect.x);
+    border_char(out, BORDER_VERTICAL);
+
+    cup(out, screen_row, content.x);
+    reset(out);
+    if blank_first {
+        // Bounded to the float's width, so it can never reach the border or the
+        // owner pane. Needed only when the cells are not known to be the ones we
+        // last painted.
+        erase_chars(out, content.width);
+    }
+    let erased = append_row(out, text, content.y, content.x);
+
+    // After the row: an `EL` inside it would have erased the border cell.
+    cup(out, screen_row, rect.right().saturating_sub(1));
+    border_char(out, BORDER_VERTICAL);
+
+    if erased {
+        repair_tail(out, owner, screen_row, rect, owner_area);
+    }
+}
+
+/// Repaint what a float row's `EL` erased beyond the float: the owner's tail.
+///
+/// The float's own right border is redrawn by the caller; this restores the
+/// cells to the right of the float, which the child's `EL` could not know about.
+fn repair_tail(out: &mut Vec<u8>, owner: &Screen, row: u16, rect: Rect, owner_area: Rect) {
+    // `rows_formatted` indexes into the row, so a rect that is (briefly) wider than
+    // the parser's grid must not become an out-of-range start column.
+    let cols = owner.size().1.get();
+    let start = rect.right().min(cols);
+    let end = owner_area.right().min(cols);
+    if start >= end {
+        return;
+    }
+
+    let width = end - start;
+    let owner_row = usize::from(row.saturating_sub(owner_area.y));
+    if let Some(text) = owner.rows_formatted(start, width).nth(owner_row) {
+        // The sub-row's origin is the first column to the right of the float, so
+        // its pane-local jumps shift by exactly that.
+        cup(out, row, start);
+        reset(out);
+        append_row(out, &text, row, start);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    fn ch(self) -> char {
+        match self {
+            Corner::TopLeft => '┌',
+            Corner::TopRight => '┐',
+            Corner::BottomLeft => '└',
+            Corner::BottomRight => '┘',
+        }
+    }
+}
+
+fn emit_horizontal_border(
+    out: &mut Vec<u8>,
+    rect: Rect,
+    row: u16,
+    left: Corner,
+    right: Corner,
+) {
+    let width = usize::from(rect.width);
+    if width < 2 {
+        return;
+    }
+
+    let mut line = String::with_capacity(width * 3);
+    line.push(left.ch());
+    for _ in 0..width - 2 {
+        line.push('─');
+    }
+    line.push(right.ch());
+
+    cup(out, row, rect.x);
+    out.extend_from_slice(BORDER_COLOR);
+    out.extend_from_slice(line.as_bytes());
+    reset(out);
+}
+
+/// The child's size, printed in the bottom border. ASCII only, so `len()` is the
+/// cell count.
+fn emit_title(out: &mut Vec<u8>, rect: Rect, content: Rect) {
+    let title = format!("s:{}:{}", content.height, content.width);
+    let available = usize::from(rect.width.saturating_sub(2));
+    if title.len() > available {
+        return;
+    }
+
+    let start = rect
+        .x
+        .saturating_add(1)
+        .saturating_add(available as u16 - title.len() as u16);
+
+    cup(out, rect.bottom().saturating_sub(1), start);
+    out.extend_from_slice(BORDER_COLOR);
+    out.extend_from_slice(title.as_bytes());
+    reset(out);
+}
+
+fn border_char(out: &mut Vec<u8>, text: &str) {
+    out.extend_from_slice(BORDER_COLOR);
+    out.extend_from_slice(text.as_bytes());
+    reset(out);
+}
+
+/// `CSI row ; col H`, one-based on the wire, zero-based in the arguments.
+fn cup(out: &mut Vec<u8>, row: u16, col: u16) {
+    out.extend_from_slice(b"\x1b[");
+    push_u16(out, row.saturating_add(1));
+    out.push(b';');
+    push_u16(out, col.saturating_add(1));
+    out.push(b'H');
+}
+
+/// `CSI n X`: erase `n` cells in place, without moving the cursor and without
+/// touching anything past them.
+fn erase_chars(out: &mut Vec<u8>, cells: u16) {
+    if cells == 0 {
+        return;
+    }
+    out.extend_from_slice(b"\x1b[");
+    push_u16(out, cells);
+    out.push(b'X');
+}
+
+fn reset(out: &mut Vec<u8>) {
+    out.extend_from_slice(RESET);
+}
+
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    let mut buf = [0u8; 5];
+    let mut at = buf.len();
+    let mut value = value;
+
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+
+    out.extend_from_slice(&buf[at..]);
+}
+
+/// Append one row emitted by `vt100` for a pane whose origin (row 0, column 0) is
+/// at `(dy, dx)` on the real screen.
+///
+/// Everything `vt100` emits inside a row is relative — except `CSI r;cH` for a
+/// backwards jump (used when clearing a run of styled-but-empty cells), which is
+/// relative to the *pane's* origin and therefore has to be shifted.
+///
+/// Returns whether the row ended with `EL`, i.e. whether the caller has to repair
+/// whatever lies to the right of this pane.
+fn append_row(out: &mut Vec<u8>, text: &str, dy: u16, dx: u16) -> bool {
+    if dy == 0 && dx == 0 {
+        out.extend_from_slice(text.as_bytes());
+        return text.contains("\x1b[K");
+    }
+
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    let mut erased = false;
+
+    while at < bytes.len() {
+        if bytes[at] == 0x1b && bytes.get(at + 1) == Some(&b'[') {
+            let start = at;
+            let mut end = at + 2;
+            while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                out.extend_from_slice(&bytes[start..]);
+                return erased;
+            }
+
+            let final_byte = bytes[end];
+            let params = &bytes[start + 2..end];
+
+            if final_byte == b'H' || final_byte == b'f' {
+                match parse_cup(params) {
+                    // `CSI H` (vt100 emits it for its own origin) means 1;1, so it
+                    // has to be shifted like any other absolute move.
+                    Some((row, col)) => cup(
+                        out,
+                        row.saturating_sub(1).saturating_add(dy),
+                        col.saturating_sub(1).saturating_add(dx),
+                    ),
+                    None => out.extend_from_slice(&bytes[start..=end]),
+                }
+            } else {
+                if final_byte == b'K' {
+                    erased = true;
+                }
+                out.extend_from_slice(&bytes[start..=end]);
+            }
+
+            at = end + 1;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+
+    erased
+}
+
+/// Parse the parameters of a `CUP`/`HVP`, one-based on the wire.
+///
+/// `CSI H` (no parameters at all) and an empty or zero field both mean 1, which is
+/// how `vt100` writes its own origin.
+fn parse_cup(params: &[u8]) -> Option<(u16, u16)> {
+    let mut parts = params.split(|byte| *byte == b';');
+
+    let row = parse_cup_field(parts.next()?)?;
+    let col = match parts.next() {
+        Some(field) => parse_cup_field(field)?,
+        None => 1,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((row, col))
+}
+
+/// One `CUP` field: empty or zero means 1, per ECMA-48.
+fn parse_cup_field(field: &[u8]) -> Option<u16> {
+    if field.is_empty() {
+        return Some(1);
+    }
+    Some(parse_u16(field)?.max(1))
+}
+
+fn parse_u16(bytes: &[u8]) -> Option<u16> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut value: u32 = 0;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + u32::from(byte - b'0');
+        if value > u32::from(u16::MAX) {
+            return None;
+        }
+    }
+    Some(value as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::nz;
+
+    fn parser(rows: u16, cols: u16) -> vt100::Parser {
+        vt100::Parser::new(nz(rows), nz(cols), 0)
+    }
+
+    fn text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[test]
+    fn cup_and_erase_are_one_based_and_padded() {
+        let mut out = Vec::new();
+        cup(&mut out, 0, 0);
+        cup(&mut out, 11, 4);
+        erase_chars(&mut out, 7);
+        assert_eq!(text(&out), "\x1b[1;1H\x1b[12;5H\x1b[7X");
+    }
+
+    #[test]
+    fn push_u16_writes_every_digit() {
+        let mut out = Vec::new();
+        for value in [0u16, 9, 10, 65535] {
+            push_u16(&mut out, value);
+            out.push(b',');
+        }
+        assert_eq!(text(&out), "0,9,10,65535,");
+    }
+
+    #[test]
+    fn append_row_shifts_absolute_moves_and_leaves_relative_ones_alone() {
+        let mut out = Vec::new();
+        // A backwards jump (pane-local) followed by a relative move.
+        let erased = append_row(&mut out, "ab\x1b[2;5Hcd\x1b[3C", 10, 20);
+        assert!(!erased);
+        // `CSI 2;5H` was pane row 2, column 5 → screen 12, 25.
+        assert_eq!(text(&out), "ab\x1b[12;25Hcd\x1b[3C");
+    }
+
+    #[test]
+    fn append_row_reports_and_keeps_el() {
+        let mut out = Vec::new();
+        let erased = append_row(&mut out, "x\x1b[41m\x1b[K", 0, 0);
+        assert!(erased);
+        assert_eq!(text(&out), "x\x1b[41m\x1b[K");
+    }
+
+    #[test]
+    fn append_row_does_not_shift_other_csi_sequences() {
+        let mut out = Vec::new();
+        append_row(&mut out, "\x1b[0m\x1b[?25l\x1b[2X", 5, 5);
+        assert_eq!(text(&out), "\x1b[0m\x1b[?25l\x1b[2X");
+    }
+
+    #[test]
+    fn parse_cup_defaults_missing_and_empty_fields_to_one() {
+        assert_eq!(parse_cup(b"3;7"), Some((3, 7)));
+        assert_eq!(parse_cup(b""), Some((1, 1)));
+        assert_eq!(parse_cup(b"3"), Some((3, 1)));
+        assert_eq!(parse_cup(b";7"), Some((1, 7)));
+        assert_eq!(parse_cup(b"0;0"), Some((1, 1)));
+        assert_eq!(parse_cup(b"3;7;9"), None);
+        assert_eq!(parse_cup(b"a;7"), None);
+        assert_eq!(parse_u16(b"65536"), None);
+    }
+
+    #[test]
+    fn a_bare_cup_is_the_panes_own_origin() {
+        // `vt100` writes `CSI H` for its pane's (0, 0).
+        let mut out = Vec::new();
+        let erased = append_row(&mut out, "ab\x1b[Hcd", 10, 20);
+        assert!(!erased);
+        assert_eq!(text(&out), "ab\x1b[11;21Hcd");
+    }
+
+    #[test]
+    fn a_new_renderer_paints_everything_once() {
+        let mut parser = parser(4, 20);
+        parser.process(b"hello");
+
+        let area = Rect::new(0, 0, 20, 4);
+        let mut renderer = Renderer::new();
+        let frame = renderer.render(Panes {
+            owner: parser.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+        });
+
+        let frame = text(frame);
+        assert!(frame.starts_with("\x1b[?25l"), "frame: {frame:?}");
+        assert!(frame.contains("hello"), "frame: {frame:?}");
+        assert!(frame.contains("\x1b[1;1H"), "frame: {frame:?}");
+        assert!(frame.ends_with("\x1b[?25h"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn an_unchanged_screen_costs_nothing() {
+        let mut parser = parser(4, 20);
+        parser.process(b"hello");
+
+        let area = Rect::new(0, 0, 20, 4);
+        let mut renderer = Renderer::new();
+        renderer.render(Panes {
+            owner: parser.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+        });
+
+        let second = renderer.render(Panes {
+            owner: parser.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+        });
+        assert!(second.is_empty(), "second frame: {:?}", text(second));
+    }
+
+    #[test]
+    fn one_changed_row_repaints_one_row() {
+        let mut parser = parser(4, 20);
+        parser.process(b"one\r\ntwo");
+
+        let area = Rect::new(0, 0, 20, 4);
+        let mut renderer = Renderer::new();
+        renderer.render(Panes {
+            owner: parser.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+        });
+
+        parser.process(b"\r\nchanged");
+        let frame = text(renderer.render(Panes {
+            owner: parser.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+        }));
+
+        assert!(frame.contains("changed"), "frame: {frame:?}");
+        // Row 0 did not change, so it must not be repainted.
+        assert!(!frame.contains("\x1b[1;1H"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn the_float_is_drawn_inside_its_border() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(4, 12);
+        float.process(b"floating");
+
+        let rect = Rect::new(2, 2, 14, 6);
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+        }));
+
+        assert!(frame.contains("floating"), "frame: {frame:?}");
+        // Top-left corner, and content one cell in.
+        assert!(frame.contains(&format!("\x1b[{};{}H", rect.y + 1, rect.x + 1)));
+        assert!(frame.contains(&format!("\x1b[{};{}H", rect.y + 2, rect.x + 2)));
+        assert!(frame.contains('┌') && frame.contains('┘'));
+        // The child's size is printed in the bottom border.
+        assert!(frame.contains("s:4:12"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn a_hidden_float_leaves_the_owner_alone() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+
+        let area = Rect::new(0, 0, 40, 10);
+        let mut renderer = Renderer::new();
+        renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+        });
+        // The float disappearing is a repaint, but the owner's cells are intact.
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+        }));
+        assert!(frame.is_empty(), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn hiding_the_cursor_emits_dectcem() {
+        let mut parser = parser(4, 20);
+        parser.process(b"\x1b[?25l");
+
+        let area = Rect::new(0, 0, 20, 4);
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: parser.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+        }));
+
+        assert!(frame.contains("\x1b[?25l"), "frame: {frame:?}");
+        assert!(!frame.contains("\x1b[?25h"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn the_owner_tail_is_repaired_after_a_float_el() {
+        let rect = Rect::new(2, 0, 12, 3);
+        let content = content_rect(rect);
+
+        // Owner text to the right of the float, on its first content row. Rows and
+        // columns are derived from the rect: a hand-written row here is exactly the
+        // kind of off-by-one this test is supposed to catch.
+        let mut owner = parser(10, 40);
+        let place = format!("\x1b[{};20HTAIL", content.y + 1);
+        owner.process(place.as_bytes());
+
+        // One row of a full-width styled bar: vt100 emits `EL` for the styled
+        // empty tail, which is what would erase the owner's text.
+        let mut float = parser(content.height, content.width);
+        float.process(b"\x1b[44m\x1b[K");
+
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: false,
+        }));
+
+        let el_at = frame.find("\x1b[K").expect("the float row should erase");
+        // The repair starts by addressing the first column to the right of the float
+        // on that same row…
+        let repair_cup = format!("\x1b[{};{}H", content.y + 1, rect.right() + 1);
+        assert!(frame.contains(&repair_cup), "frame: {frame:?}");
+        let cup_at = frame.find(&repair_cup).unwrap();
+        assert!(cup_at > el_at, "frame: {frame:?}");
+        // …and the owner's text follows it (rfind: the first TAIL is the owner's own
+        // full repaint, which happens before the float is drawn).
+        let tail_at = frame.rfind("TAIL").expect("the owner tail should be repainted");
+        assert!(tail_at > cup_at, "frame: {frame:?}");
+    }
+
+    #[test]
+    fn an_unchanged_float_costs_nothing() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"abc");
+
+        let panes = |owner: &vt100::Parser, float: &vt100::Parser| Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), Rect::new(2, 2, 12, 5))),
+            float_focused: true,
+        };
+
+        let mut renderer = Renderer::new();
+        let first = renderer.render(panes(&owner, &float)).to_vec();
+        assert!(text(&first).contains('┌'));
+
+        let second = renderer.render(panes(&owner, &float));
+        assert!(second.is_empty(), "second frame: {:?}", text(second));
+    }
+
+    #[test]
+    fn a_changed_float_row_is_a_diff_and_leaves_the_border_alone() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"abc");
+
+        let panes = |owner: &vt100::Parser, float: &vt100::Parser| Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), Rect::new(2, 2, 12, 5))),
+            float_focused: true,
+        };
+
+        let mut renderer = Renderer::new();
+        renderer.render(panes(&owner, &float));
+
+        float.process(b"\r\ntwo");
+        let frame = text(renderer.render(panes(&owner, &float)));
+
+        assert!(frame.contains("two"), "frame: {frame:?}");
+        // Row 0 of the float did not change, so it is not repainted…
+        assert!(!frame.contains("abc"), "frame: {frame:?}");
+        // …and neither is the border: a diff row is not blanked first.
+        assert!(!frame.contains('┌'), "frame: {frame:?}");
+        assert!(!frame.contains("\x1b[10X"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn invalidate_forces_the_next_frame_to_be_full() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+
+        let mut renderer = Renderer::new();
+        renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: None,
+            float_focused: false,
+        });
+
+        // Nothing changed, so nothing is painted…
+        let quiet = renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: None,
+            float_focused: false,
+        });
+        assert!(quiet.is_empty());
+
+        // …until the caller says the screen no longer matches what we think.
+        renderer.invalidate();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: None,
+            float_focused: false,
+        }));
+
+        assert!(frame.contains("owner"), "frame: {frame:?}");
+        // A full repaint blanks each row before writing it.
+        assert!(frame.contains("\x1b[40X"), "frame: {frame:?}");
+    }
+}

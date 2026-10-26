@@ -17,7 +17,7 @@
 use crate::app::ui::tenant::Overlay;
 use crate::constants::{MIN_HEIGHT, MIN_WIDTH, ResizeDirection};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::{Position, Rect};
+use crate::geometry::Rect;
 
 /// What uncl decided to do with a mouse event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,8 +34,8 @@ pub enum MouseRoute {
 /// Decide the route for one event, without mutating anything.
 pub fn route(overlay: &Overlay, m: MouseEvent) -> MouseRoute {
     let content = overlay.content_rect();
-    let inside = content.contains(Position::new(m.column, m.row));
-    let on_float = overlay.rect.contains(Position::new(m.column, m.row));
+    let inside = content.contains(m.column, m.row);
+    let on_float = overlay.rect.contains(m.column, m.row);
     let alt = m.modifiers.contains(KeyModifiers::ALT);
 
     // An in-progress gesture inside the child's grid outranks everything: the
@@ -123,10 +123,10 @@ pub fn begin(overlay: &mut Overlay, m: MouseEvent) {
     }
 
     let content = overlay.content_rect();
-    let inside = content.contains(Position::new(m.column, m.row));
+    let inside = content.contains(m.column, m.row);
     let alt = m.modifiers.contains(KeyModifiers::ALT);
 
-    if alt && overlay.rect.contains(Position::new(m.column, m.row)) {
+    if alt && overlay.rect.contains(m.column, m.row) {
         overlay.dragging = true;
         overlay.drag_offset = (
             m.column.saturating_sub(overlay.rect.x),
@@ -150,7 +150,7 @@ pub fn begin(overlay: &mut Overlay, m: MouseEvent) {
 /// Returns `None` when the point is not on the border at all (i.e. it is in the
 /// content area or outside the float entirely).
 pub fn direction_for(rect: Rect, x: u16, y: u16) -> Option<ResizeDirection> {
-    if !rect.contains(Position::new(x, y)) {
+    if !rect.contains(x, y) {
         return None;
     }
 
@@ -291,7 +291,6 @@ pub fn end(overlay: &mut Overlay) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::layout::Rect;
 
     fn overlay() -> Overlay {
         Overlay::new()

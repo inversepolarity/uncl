@@ -15,6 +15,13 @@ pub const DEFAULT_HEIGHT: u16 = 25;
 pub const DEFAULT_X: u16 = 10;
 pub const DEFAULT_Y: u16 = 5;
 
+/// Minimum time between frames (~120 Hz).
+///
+/// A child flooding output raises the reader signal far more often than a
+/// terminal can usefully repaint; frames are coalesced to this interval. Input
+/// is never delayed by it — the event loop still wakes for input immediately.
+pub const FRAME_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+
 /// How often the event loop wakes up when nothing else is happening.
 ///
 /// Frames are driven by PTY output and input events (see `app::signal::Signal`),
@@ -42,11 +49,19 @@ pub const PTY_WRITE_BATCH: usize = 64 * 1024;
 
 /// Cells the floating window's border eats on each side.
 ///
-/// This used to be a flat `- 4` applied to the pty *and* the grid while the
+/// This used to be a flat `- 4` applied to the pty *and* the grid while the old
 /// widget painted into `rect - 2`, so a full-screen app drew for a size we never
 /// rendered. The border is one cell per side, so this is the only number that
 /// keeps the pty, the parser and the painted area in agreement.
 pub const TENANT_BORDER: u16 = 1;
+
+/// The rectangle the float's child draws into, from the float's outer rect.
+///
+/// Used by the overlay (to size the pty and the parser) and by the renderer (to
+/// paint). Keeping it in one place is what keeps those three numbers equal.
+pub fn content_rect(rect: crate::geometry::Rect) -> crate::geometry::Rect {
+    rect.inset(TENANT_BORDER)
+}
 
 /// `vt100` 0.18 requires non-zero dimensions (it used to panic on zero), so
 /// every size that comes from the environment goes through here.

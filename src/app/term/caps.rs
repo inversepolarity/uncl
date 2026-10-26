@@ -9,9 +9,10 @@
 //!
 //! * **Never advertise something we cannot transport.** Answering "yes" to
 //!   sixel makes the child emit sixel; if our own layer drops it, the child has
-//!   no way to find out and the user sees garbage. Until the DCS/APC tap lands
-//!   (S3), images are advertised as unavailable even on a terminal that has
-//!   them.
+//!   no way to find out and the user sees garbage. Since S3 the tap in
+//!   `app::images` does transport DCS/APC/OSC payloads, so sixel is advertised
+//!   when the host can draw it *and* `UNCL_SIXEL` is set (the sixel path is
+//!   passthrough-only and cannot crop, so it stays opt-in).
 //! * **Answer, don't stay silent.** Applications block on these queries with a
 //!   timeout; silence is the bug this module exists to fix.
 
@@ -124,15 +125,19 @@ impl Capabilities {
         // Shells and tools use this to decide between "dumb" and interactive
         // output; uncl is a real terminal as far as the child is concerned.
         cmd.env("TERM_PROGRAM", "uncl");
+        // Our own namespace, so a script (or the acceptance tests in
+        // docs/rendering-report.md) can ask "will uncl carry my images?" without
+        // guessing from TERM. Nothing outside uncl reads this.
+        cmd.env("UNCL_GRAPHICS", "kitty,iterm2");
         if let Some(program) = &self.term_program {
             cmd.env("UNCL_HOST_TERM_PROGRAM", program);
         }
     }
 
-    /// Three lines for `uncl doctor`.
+    /// A few lines for `uncl doctor`.
     pub fn summary(&self) -> String {
         format!(
-            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}",
+            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)",
             if self.term.is_empty() { "<unset>" } else { &self.term },
             self.term_program.as_deref().unwrap_or("<unset>"),
             self.colorterm.as_deref().unwrap_or("<unset>"),
@@ -140,6 +145,7 @@ impl Capabilities {
             self.sixel,
             self.kitty_graphics,
             self.kitty_keyboard,
+            if self.sixel { "advertised" } else { "not advertised" },
         )
     }
 }

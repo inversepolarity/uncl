@@ -1,3 +1,4 @@
+use crate::app::images::Store;
 use crate::app::pty::{ChildParser, PtySession};
 use crate::app::term::callbacks::{ChildCallbacks, ReplySink};
 use crate::app::ui::tenant::Overlay;
@@ -5,7 +6,7 @@ use crate::constants::*;
 
 use bytes::Bytes;
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::UnboundedSender;
@@ -15,6 +16,9 @@ pub struct Lease {
     pub tenant: Overlay,
     pub tenant_parser: Arc<RwLock<ChildParser>>,
     pub tenant_sink: ReplySink,
+    /// Graphics the float's child has drawn (S3). Empty for a shell that never
+    /// emits an image, which is the common case.
+    pub tenant_images: Arc<Mutex<Store>>,
     pub tenant_visible: bool,
     /// Kept whole (not just its channels) so that dropping the lease kills the
     /// child and unblocks its reader thread.
@@ -32,6 +36,7 @@ impl Lease {
             tenant: Overlay::new(),
             tenant_parser: parser,
             tenant_sink: sink,
+            tenant_images: Arc::new(Mutex::new(Store::new())),
             session: None,
         }
     }

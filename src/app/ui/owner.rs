@@ -194,7 +194,11 @@ impl Container {
         let parser = self.lease.tenant_parser.clone();
         let sink = self.lease.tenant_sink.clone();
         let signal = self.signal.clone();
-        let session = self.lease.tenant.spawn(parser, sink, signal, &self.caps)?;
+        let images = self.lease.tenant_images.clone();
+        let session = self
+            .lease
+            .tenant
+            .spawn(parser, sink, signal, &self.caps, images)?;
         self.lease.attach(session);
         Ok(())
     }
@@ -230,6 +234,9 @@ impl Container {
             self.parser.clone(),
             self.parser_sink.clone(),
             self.signal.clone(),
+            // The owner pane is the real terminal: its images are as invisible as
+            // they were before S3, which is honest — we never claim otherwise.
+            None,
         )?;
         self.session = Some(session);
 
@@ -296,11 +303,17 @@ impl Container {
         // Bind what the frame needs before borrowing the renderer mutably.
         let owner_area = self.rect;
 
+        // The image store is read under its lock for the duration of the frame.
+        // It is never held while the parser runs (the reader takes the parser
+        // lock first, then this one), so a frame cannot deadlock a reader.
+        let images = self.lease.tenant_images.lock().unwrap();
+
         let bytes = self.renderer.render(Panes {
             owner,
             owner_area,
             float,
             float_focused: visible,
+            images: Some(&*images),
         });
 
         if !bytes.is_empty() {
@@ -691,6 +704,10 @@ impl Container {
                             self.lease.tenant_visible = was_visible;
                             self.tenant_retry_after = None;
                             self.renderer.invalidate();
+                            // The old child's pictures belong to a process that
+                            // no longer exists; the new one starts from an empty
+                            // image layer.
+                            self.renderer.forget_images();
                         }
                         Err(_) => {
                             self.tenant_retry_after = Some(now + TENANT_RESPAWN_BACKOFF);

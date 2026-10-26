@@ -1,3 +1,4 @@
+use crate::app::images::Store;
 use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::term::callbacks::ReplySink;
 use crate::app::signal::Signal;
@@ -13,7 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use portable_pty::CommandBuilder;
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub struct Size {
     pub cols: u16,
@@ -74,6 +75,7 @@ impl Overlay {
         sink: ReplySink,
         signal: Arc<Signal>,
         caps: &crate::app::term::caps::Capabilities,
+        images: Arc<Mutex<Store>>,
     ) -> Result<PtySession> {
         let (rows, cols) = self.content_size();
 
@@ -84,7 +86,7 @@ impl Overlay {
         cmd.cwd(std::env::current_dir()?);
         caps.apply_child_env(&mut cmd);
 
-        let session = pty::spawn(cmd, rows, cols, parser, sink, signal)?;
+        let session = pty::spawn(cmd, rows, cols, parser, sink, signal, Some(images))?;
         self.is_dead = false;
         Ok(session)
     }

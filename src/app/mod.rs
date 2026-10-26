@@ -1,3 +1,4 @@
+pub mod images;
 pub mod input;
 pub mod lease;
 pub mod pty;

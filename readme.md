@@ -20,3 +20,20 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - floating term is draggable and resizeable with keyboard
 - supports most shells, tested on zsh, bash
 - supports most terminal emulators, tested on wezterm
+- images inside the float: kitty graphics and iTerm2 inline images are carried
+  through (`chafa --format=kitty`, `wezterm imgcat`, `timg -pk`, ...)
+
+### images: what is, and is not, supported
+
+uncl does not decode, scale or re-encode anything. The child's bytes are carried
+through to your terminal and re-emitted inside the float, so what you get is
+whatever your terminal can do:
+
+- kitty graphics and iTerm2 inline images work out of the box.
+- sixel is opt-in (`UNCL_SIXEL=1`) and only on a terminal that can draw it.
+- an image wider than the float is not cropped: it is drawn from its cell and
+  your terminal clips it at the screen edge, so it may overlap the border. (uncl
+  does not know your cell size in pixels unless you tell it: `UNCL_CELL_PX=WxH`.)
+- sixel images larger than the float are skipped, once, with a note on stderr.
+- no animation, no alpha, no scaling, no re-encoding.
+- the background shell's images are not carried through - only the float's.

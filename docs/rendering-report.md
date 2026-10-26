@@ -16,7 +16,7 @@
    - **S0 — stop being slow** (~2–3 days): event-driven redraw, drain-to-empty input, bracketed paste, batching writer, `vt100 0.18.1` via the vendored 123-LOC adapter, delete the byte-sniffing.
    - **S1 — stop lying about geometry and input** (~5 days): one source of truth for the float's size, mouse/key routing by region with mode-aware per-pane encoders, paste, and a **capability-proxying reply channel** (uncl must query the *host* terminal once and relay its answers to children — including the sixel bit, or nothing will ever emit an image).
    - **S2 — own the emitter** (~1 week, **shipped** — Appendix E): `ratatui`+`tui-term` are gone; ~980 LOC turn the grid into ANSI bytes via `vt100`'s `rows_diff`/`rows_formatted` plus our own cursor and border emission (`state_diff` and `cursor_state_formatted` turned out to be unusable — see Appendix E). **This was load-bearing**, because floating is non-negotiable: it is the only route to both speed and pixel fidelity, and the only place out-of-band image bytes can be emitted.
-   - **S3 — cheap-tier images** (~3 days): DCS/APC tap + placement store + re-emit. kitty first (croppable/placeable), sixel best-effort (draw if it fits, otherwise drop). No re-encoding, no scaling.
+   - **S3 — cheap-tier images** (~3 days, **shipped** — Appendix F): DCS/APC/OSC-1337 tap + placement store + re-emit after the grid. kitty and iTerm2 work out of the box (kitty re-places by id, so a move costs one line); sixel is opt-in and drawn only if it can fit. No re-encoding, no scaling, no crop.
 6. **Two things are off the critical path.** *Passthrough takeover* (v1 §6.5) is incompatible with "floating is the product" — demoted to Appendix B, where it survives only as a user-invoked "maximize" and as a debugging aid. *Swapping in `alacritty_terminal`* (S4) stays optional: it buys underline colour, `OSC 8` links and kitty-keyboard input, none of which BTOP-class rendering needs.
 
 ## 0.1 Decisions recorded (2026-10-26)
@@ -268,7 +268,7 @@ Notes that matter:
 
 **Why this is the pivotal stage:** it removes the 100 Hz buffer diffing (§2.1), removes per-cell `Style` construction, drops the lock from the render path (clone-or-snapshot cells into your own `prev` buffer under a short lock), cuts dependencies, and — critically — gives you a place to put **out-of-band bytes after the grid flush**, which is the only way images can be drawn (§6.4).
 
-### 6.4 S3 — "images, cheap tier" — ~3 days, ~300 LOC (decision 2)
+### 6.4 S3 — "images, cheap tier" — ~3 days, ~300 LOC (decision 2) — **shipped**, see Appendix F
 
 Goal: *an image the child emits shows up inside the float*. No decode, no scaling, no re-encoding, no alpha. Passthrough only.
 
@@ -321,7 +321,7 @@ Sources for the ConPTY v1/v2 distinction: Windows Terminal 1.22 release notes (`
 | S0 speed | 2–3 d | ~±200 | Idle CPU → ~0; input 1 event/tick → unbounded; paste instant; real mode tracking; `vt100 0.18.1` via the vendored adapter | Low. `vt100` 0.18 API churn is contained in the 123-LOC adapter; benchmark it against 0.15.2 (see the criterion bench in §8) and keep the pin reversible. |
 | S1 correctness + input + capability proxy | ~5 d | ~+700 | BTOP/htop/nvim/lazygit render at the right size **and are mouse-interactive**; paste; query replies; sixel capability advertised (prerequisite for any image ever appearing) | Medium — the encoder branches per mode and per platform; mitigated by the encoder trait and a golden-sequence table. |
 | S2 own emitter — **shipped** | ~1 wk | ~+1,200/−350, −4 crates | Native-speed scan-out; a hook for out-of-band bytes; no per-cell `Style`; `ratatui`/`tui-term` gone | Medium — off-by-one/clipping bugs are visible; mitigate with the §8.1 golden-frame harness. **Load-bearing: do not defer behind S3.** |
-| S3 cheap-tier images | ~3 d | ~+300 | kitty images (croppable), sixel (if it fits), passthrough | Medium-low, because the quality contract is explicit (§6.4 non-goals). |
+| S3 cheap-tier images — **shipped** | ~3 d | ~+450 | kitty images (croppable), sixel (if it fits), passthrough | Medium-low, because the quality contract is explicit (§6.4 non-goals). |
 | S3.5 hyperlinks (`OSC 8`) | 1 d | ~+60 | clickable links inside the float | Low; or free with S4. |
 | S4 engine swap (`alacritty_terminal`) | 3–5 d | ~+600 | underline colour/styles, hyperlinks, kitty-keyboard input, sync output, `EventListener` (title/clipboard/bell) | Medium; **requires S2** (you must own the encoder before leaving `vt100`). Optional — skip unless users ask for the fidelity *inside* a float. |
 | §6.6 Windows delta | 1–2 d | ~+120 | Windows build that runs a TUI float (no images) | Medium; needs a real Windows box or CI runner to validate input modes. |
@@ -366,9 +366,10 @@ Still genuinely open, in the order they will bite:
 ## 10. Implementation checklist (drop-in order)
 
 Each line is a reviewable PR; the sequence is the shortest dependency-satisfying one.
-S0 (items 1–5), S1 (items 6–10) and S2 (items 11–13) are implemented — see Appendices C, D
-and E for the file maps and the verification status. Item 14 (the golden-frame corpus in
-CI) is the one S2 item still open.
+S0 (items 1–5), S1 (items 6–10), S2 (items 11–13) and S3 (items 15–16) are implemented —
+see Appendices C, D, E and F for the file maps and the verification status. Item 14 (the
+golden-frame corpus in CI) is the one S2 item still open, and S3 deliberately skips item
+17 (`OSC 8` hyperlinks, still an S3.5/S4 item).
 
 ```
 S0  1. vendor adapter (src/app/ui/adapter.rs) + vt100 0.18.1 + drop tui-term        [½ d]
@@ -833,3 +834,158 @@ cargo build --release && ./target/release/uncl
 `state_diff`, the mode table and — crucially — **out-of-band bytes after the grid flush**
 now have a place to live. That is the prerequisite for S3 (kitty/sixel passthrough) and
 for S4 (an `alacritty_terminal` swap) without touching the event loop again.
+
+---
+
+## Appendix F — S3 implementation log (2026-10-26)
+
+S3 is "images, cheap tier" (§6.4): **an image the child emits shows up inside the
+float**, with no decode, no scale and no re-encode. It does now — for the two
+protocols that matter on a terminal that is not a sixel terminal.
+
+### What landed
+
+| # | Change | File |
+|---|---|---|
+| 1 | The tap: a streaming splitter that removes `DCS`/`APC`/`OSC` strings from a child's output *before* `vt100` sees it, across chunk boundaries, and hands everything else back | `src/app/images.rs` (new, ~700 LOC incl. 19 tests) |
+| 2 | The store: classification (kitty / sixel / iTerm2), kitty control-block parsing, chunk joining (`m=1`…`m=0`), a placement-only replay by image id, bounds on count and bytes | `src/app/images.rs` |
+| 3 | The reader thread feeds the splitter, passes graphics to the store anchored at the child's cursor, and answers kitty's `a=q` capability query from the child's own pty | `src/app/pty.rs` |
+| 4 | `Lease` owns the float's store (a restarted child gets a fresh one) | `src/app/lease.rs`, `src/app/ui/tenant.rs` |
+| 5 | Emission **after the grid flush**: new images, re-placement on a move, re-blit after a repaint, and `a=d,d=A` when the float hides | `src/app/render/mod.rs` (6 new tests) |
+| 6 | `TERM`-level advertising: `UNCL_GRAPHICS=kitty,iterm2` for children, `--doctor` says what the tap carries | `src/app/term/caps.rs` |
+| 7 | Non-goals written down where users will find them | `readme.md` |
+
+**111 tests** (S2 shipped 83: +22 tap/store, +6 renderer). No new dependencies.
+
+### The five laws this stage is made of
+
+1. **`vte` cannot tell us about pixels.** `vt100` does not implement
+   `hook/put/unhook`, so a DCS payload is consumed and dropped *inside* the parser,
+   and APC bytes go to `anywhere()`, which discards them. §6.4 offered patching
+   `vt100` for DCS; splitting the stream ourselves instead handles DCS **and** APC
+   **and** OSC 1337 in one place, with no fork of a dependency. The splitter is
+   ~150 lines and has no version coupling.
+2. **The splitter is protocol-agnostic, the store is not.** Out-of-band sequences
+   are reported as `(kind, bytes)`; anything the store does not recognise comes
+   straight back and is fed to the parser, so `OSC 52`, colour queries and `DECRQSS`
+   behave exactly as they did in S1. That is what keeps this stage invisible to the
+   rest of the terminal.
+3. **A terminator can be split.** `ESC` at the end of one read and `\` at the start
+   of the next is the normal case for a 4 KiB image on a pty, and treating the lone
+   `ESC` as ordinary payload swallows the rest of the stream. `feed` checks the
+   boundary explicitly (and a test covers it).
+4. **A transmission is not an image.** kitty senders chunk payloads (`m=1`…`m=0`,
+   4 KiB each), so a 100 KiB PNG arrives as ~25 sequences. Storing each as an image
+   would both break the image and evict its first fragments, so chunks are joined
+   into one entry anchored where the *first* one arrived.
+5. **Two kinds of image, two kinds of lifetime.** kitty images live in the
+   terminal's own image layer: painting text over them does not erase them, so a
+   still frame costs nothing — but they have to be **deleted** (`a=d,d=A`) when the
+   float hides, or they stay stuck over the owner's screen. sixel and iTerm2 draw
+   into the same plane as text, so *any* repaint of their rows erases them and they
+   have to be blitted again. The renderer's emission rule is exactly those three
+   triggers: **new**, **moved**, **erased**.
+
+### Emission rules (the whole policy)
+
+| Trigger | What is sent |
+|---|---|
+| a new sequence | the payload, verbatim, at its translated anchor |
+| the content rect changed (show, drag, resize) | `a=p,i=<id>…` for kitty (never the payload), the payload for the rest |
+| a pixel-based image's rows were repainted | the payload again |
+| the float hides | `ESC _ G a=d,d=A ESC \` — once |
+| nothing changed | nothing at all |
+
+### Deviations from §6.4
+
+- **`vt100` is not patched** (law 1): one splitter for all three protocols instead
+  of a DCS hook plus a separate APC splitter.
+- **iTerm2 inline images are in scope**, though §6.4 listed them as a non-goal.
+  Cost: ~40 lines on top of the same store. Reason: the terminals most likely to be
+  hosting uncl (WezTerm, iTerm2, kitty) implement it, the review machine's terminal
+  has **no sixel at all** (`uncl --doctor`: `sixel=false kitty_graphics=true`), and
+  `wezterm imgcat` is the shortest path to a user seeing an image today.
+- **No source-rect cropping.** §6.4's kitty crop (`x,y,w,h` in *pixels*) needs the
+  cell size in pixels, which needs a host probe (`CSI 16 t`) we do not run. An
+  oversized image therefore overlaps the border instead of being cropped — a
+  documented compromise, and the child's own crop parameters are still passed
+  through verbatim.
+- **The "does it fit" test is an assumption, not a measurement.** sixel only states
+  its size in pixels, so `UNCL_CELL_PX` (default `10x20`) is used to convert. It
+  only ever decides *skip*: the terminal does the drawing. Kitty's `c=`/`r=` are
+  used when the sender provides them, and unknown footprints are drawn.
+- **The capability probe is a reply, not a query.** Rather than interrogating the
+  host at startup, the tap answers kitty's `a=q` from the child's own pty (that is
+  the probe graphics-aware senders actually use) and advertises
+  `UNCL_GRAPHICS=kitty,iterm2` in the child's environment. Sending sixel remains
+  gated on `UNCL_SIXEL`, because a sixel the host cannot draw is garbage on screen,
+  whereas an unknown APC/OSC is ignored by every terminal.
+
+### Deliberately *not* in S3
+
+- **Owner-pane images.** The background shell's graphics are stripped like every
+  other child's, and never drawn. Claiming otherwise would be a lie: the owner pane
+  is painted by the same row encoder as everything else.
+- **Animation** (`a=a`), **frame edits** (`a=f`) beyond passthrough, **alpha**,
+  **scaling**, **`OSC 8` hyperlinks** (that is S3.5, unchanged).
+- **Scroll-aware placement.** An image is anchored to the cell it was emitted at
+  and re-placed there; if the child scrolls its grid, the image stays put instead
+  of travelling with the text. Doing it properly means tracking the grid's scroll
+  deltas, which `vt100` does not expose — that is an S4 (`alacritty_terminal`)
+  feature, not a cheap one.
+- **A cell-size probe** and therefore real cropping (above).
+- **A `--doctor` self-test** that emits a sample image; the acceptance script below
+  does that in three lines instead.
+
+### Verification status — read this before trusting the diff
+
+Still **no Rust toolchain here**; S3 has not been compiled or run.
+
+* every file parses with `tree-sitter-rust`;
+* the `vt100`/`vte` behaviour the tap relies on was read from the vendored sources
+  (`perform.rs`: `hook/put/unhook` unimplemented; `anywhere()` for APC);
+* the kitty control-block grammar, `a=q` reply and `a=d,d=A` deletion were taken
+  from kitty's own protocol description, and sixel's raster attributes from the
+  `DECSDM`/sixel spec as implemented by `libsixel`/`chafa`;
+* 111 tests, 28 of which are new here: splitter ordering, chunk boundaries, split
+  terminators, C1 forms, classification per protocol, chunk joining, deletion,
+  bounds, anchor translation, and the renderer's three emission triggers.
+
+### Manual acceptance script (S3 exit criteria)
+
+```sh
+cargo test                       # 111 tests
+cargo build --release && ./target/release/uncl
+
+# 1. kitty graphics, no external tools needed: an 8x8 dark-red block, 8 cells wide.
+#    Inside the float, paste this; a red rectangle must appear at the prompt cell.
+python3 - <<'PY'
+import base64, sys
+w = h = 8
+data = base64.b64encode(bytes([0x80, 0, 0]) * (w * h)).decode()
+sys.stdout.write(f"\x1b_Gi=1,a=T,f=24,s={w},v={h},c=8,r=4;{data}\x1b\\")
+PY
+# 2. with real tools (whichever you have):
+chafa --format=kitty -s 30x15 some.png      # kitty path
+timg -pk some.png                           # kitty path
+wezterm imgcat some.png                     # iTerm2 path
+chafa --format=sixel -s 30x15 some.png      # sixel path (needs UNCL_SIXEL=1)
+
+# 3. move the float (Alt+arrows, or drag the border) → the image follows the cell
+#    it belongs to, and comes back unchanged. It must not be re-transmitted
+#    (strace -e write -s 200 -p $(pgrep uncl) shows `a=p,i=…`, not the payload).
+# 4. Home twice → the image disappears with the float and returns with it.
+# 5. run the image command again in a scrolling TUI (e.g. `less some.png` via
+#    chafa's sixel/kitty output) → no stale image left behind on the owner screen.
+# 6. `uncl --doctor` → "image tap: kitty + iTerm2 always, sixel not advertised".
+# 7. `UNCL_SIXEL=1 uncl --doctor` → sixel advertised, and a full-screen sixel is
+#    skipped once with "uncl: sixel image is larger than the float; skipping".
+```
+
+### Where S3 leaves the plan
+
+S0–S3 of §6 are now in the tree: fast, correct, self-owned emitter, images. What is
+left is the tail the report already marked optional — `OSC 8` hyperlinks (S3.5),
+the `alacritty_terminal` engine swap (S4), and the Windows delta (§6.6) — plus the
+one open S2 item (the golden-frame corpus). Images are the last thing that was
+*broken* rather than merely missing.

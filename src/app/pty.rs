@@ -18,7 +18,7 @@
 
 use std::{
     io::{Read, Write},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::{Context, Result};
@@ -26,6 +26,7 @@ use bytes::Bytes;
 use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+use crate::app::images::{Ingest, Piece, Splitter, Store};
 use crate::app::signal::Signal;
 use crate::app::term::callbacks::{ChildCallbacks, ReplySink};
 use crate::constants::PTY_WRITE_BATCH;
@@ -69,6 +70,11 @@ impl Drop for PtySession {
 ///
 /// `parser` receives everything the child writes; `signal` is raised after each
 /// batch so the event loop can repaint.
+///
+/// `images` is where graphics sequences from this child are kept (S3). `None`
+/// means "this pane does not draw images": the sequences still leave the byte
+/// stream, they are just handed to the parser and dropped there, exactly as they
+/// were before the tap existed.
 pub fn spawn(
     cmd: CommandBuilder,
     rows: u16,
@@ -76,6 +82,7 @@ pub fn spawn(
     parser: Arc<RwLock<ChildParser>>,
     sink: ReplySink,
     signal: Arc<Signal>,
+    images: Option<Arc<Mutex<Store>>>,
 ) -> Result<PtySession> {
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -104,6 +111,7 @@ pub fn spawn(
     // uses, so replies are ordered with keystrokes and coalesced by the batching
     // task below.
     sink.install(&writer_tx);
+    let reader_sink = sink.clone();
     let (resize_tx, mut resize_rx) = unbounded_channel::<(u16, u16)>();
     let (exited_tx, exited_rx) = unbounded_channel::<()>();
 
@@ -111,13 +119,42 @@ pub fn spawn(
     // runs; the renderer never holds it across a frame (it clones the screen).
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8192];
+        let mut splitter = Splitter::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    {
+                    for piece in splitter.feed(&buf[..n]) {
                         let mut parser = parser.write().unwrap();
-                        parser.process(&buf[..n]);
+                        match piece {
+                            Piece::Text(bytes) => parser.process(&bytes),
+                            Piece::OutOfBand(kind, bytes) => {
+                                // Graphics leave the stream here; everything else
+                                // (OSC 52, colour queries, DECRQSS) is handed to
+                                // the parser exactly as it was before the tap.
+                                let mut kept = false;
+                                if let Some(store) = images.as_ref() {
+                                    let anchor = parser.screen().cursor_position();
+                                    let (rows, cols) = parser.screen().size();
+                                    let area = (cols.get(), rows.get());
+                                    let ingest = store
+                                        .lock()
+                                        .unwrap()
+                                        .ingest(kind, &bytes, anchor, area);
+                                    match ingest {
+                                        Ingest::Stored => kept = true,
+                                        Ingest::Reply(reply) => {
+                                            reader_sink.send(reply);
+                                            kept = true;
+                                        }
+                                        Ingest::Passthrough => {}
+                                    }
+                                }
+                                if !kept {
+                                    parser.process(&bytes);
+                                }
+                            }
+                        }
                     }
                     signal.raise();
                 }

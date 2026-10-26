@@ -36,6 +36,7 @@
 
 use vt100::Screen;
 
+use crate::app::images::Store;
 use crate::constants::content_rect;
 use crate::geometry::Rect;
 
@@ -44,6 +45,9 @@ const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const RESET: &[u8] = b"\x1b[0m";
 const BORDER_COLOR: &[u8] = b"\x1b[32m";
 const BORDER_VERTICAL: &str = "│";
+/// kitty: delete every placement (not the image data). Sent when the float goes
+/// away, because kitty images live in a layer that our own repaint cannot touch.
+const KITTY_DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A\x1b\\";
 
 /// Everything one frame needs: the two snapshots and where they go.
 ///
@@ -51,12 +55,14 @@ const BORDER_VERTICAL: &str = "│";
 /// parser lock (so the lock is never held while a frame is encoded) and hands the
 /// snapshots over, which becomes the `prev` state for the next frame. Taking
 /// ownership is what keeps this at one clone per pane per frame instead of two.
-pub struct Panes {
+pub struct Panes<'a> {
     pub owner: Screen,
     pub owner_area: Rect,
     /// The float's screen and its rectangle *including* the border.
     pub float: Option<(Screen, Rect)>,
     pub float_focused: bool,
+    /// Graphics the float's child has drawn, in the child's own coordinates.
+    pub images: Option<&'a Store>,
 }
 
 /// Per-frame state: what the host terminal was last told to display.
@@ -69,6 +75,16 @@ pub struct Renderer {
     /// Where we last put it, or `None` when painting has moved it since.
     cursor_at: Option<(u16, u16)>,
     force_full: bool,
+    /// The content rect the images were last drawn into. A change means every
+    /// placement has to move.
+    image_layout: Option<Rect>,
+    /// The newest image sequence the terminal has been told about.
+    last_image_seq: u64,
+    /// Have we drawn anything that lives in the terminal's image layer?
+    images_shown: bool,
+    /// Did we delete the images (float hidden)? Then the next show has to send
+    /// the payloads again instead of re-placing by id.
+    images_forgotten: bool,
 }
 
 impl Renderer {
@@ -82,6 +98,10 @@ impl Renderer {
             cursor_shown: true,
             cursor_at: None,
             force_full: true,
+            image_layout: None,
+            last_image_seq: 0,
+            images_shown: false,
+            images_forgotten: false,
         }
     }
 
@@ -93,10 +113,24 @@ impl Renderer {
         self.force_full = true;
         self.owner_prev = None;
         self.float_prev = None;
+        // The float may be somewhere else now, so every placement has to move.
+        // The image *data* does not: the terminal still holds it, and a kitty
+        // image is one `a=p,i=<id>` away rather than a re-send of the payload.
+        self.image_layout = None;
+    }
+
+    /// The float's child was replaced: its images belong to a process that no
+    /// longer exists, so drop the terminal's whole image layer and let the next
+    /// frame start again.
+    pub fn forget_images(&mut self) {
+        self.images_forgotten = true;
+        self.images_shown = true;
+        self.image_layout = None;
+        self.last_image_seq = 0;
     }
 
     /// Build one frame. The returned bytes are empty when nothing changed.
-    pub fn render(&mut self, panes: Panes) -> &[u8] {
+    pub fn render(&mut self, panes: Panes<'_>) -> &[u8] {
         self.out.clear();
 
         let Panes {
@@ -104,6 +138,7 @@ impl Renderer {
             owner_area,
             float,
             float_focused,
+            images,
         } = panes;
         let float_at = float.as_ref().map(|(screen, rect)| (screen, *rect));
 
@@ -168,6 +203,13 @@ impl Renderer {
             );
         }
 
+        // Graphics go last, after the grid: a pixel-based image is destroyed by
+        // any text painted over it, and a kitty image would be covered by the
+        // grid rows above it.
+        let repainted = !float_plan.is_empty() || borders;
+        let content = float_at.map(|(_, rect)| content_rect(rect));
+        self.emit_images(images, content, repainted);
+
         let (cursor_screen, cursor_area) = match float_at {
             Some((screen, rect)) if float_focused => (screen, content_rect(rect)),
             _ => (&owner, owner_area),
@@ -191,6 +233,83 @@ impl Renderer {
         }
         // Painting leaves the terminal's cursor wherever the last row ended.
         self.cursor_at = None;
+    }
+
+    /// Re-emit the float's graphics at their (possibly new) cells.
+    ///
+    /// Three reasons to emit anything at all:
+    ///
+    /// * the image is **new** — the terminal has never seen it;
+    /// * the float **moved** (show, drag, resize) — every placement has to follow,
+    ///   which for kitty is a one-line `a=p,i=<id>` rather than the payload;
+    /// * a **pixel-based** image (sixel, iTerm2) had its rows repainted, which
+    ///   erased it, because those protocols draw into the same plane as text.
+    ///
+    /// A still screen with a kitty image therefore costs nothing per frame, which
+    /// is the whole point of putting this after the grid diff.
+    fn emit_images(&mut self, store: Option<&Store>, content: Option<Rect>, repainted: bool) {
+        let Some(content) = content else {
+            // The float is gone. Its kitty images live in a layer our repaint
+            // cannot reach, so they have to be deleted explicitly, or they stay
+            // stuck on the owner's screen.
+            if self.images_shown {
+                self.out.extend_from_slice(KITTY_DELETE_ALL);
+                self.images_shown = false;
+                self.images_forgotten = true;
+                self.cursor_at = None;
+            }
+            self.image_layout = None;
+            return;
+        };
+
+        let layout_changed = self.image_layout != Some(content);
+        let mut emitted = false;
+
+        // Everything we thought the terminal held is gone (the float came back,
+        // or its child was replaced): start from an empty image layer, so a dead
+        // child's pictures cannot survive into the next one.
+        if self.images_forgotten {
+            self.out.extend_from_slice(KITTY_DELETE_ALL);
+            emitted = true;
+        }
+
+        if let Some(store) = store {
+            for image in store.images() {
+                // `vt100` reports the cursor as (row, column).
+                let (row, col) = image.anchor();
+
+                // Anything anchored outside the child's grid is not ours to draw:
+                // it would land on the border or on the owner's cells.
+                if col >= content.width || row >= content.height {
+                    self.last_image_seq = self.last_image_seq.max(image.seq());
+                    continue;
+                }
+
+                let fresh = self.images_forgotten || image.seq() > self.last_image_seq;
+                let moved = layout_changed && image.replay().is_some();
+                let erased = repainted && image.pixel_based();
+
+                if fresh || moved || erased {
+                    cup(&mut self.out, content.y.saturating_add(row), content.x.saturating_add(col));
+                    match image.replay() {
+                        // Re-placing an image the terminal already holds.
+                        Some(replay) if !fresh => self.out.extend_from_slice(replay),
+                        _ => self.out.extend_from_slice(image.bytes()),
+                    }
+                    emitted = true;
+                }
+
+                self.last_image_seq = self.last_image_seq.max(image.seq());
+            }
+        }
+
+        if emitted {
+            self.images_shown = true;
+            // The last image left the cursor somewhere in its own pixels.
+            self.cursor_at = None;
+        }
+        self.images_forgotten = false;
+        self.image_layout = Some(content);
     }
 
     fn place_cursor(&mut self, screen: &Screen, area: Rect) {
@@ -687,6 +806,7 @@ fn parse_u16(bytes: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::images::Ingest;
     use crate::constants::nz;
 
     fn parser(rows: u16, cols: u16) -> vt100::Parser {
@@ -774,6 +894,7 @@ mod tests {
             owner_area: area,
             float: None,
             float_focused: false,
+            images: None,
         });
 
         let frame = text(frame);
@@ -795,6 +916,7 @@ mod tests {
             owner_area: area,
             float: None,
             float_focused: false,
+            images: None,
         });
 
         let second = renderer.render(Panes {
@@ -802,6 +924,7 @@ mod tests {
             owner_area: area,
             float: None,
             float_focused: false,
+            images: None,
         });
         assert!(second.is_empty(), "second frame: {:?}", text(second));
     }
@@ -818,6 +941,7 @@ mod tests {
             owner_area: area,
             float: None,
             float_focused: false,
+            images: None,
         });
 
         parser.process(b"\r\nchanged");
@@ -826,6 +950,7 @@ mod tests {
             owner_area: area,
             float: None,
             float_focused: false,
+            images: None,
         }));
 
         assert!(frame.contains("changed"), "frame: {frame:?}");
@@ -847,6 +972,7 @@ mod tests {
             owner_area: Rect::new(0, 0, 40, 10),
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
+            images: None,
         }));
 
         assert!(frame.contains("floating"), "frame: {frame:?}");
@@ -870,6 +996,7 @@ mod tests {
             owner_area: area,
             float: None,
             float_focused: false,
+            images: None,
         });
         // The float disappearing is a repaint, but the owner's cells are intact.
         let frame = text(renderer.render(Panes {
@@ -877,6 +1004,7 @@ mod tests {
             owner_area: area,
             float: None,
             float_focused: false,
+            images: None,
         }));
         assert!(frame.is_empty(), "frame: {frame:?}");
     }
@@ -893,6 +1021,7 @@ mod tests {
             owner_area: area,
             float: None,
             float_focused: false,
+            images: None,
         }));
 
         assert!(frame.contains("\x1b[?25l"), "frame: {frame:?}");
@@ -922,6 +1051,7 @@ mod tests {
             owner_area: Rect::new(0, 0, 40, 10),
             float: Some((float.screen().clone(), rect)),
             float_focused: false,
+            images: None,
         }));
 
         let el_at = frame.find("\x1b[K").expect("the float row should erase");
@@ -949,6 +1079,7 @@ mod tests {
             owner_area: Rect::new(0, 0, 40, 10),
             float: Some((float.screen().clone(), Rect::new(2, 2, 12, 5))),
             float_focused: true,
+            images: None,
         };
 
         let mut renderer = Renderer::new();
@@ -971,6 +1102,7 @@ mod tests {
             owner_area: Rect::new(0, 0, 40, 10),
             float: Some((float.screen().clone(), Rect::new(2, 2, 12, 5))),
             float_focused: true,
+            images: None,
         };
 
         let mut renderer = Renderer::new();
@@ -998,6 +1130,7 @@ mod tests {
             owner_area: Rect::new(0, 0, 40, 10),
             float: None,
             float_focused: false,
+            images: None,
         });
 
         // Nothing changed, so nothing is painted…
@@ -1006,6 +1139,7 @@ mod tests {
             owner_area: Rect::new(0, 0, 40, 10),
             float: None,
             float_focused: false,
+            images: None,
         });
         assert!(quiet.is_empty());
 
@@ -1016,10 +1150,223 @@ mod tests {
             owner_area: Rect::new(0, 0, 40, 10),
             float: None,
             float_focused: false,
+            images: None,
         }));
 
         assert!(frame.contains("owner"), "frame: {frame:?}");
         // A full repaint blanks each row before writing it.
         assert!(frame.contains("\x1b[40X"), "frame: {frame:?}");
+    }
+
+    // ---- S3: graphics ----------------------------------------------------
+
+    const KITTY: &[u8] = b"\x1b_Gf=24,a=T,i=7;QUJD\x1b\\";
+    const SIXEL: &[u8] = b"\x1bPq\"1;1;2;2#0~~\x1b\\";
+
+    fn store(area: Rect) -> Store {
+        let mut store = Store::new();
+        let size = (area.width, area.height);
+        assert!(matches!(
+            store.ingest(crate::app::images::Kind::Apc, KITTY, (1, 2), size),
+            Ingest::Stored
+        ));
+        store
+    }
+
+    #[test]
+    fn a_new_image_is_drawn_after_the_grid() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let store = store(content_rect(rect));
+
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        }));
+
+        let row_at = frame.find("hi").expect("the float row is painted");
+        let image_at = frame.find("QUJD").expect("the image is emitted");
+        assert!(image_at > row_at, "grid first, then graphics: {frame:?}");
+
+        // Anchored at (row 1, col 2) inside the child's grid, translated.
+        let content = content_rect(rect);
+        let cup_at = frame.find(&format!("\x1b[{};{}H", content.y + 2, content.x + 3));
+        assert!(cup_at.is_some_and(|cup_at| cup_at < image_at), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn an_unchanged_image_costs_nothing() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let store = store(content_rect(rect));
+        let mut renderer = Renderer::new();
+
+        renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        });
+
+        let second = renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        });
+        assert!(second.is_empty(), "frame: {:?}", text(second));
+    }
+
+    #[test]
+    fn moving_the_float_re_places_the_image_by_id() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let store = store(content_rect(rect));
+        let mut renderer = Renderer::new();
+
+        renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        });
+
+        // The float moved: same image, one line of placement, no payload.
+        renderer.invalidate();
+        let moved = Rect::new(20, 6, 12, 5);
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), moved)),
+            float_focused: true,
+            images: Some(&store),
+        }));
+
+        assert!(frame.contains("\x1b_Ga=p,i=7\x1b\\"), "frame: {frame:?}");
+        assert!(!frame.contains("QUJD"), "the payload must not be re-sent: {frame:?}");
+    }
+
+    #[test]
+    fn hiding_the_float_deletes_the_image_layer() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let store = store(content_rect(rect));
+        let mut renderer = Renderer::new();
+
+        renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        });
+
+        // `Home`: the kitty image lives in a layer our repaint cannot reach.
+        renderer.invalidate();
+        let hidden = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: None,
+            float_focused: false,
+            images: Some(&store),
+        }));
+        assert!(hidden.contains("\x1b_Ga=d,d=A\x1b\\"), "frame: {hidden:?}");
+
+        // And showing it again has to send the payload, because we deleted it.
+        renderer.invalidate();
+        let shown = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        }));
+        assert!(shown.contains("QUJD"), "frame: {shown:?}");
+    }
+
+    #[test]
+    fn a_sixel_is_redrawn_when_its_rows_are_repainted() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let mut store = Store::new();
+        assert!(matches!(
+            store.ingest(crate::app::images::Kind::Dcs, SIXEL, (0, 0), (10, 3)),
+            Ingest::Stored
+        ));
+
+        let mut renderer = Renderer::new();
+        renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        });
+
+        // Text painted over sixel destroys it, so any repaint has to be followed
+        // by the blit again.
+        float.process(b"\r\nmore");
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        }));
+        assert!(frame.contains("more"), "frame: {frame:?}");
+        assert!(frame.contains("\x1bPq"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn an_image_anchored_outside_the_grid_is_not_drawn() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let mut store = Store::new();
+        // Row 99 does not exist in a 3-row child.
+        assert!(matches!(
+            store.ingest(crate::app::images::Kind::Apc, KITTY, (99, 0), (10, 3)),
+            Ingest::Stored
+        ));
+
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        }));
+        assert!(!frame.contains("QUJD"), "frame: {frame:?}");
     }
 }

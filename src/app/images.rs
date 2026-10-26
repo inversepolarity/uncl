@@ -240,6 +240,22 @@ pub enum Ingest {
     Reply(Vec<u8>),
 }
 
+/// How an image asks the terminal for a size.
+///
+/// Every protocol here draws at a size *the terminal chooses*, and all three let
+/// the sender say what that size should be — kitty in cells (`c=`/`r=`), iTerm2
+/// in pixels (`width=…px`). Nothing is ever re-encoded: we edit the request, and
+/// the terminal does the scaling.
+#[derive(Debug)]
+enum Placement {
+    /// Nothing to negotiate (sixel): the payload is all we have.
+    Native,
+    /// kitty: the raw control block, so a size can be written into it.
+    Kitty { header: Vec<u8>, body: Vec<u8> },
+    /// iTerm2 inline: the arguments before the colon, and the base64 body.
+    Inline { args: Vec<u8>, body: Vec<u8> },
+}
+
 /// One image, kept verbatim.
 #[derive(Debug)]
 pub struct Image {
@@ -257,6 +273,20 @@ pub struct Image {
     /// have to be re-emitted whenever the frame repaints their rows. Kitty keeps
     /// images in a separate layer and does not.
     pixel_based: bool,
+    /// How big the image is, as far as anything here can tell: cells for kitty
+    /// (the sender states them), pixels for the rest (sniffed from the header).
+    size: Size,
+    /// How to ask for a size when the image is too big for its box.
+    placement: Placement,
+}
+
+/// What an image says about itself before it is drawn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Size {
+    /// The protocol does not say, and the payload is not a format we sniff.
+    Unknown,
+    Cells(u16, u16),
+    Pixels(u32, u32),
 }
 
 impl Image {
@@ -284,6 +314,148 @@ impl Image {
     pub fn pixel_based(&self) -> bool {
         self.pixel_based
     }
+
+    /// The payload, sized to fit inside `avail` cells of the float's content.
+    ///
+    /// Fitting is done *by the terminal*: kitty gets `c=`/`r=`, iTerm2 gets
+    /// `width=…px;height=…px`, and sixel — which has no such request — is drawn
+    /// as it is. When the image already fits, or its size is unknown, this is
+    /// exactly the bytes the child sent.
+    pub fn render(&self, avail: Option<(u16, u16)>) -> Vec<u8> {
+        let Some((cols, rows)) = avail else {
+            return self.bytes.clone();
+        };
+
+        match &self.placement {
+            Placement::Native => self.bytes.clone(),
+            Placement::Kitty { header, body } => {
+                let Some((fit_cols, fit_rows)) = self.cells_for(cols, rows) else {
+                    return self.bytes.clone();
+                };
+                let mut out = Vec::with_capacity(header.len() + body.len() + 16);
+                out.extend_from_slice(b"\x1b_G");
+                out.extend_from_slice(&kitty_header_for(header, fit_cols, fit_rows));
+                // A control-only sequence (`a=p`, `a=d`) has no payload and must
+                // not grow a dangling separator.
+                if !body.is_empty() {
+                    out.push(b';');
+                    out.extend_from_slice(body);
+                }
+                out.extend_from_slice(b"\x1b\\");
+                out
+            }
+            Placement::Inline { args, body } => {
+                let Some((width, height)) = self.pixels_for(cols, rows) else {
+                    return self.bytes.clone();
+                };
+                let mut out = Vec::with_capacity(args.len() + body.len() + 32);
+                out.extend_from_slice(b"\x1b]1337;File=");
+                out.extend_from_slice(&inline_args_for(args, width, height));
+                out.push(b':');
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\x1b\\");
+                out
+            }
+        }
+    }
+
+    /// The bytes that move an image the terminal already holds, or `None` when
+    /// that protocol cannot be moved and the payload has to be sent again.
+    pub fn replace(&self, avail: Option<(u16, u16)>) -> Option<Vec<u8>> {
+        let replay = self.replay.as_ref()?;
+        let fit = avail.and_then(|(cols, rows)| self.cells_for(cols, rows));
+
+        let Some((fit_cols, fit_rows)) = fit else {
+            return Some(replay.clone());
+        };
+        // A move that also has to change size: keep the replay's own control
+        // block (which is the `a=p` form, i.e. what the terminal already holds)
+        // and rewrite only the size in it.
+        if let Placement::Kitty { .. } = &self.placement {
+            let inner = replay.strip_prefix(b"\x1b_G").unwrap_or(replay);
+            let inner = inner.strip_suffix(b"\x1b\\").unwrap_or(inner);
+            let mut out = Vec::with_capacity(replay.len() + 16);
+            out.extend_from_slice(b"\x1b_G");
+            out.extend_from_slice(&kitty_header_for(inner, fit_cols, fit_rows));
+            out.extend_from_slice(b"\x1b\\");
+            return Some(out);
+        }
+        Some(replay.clone())
+    }
+
+    /// The cell box this image needs, if it does not already fit `(cols, rows)`.
+    fn cells_for(&self, cols: u16, rows: u16) -> Option<(u16, u16)> {
+        match self.size {
+            Size::Cells(width, height) => {
+                if width <= cols && height <= rows {
+                    None
+                } else {
+                    let (width, height) = fit_cells(width, height, cols, rows);
+                    Some((width, height))
+                }
+            }
+            Size::Pixels(width, height) => {
+                let (cell_w, cell_h) = cell_px();
+                let (fit_width, fit_height) = fit_pixels(width, height, cols, rows, cell_w, cell_h)?;
+                // Back to cells for the protocols (kitty) that think in them.
+                Some((
+                    u16::try_from(fit_width.div_ceil(u32::from(cell_w.max(1)))).unwrap_or(cols),
+                    u16::try_from(fit_height.div_ceil(u32::from(cell_h.max(1)))).unwrap_or(rows),
+                ))
+            }
+            Size::Unknown => None,
+        }
+    }
+
+    /// The pixel box this image needs, if it does not already fit.
+    fn pixels_for(&self, cols: u16, rows: u16) -> Option<(u32, u32)> {
+        let Size::Pixels(width, height) = self.size else {
+            return None;
+        };
+        let (cell_w, cell_h) = cell_px();
+        fit_pixels(width, height, cols, rows, cell_w, cell_h)
+    }
+}
+
+/// Scale a pixel size down to fit `cols` x `rows` cells, preserving the aspect
+/// ratio. `None` when it already fits (do not upscale, do not resample).
+fn fit_pixels(
+    width: u32,
+    height: u32,
+    cols: u16,
+    rows: u16,
+    cell_w: u16,
+    cell_h: u16,
+) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    let max_width = f64::from(cols) * f64::from(cell_w);
+    let max_height = f64::from(rows) * f64::from(cell_h);
+    let scale = (max_width / f64::from(width)).min(max_height / f64::from(height));
+    if !scale.is_finite() || scale >= 1.0 {
+        return None;
+    }
+    Some((
+        (f64::from(width) * scale).floor().max(1.0) as u32,
+        (f64::from(height) * scale).floor().max(1.0) as u32,
+    ))
+}
+
+/// Scale a cell size down to fit `cols` x `rows` cells, preserving the aspect
+/// ratio.
+fn fit_cells(width: u16, height: u16, cols: u16, rows: u16) -> (u16, u16) {
+    if width <= cols && height <= rows {
+        return (width, height);
+    }
+    let scale = (f64::from(cols) / f64::from(width)).min(f64::from(rows) / f64::from(height));
+    if !scale.is_finite() || scale <= 0.0 {
+        return (cols.max(1), rows.max(1));
+    }
+    (
+        (f64::from(width) * scale).floor().max(1.0) as u16,
+        (f64::from(height) * scale).floor().max(1.0) as u16,
+    )
 }
 
 /// The images one pane remembers, oldest first.
@@ -363,6 +535,8 @@ impl Store {
                     replay: None,
                     anchor,
                     pixel_based: false,
+                    size: Size::Unknown,
+                    placement: Placement::Native,
                 });
                 Ingest::Stored
             }
@@ -400,14 +574,18 @@ impl Store {
                         replay: controls.replay(),
                         anchor: first_anchor,
                         pixel_based: false,
+                        size: controls.size(),
+                        // A transmission spread over several APCs cannot be
+                        // rewritten as one, so it is drawn at the size it asked
+                        // for.
+                        placement: Placement::Native,
                     });
                     return Ingest::Stored;
                 }
 
-                if !fits(controls.footprint(), area) {
-                    self.warn_once("image is larger than the float; skipping");
-                    return Ingest::Stored;
-                }
+                // kitty can be asked to fit a cell box, so a too-large image is
+                // not dropped the way sixel is: the terminal scales it.
+                let (header, payload) = split_kitty(body);
                 self.push(Image {
                     seq: 0,
                     bytes: bytes.to_vec(),
@@ -417,6 +595,11 @@ impl Store {
                     // Kitty images live in the terminal's image layer, so our
                     // repaints do not erase them.
                     pixel_based: false,
+                    size: controls.size(),
+                    placement: Placement::Kitty {
+                        header,
+                        body: payload,
+                    },
                 });
                 Ingest::Stored
             }
@@ -439,7 +622,10 @@ impl Store {
             return Ingest::Passthrough;
         }
 
-        if !fits(raster_attributes(&body[q + 1..]), area) {
+        let footprint = raster_attributes(&body[q + 1..]);
+        if !fits(footprint, area) {
+            // sixel has no way to ask for a size, and re-encoding it is out of
+            // scope by design, so the only honest options are draw or skip.
             self.warn_once("sixel image is larger than the float; skipping");
             return Ingest::Stored;
         }
@@ -452,6 +638,8 @@ impl Store {
             replay: None,
             anchor,
             pixel_based: true,
+            size: size_of(footprint),
+            placement: Placement::Native,
         });
         Ingest::Stored
     }
@@ -477,11 +665,11 @@ impl Store {
             return Ingest::Passthrough;
         }
 
-        if !fits(iterm_footprint(args), area) {
-            self.warn_once("inline image is larger than the float; skipping");
-            return Ingest::Stored;
-        }
-
+        // iTerm2 asks for a size in pixels (`width=…px`), so a too-large image is
+        // scaled by the terminal rather than dropped. Its native size is not in
+        // the sequence, so it is read out of the payload's own header — the only
+        // decode in this module, and it stops after a few dozen bytes.
+        let native = image_pixels(&rest[colon + 1..]);
         self.push(Image {
             seq: 0,
             bytes: bytes.to_vec(),
@@ -489,6 +677,14 @@ impl Store {
             replay: None,
             anchor,
             pixel_based: true,
+            size: match native {
+                Some((width, height)) => Size::Pixels(width, height),
+                None => size_of(iterm_footprint(args)),
+            },
+            placement: Placement::Inline {
+                args: args.to_vec(),
+                body: rest[colon + 1..].to_vec(),
+            },
         });
         Ingest::Stored
     }
@@ -522,6 +718,166 @@ impl Store {
             self.bytes = self.bytes.saturating_sub(dropped.bytes.len());
         }
     }
+}
+
+/// The control block and payload of a kitty sequence, split at the first `;`.
+fn split_kitty(body: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    match body.iter().position(|byte| *byte == b';') {
+        Some(at) => (body[..at].to_vec(), body[at + 1..].to_vec()),
+        None => (body.to_vec(), Vec::new()),
+    }
+}
+
+/// Ask the terminal for a specific cell box: `c=`/`r=` replace whatever the
+/// sender said, and `C=` (do not preserve aspect) is dropped so that a fitted
+/// image is never distorted.
+fn kitty_header_for(header: &[u8], cols: u16, rows: u16) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(header.len() + 16);
+    for item in header.split(|byte| *byte == b',') {
+        let key = item.first().copied();
+        if matches!(key, Some(b'c' | b'r' | b'C')) {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(b',');
+        }
+        out.extend_from_slice(item);
+    }
+    out.extend_from_slice(format!(",c={cols},r={rows}").as_bytes());
+    out
+}
+
+/// Ask iTerm2 for a specific pixel box. `preserveAspectRatio=1` keeps the aspect
+/// ratio when the terminal derives the other dimension.
+fn inline_args_for(args: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(args.len() + 40);
+    let mut wrote_size = false;
+
+    for arg in args.split(|byte| *byte == b';') {
+        if arg.is_empty() {
+            continue;
+        }
+        // Drop any size the sender asked for, and any aspect-ratio setting: ours
+        // is the one that keeps the image inside the float.
+        if arg.starts_with(b"width=")
+            || arg.starts_with(b"height=")
+            || arg.starts_with(b"preserveAspectRatio=")
+        {
+            if !wrote_size {
+                if !out.is_empty() {
+                    out.push(b';');
+                }
+                out.extend_from_slice(format!("width={width}px;height={height}px").as_bytes());
+                wrote_size = true;
+            }
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(b';');
+        }
+        out.extend_from_slice(arg);
+    }
+
+    if !wrote_size {
+        if !out.is_empty() {
+            out.push(b';');
+        }
+        out.extend_from_slice(format!("width={width}px;height={height}px").as_bytes());
+    }
+    out.extend_from_slice(b";preserveAspectRatio=1");
+    out
+}
+
+fn size_of(footprint: Footprint) -> Size {
+    match footprint {
+        Footprint::Unknown => Size::Unknown,
+        Footprint::Cells(cols, rows) => Size::Cells(cols, rows),
+        Footprint::Pixels(width, height) => Size::Pixels(width, height),
+    }
+}
+
+/// The intrinsic size of a base64 image, read from its own header.
+///
+/// This is not image decoding: it is a signature check and two big-endian
+/// integers (PNG), two little-endian ones (GIF), or a marker walk (JPEG). It
+/// exists because the iTerm2 sequence only carries pixels if the sender chose to
+/// say so, and `wezterm imgcat` does not — but the terminal still has to be told
+/// a size, or it draws at native scale and runs over the float's border.
+fn image_pixels(base64_body: &[u8]) -> Option<(u32, u32)> {
+    // 8 KiB of base64 is 6 KiB of image: enough for any header, even JPEG's
+    // marker walk past an EXIF block.
+    let head = base64_prefix(base64_body, 6144);
+    match head.as_slice() {
+        // PNG: IHDR is the first chunk, width and height are big-endian.
+        [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, ..] if head.len() >= 24 => {
+            let width = u32::from_be_bytes([head[16], head[17], head[18], head[19]]);
+            let height = u32::from_be_bytes([head[20], head[21], head[22], head[23]]);
+            Some((width, height)).filter(|(width, height)| *width > 0 && *height > 0)
+        }
+        // GIF: the logical screen size, little-endian, right after the signature.
+        [b'G', b'I', b'F', b'8', _, b'a', width_low, width_high, height_low, height_high, ..] => {
+            let width = u32::from(u16::from_le_bytes([*width_low, *width_high]));
+            let height = u32::from(u16::from_le_bytes([*height_low, *height_high]));
+            Some((width, height)).filter(|(width, height)| *width > 0 && *height > 0)
+        }
+        [0xff, 0xd8, ..] => jpeg_pixels(&head),
+        _ => None,
+    }
+}
+
+/// Walk JPEG segments to the first start-of-frame, which carries the size.
+fn jpeg_pixels(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut at = 2usize;
+    while at + 9 < bytes.len() {
+        if bytes[at] != 0xff {
+            return None;
+        }
+        let marker = bytes[at + 1];
+        // SOF0…SOF15, minus the four that are not frames (DHT, JPG, DAC).
+        if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+            let height = u32::from(u16::from_be_bytes([bytes[at + 5], bytes[at + 6]]));
+            let width = u32::from(u16::from_be_bytes([bytes[at + 7], bytes[at + 8]]));
+            return Some((width, height)).filter(|(width, height)| *width > 0 && *height > 0);
+        }
+        let length = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
+        if length < 2 {
+            return None;
+        }
+        at += 2 + length;
+    }
+    None
+}
+
+/// Decode at most `want` bytes of a base64 payload.
+///
+/// Deliberately tolerant: it stops at `=`, on any non-alphabet byte, or when the
+/// payload ends, because this runs on whatever a child decided to send.
+fn base64_prefix(bytes: &[u8], want: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(want);
+    let mut accumulator: u32 = 0;
+    let mut bits = 0u32;
+
+    for byte in bytes {
+        let value = match byte {
+            b'A'..=b'Z' => u32::from(byte - b'A'),
+            b'a'..=b'z' => u32::from(byte - b'a') + 26,
+            b'0'..=b'9' => u32::from(byte - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            // Padding, whitespace and anything else: stop.
+            _ => return out,
+        };
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+            if out.len() >= want {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 /// Would something this size fit inside the child's grid?
@@ -565,6 +921,8 @@ struct KittyControls {
     placement: Option<u32>,
     /// `m=1`: more chunks of this transmission follow.
     more: bool,
+    /// `s=`/`v=`: the image's own size, in pixels.
+    native_px: Option<(u32, u32)>,
     /// `c`/`r` (size in cells), `x`/`y`/`w`/`h` (source crop), `z` (z-index),
     /// `q` (quiet). All of it replays verbatim; we never interpret the pixels.
     replay_keys: Vec<(u8, String)>,
@@ -592,6 +950,8 @@ impl KittyControls {
                 b'i' => out.id = value.parse().ok(),
                 b'p' => out.placement = value.parse().ok(),
                 b'm' => out.more = value == "1",
+                b's' => out.native_px = Some((value.parse().unwrap_or(0), out.native_px.map_or(0, |px| px.1))),
+                b'v' => out.native_px = Some((out.native_px.map_or(0, |px| px.0), value.parse().unwrap_or(0))),
                 b'c' | b'r' | b'x' | b'y' | b'w' | b'h' | b'z' | b'q' | b'C' | b'X' | b'Y' => {
                     out.replay_keys.push((key, value.to_owned()));
                 }
@@ -602,8 +962,9 @@ impl KittyControls {
         Some(out)
     }
 
-    /// How big the image will be, if the controls say.
-    fn footprint(&self) -> Footprint {
+    /// How big the image will be, if the controls say: cells when the sender
+    /// gave `c=`/`r=`, pixels when it only gave `s=`/`v=`.
+    fn size(&self) -> Size {
         let mut cols = None;
         let mut rows = None;
         for (key, value) in &self.replay_keys {
@@ -614,8 +975,11 @@ impl KittyControls {
             }
         }
         match (cols, rows) {
-            (Some(cols), Some(rows)) => Footprint::Cells(cols, rows),
-            _ => Footprint::Unknown,
+            (Some(cols), Some(rows)) => Size::Cells(cols, rows),
+            _ => match self.native_px {
+                Some((width, height)) if width > 0 && height > 0 => Size::Pixels(width, height),
+                _ => Size::Unknown,
+            },
         }
     }
 
@@ -746,6 +1110,44 @@ mod tests {
 
     fn ingest(store: &mut Store, kind: Kind, bytes: &[u8]) -> Ingest {
         store.ingest(kind, bytes, (0, 0), (80, 24))
+    }
+
+    /// Base64, so the fixtures below can be written as bytes.
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let mut block = [0u8; 3];
+            block[..chunk.len()].copy_from_slice(chunk);
+            let value = (u32::from(block[0]) << 16)
+                | (u32::from(block[1]) << 8)
+                | u32::from(block[2]);
+            for index in 0..4 {
+                if index <= chunk.len() {
+                    let shift = 18 - index * 6;
+                    out.push(char::from(ALPHABET[((value >> shift) & 0x3f) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// A PNG header — signature, IHDR length/type, then the size in big-endian.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    fn inline(pixels: &[u8]) -> Vec<u8> {
+        format!("\x1b]1337;File=inline=1:{}", base64(pixels)).into_bytes()
     }
 
     #[test]
@@ -1067,6 +1469,119 @@ mod tests {
             store.ingest(Kind::Dcs, b"\x1bP$qm\x1b\\", (0, 0), (80, 24)),
             Ingest::Passthrough
         ));
+    }
+
+    #[test]
+    fn a_png_header_is_read_without_decoding_the_image() {
+        assert_eq!(image_pixels(base64(png(1920, 1080).as_slice()).as_bytes()), Some((1920, 1080)));
+
+        // GIF: little-endian, right after `GIF89a`.
+        let gif = b"GIF89a\x40\x01\xf0\x00".to_vec();
+        assert_eq!(image_pixels(base64(&gif).as_bytes()), Some((320, 240)));
+
+        // JPEG: walk to SOF0.
+        let mut jpeg = vec![0xff, 0xd8];
+        jpeg.extend_from_slice(&[0xff, 0xe0, 0x00, 0x04, 0x00, 0x00]); // APP0, len 4
+        jpeg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08]);
+        jpeg.extend_from_slice(&480u16.to_be_bytes()); // height
+        jpeg.extend_from_slice(&640u16.to_be_bytes()); // width
+        jpeg.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        assert_eq!(image_pixels(base64(&jpeg).as_bytes()), Some((640, 480)));
+
+        // Nothing we recognise, and a payload that is not even base64.
+        assert_eq!(image_pixels(base64(b"not an image").as_bytes()), None);
+        assert_eq!(image_pixels(b"~~~~"), None);
+        assert_eq!(image_pixels(b""), None);
+    }
+
+    #[test]
+    fn an_inline_image_is_asked_to_fit_the_box() {
+        let (cell_w, cell_h) = cell_px();
+        let mut store = Store::new();
+        // 2000x1000 px in a box 20 cells wide and 10 cells tall.
+        ingest(&mut store, Kind::Osc, &inline(&png(2000, 1000)));
+        let image = &store.images()[0];
+
+        let out = String::from_utf8(image.render(Some((20, 10)))).unwrap();
+        // The box in pixels, and the aspect ratio kept: 2000x1000 scaled by
+        // whichever limit binds.
+        let max_w = f64::from(20 * cell_w);
+        let max_h = f64::from(10 * cell_h);
+        let scale = (max_w / 2000.0).min(max_h / 1000.0);
+        let width = (2000.0 * scale).floor() as u32;
+        let height = (1000.0 * scale).floor() as u32;
+
+        assert!(out.contains(&format!("width={width}px;height={height}px")), "out: {out:?}");
+        assert!(out.contains("preserveAspectRatio=1"), "out: {out:?}");
+        assert!(out.contains("inline=1"), "the sender's own args survive: {out:?}");
+        assert!(out.starts_with("\x1b]1337;File="), "out: {out:?}");
+        // The payload is untouched: we never re-encode.
+        assert!(out.contains(&base64(&png(2000, 1000))), "out: {out:?}");
+    }
+
+    #[test]
+    fn an_image_that_fits_is_sent_exactly_as_it_arrived() {
+        let mut store = Store::new();
+        let sequence = inline(&png(32, 16));
+        ingest(&mut store, Kind::Osc, &sequence);
+        let image = &store.images()[0];
+
+        // 32x16 px fits in any sane box: no rewrite, no resampling.
+        assert_eq!(image.render(Some((80, 24))), sequence);
+        // And with no box at all it is untouched too.
+        assert_eq!(image.render(None), sequence);
+    }
+
+    #[test]
+    fn a_kitty_image_is_clamped_to_the_box() {
+        let mut store = Store::new();
+        ingest(
+            &mut store,
+            Kind::Apc,
+            b"\x1b_Ga=T,f=24,i=7,c=200,r=100;QUJD\x1b\\",
+        );
+        let image = &store.images()[0];
+
+        let out = String::from_utf8(image.render(Some((20, 10)))).unwrap();
+        assert!(out.contains("c=20"), "out: {out:?}");
+        assert!(out.contains("r=10"), "out: {out:?}");
+        // The old, oversized keys are gone rather than duplicated.
+        assert!(!out.contains("c=200"), "out: {out:?}");
+        assert!(out.contains("i=7") && out.contains("QUJD"), "out: {out:?}");
+    }
+
+    #[test]
+    fn a_kitty_image_that_fits_keeps_its_own_size() {
+        let mut store = Store::new();
+        let sequence = b"\x1b_Ga=T,f=24,i=7,c=4,r=2;QUJD\x1b\\";
+        ingest(&mut store, Kind::Apc, sequence);
+        assert_eq!(store.images()[0].render(Some((20, 10))), sequence.to_vec());
+    }
+
+    #[test]
+    fn a_fitted_kitty_move_is_still_one_line() {
+        let mut store = Store::new();
+        ingest(
+            &mut store,
+            Kind::Apc,
+            b"\x1b_Ga=T,f=24,i=7,c=200,r=100;QUJD\x1b\\",
+        );
+        let image = &store.images()[0];
+
+        let out = String::from_utf8(image.replace(Some((20, 10))).unwrap()).unwrap();
+        assert!(out.contains("a=p"), "out: {out:?}");
+        assert!(out.contains("c=20") && out.contains("r=10"), "out: {out:?}");
+        assert!(!out.contains("QUJD"), "a move must not resend the payload: {out:?}");
+    }
+
+    #[test]
+    fn a_sixel_has_no_way_to_be_resized() {
+        let mut store = Store::new();
+        let sixel = b"\x1bPq\"1;1;2;2#0;2;0;0;0#0~~\x1b\\";
+        ingest(&mut store, Kind::Dcs, sixel);
+        let image = &store.images()[0];
+        // Verbatim, whatever box it is given: sixel is draw-or-skip.
+        assert_eq!(image.render(Some((1, 1))), sixel.to_vec());
     }
 
     #[test]

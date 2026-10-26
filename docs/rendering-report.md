@@ -855,7 +855,7 @@ protocols that matter on a terminal that is not a sixel terminal.
 | 6 | `TERM`-level advertising: `UNCL_GRAPHICS=kitty,iterm2` for children, `--doctor` says what the tap carries | `src/app/term/caps.rs` |
 | 7 | Non-goals written down where users will find them | `readme.md` |
 
-**117 tests** (S2 shipped 83: +23 tap/store, +6 renderer, +5 window reports and
+**125 tests** (S2 shipped 83: +30 tap/store, +7 renderer, +5 window reports and
 cell size). No new dependencies.
 
 ### The five laws this stage is made of
@@ -906,12 +906,10 @@ cell size). No new dependencies.
   hosting uncl (WezTerm, iTerm2, kitty) implement it, the review machine's terminal
   has **no sixel at all** (`uncl --doctor`: `sixel=false kitty_graphics=true`), and
   `wezterm imgcat` is the shortest path to a user seeing an image today.
-- **No source-rect cropping.** §6.4's kitty crop (`x,y,w,h` in *pixels*) needs the
-  cell size in pixels. We do have one (see `probe_cell_px`, below), but cropping
-  would mean rewriting a sender's payload, and passthrough is the rule. An
-  oversized image therefore overlaps the border instead of being cropped — a
-  documented compromise, and the child's own crop parameters are still passed
-  through verbatim.
+- **No source-rect cropping.** §6.4's kitty crop (`x,y,w,h` in *pixels*) cuts a
+  window out of the image instead of showing all of it. Scaling (S3.2, below) is
+  the better answer for a float — the whole picture, just smaller — so cropping
+  stays unbuilt. A sender's own crop parameters are still passed through.
 - **The "does it fit" test is an estimate, not a measurement.** sixel only states
   its size in pixels, so the cell size has to be assumed: measured from the host
   tty at startup (`TIOCGWINSZ`), overridable with `UNCL_CELL_PX`, falling back to
@@ -953,14 +951,14 @@ Still **no Rust toolchain here**; S3 has not been compiled or run.
 * the kitty control-block grammar, `a=q` reply and `a=d,d=A` deletion were taken
   from kitty's own protocol description, and sixel's raster attributes from the
   `DECSDM`/sixel spec as implemented by `libsixel`/`chafa`;
-* 117 tests, 34 of which are new here: splitter ordering, chunk boundaries, split
+* 125 tests, 42 of which are new here: splitter ordering, chunk boundaries, split
   terminators, C1 forms, classification per protocol, chunk joining, deletion,
   bounds, anchor translation, and the renderer's three emission triggers.
 
 ### Manual acceptance script (S3 exit criteria)
 
 ```sh
-cargo test                       # 117 tests
+cargo test                       # 125 tests
 cargo build --release && ./target/release/uncl
 
 # 1. kitty graphics, no external tools needed: an 8x8 dark-red block, 8 cells wide.
@@ -1055,6 +1053,62 @@ contract with every terminal application in existence, and the failure mode of a
 partial table is not "the app degrades", it is "the app trusts the half-answer and
 divides by zero". §6.5's fidelity table should eventually be read the same way: a
 capability we claim is a promise about the ones next to it.
+
+### S3.2 — the image drew *at* the float instead of *inside* it
+
+The second thing the first real image found. `wezterm imgcat uncl.png` inside the
+float no longer panicked (S3.1), and the picture appeared — at its native pixel
+size, drawn from the prompt cell **over the border, over the owner's screen**, a
+600px image inside a 78-column window:
+
+```
+┌─ float ────────────────────────┐
+│ ▲ ~ wezterm imgcat uncl.png    │
+│ ┌─────────────────────────┐    │   <- the image, native size,
+│ │                         │    │      ignoring the border entirely
+└─┼─────────────────────────┼────┘
+  └─────────────────────────┘
+```
+
+Nothing was *broken* — we had simply never told the terminal how big to make the
+image, so it made the only choice it could. This is the same shape of bug as S3.1:
+**a child asks for geometry, and we answer by staying silent.**
+
+The fix has one rule — *the terminal does the scaling; we only state the box* —
+because the alternative (decode, resample, re-encode) is exactly what §6.4 ruled
+out.
+
+| Protocol | How it is asked to fit | What it costs |
+|---|---|---|
+| kitty | `c=`/`r=` rewritten to the fitted cell box (`C=` dropped so the terminal preserves the aspect ratio) | one line; the payload is untouched |
+| iTerm2 inline | `width=<W>px;height=<H>px;preserveAspectRatio=1` | one line; the payload is untouched |
+| sixel | nothing — draw or skip, as before | — |
+
+The box is *everything from the anchor cell to the float's bottom-right corner*,
+which S1's geometry law makes the child's own grid, so a child drawing at its own
+origin lands inside the float by construction.
+
+**The one decode.** The iTerm2 sequence does not carry the image's own size:
+`wezterm imgcat` sends `File=inline=1:…` and nothing else. So the payload's header
+is read — signature check plus two integers for PNG, two more for GIF, a marker
+walk for JPEG (`image_pixels`). It decodes at most 6 KiB of the base64 and never
+the pixels; a format it does not recognise is left at native size rather than
+guessed at. This is the only place in uncl that looks inside an image, and it
+exists purely to answer "how much space does this want?".
+
+Deliberate limits, all tested:
+
+* **down, never up.** An image smaller than the box is sent byte-for-byte
+  unchanged (`an_image_that_fits_is_sent_exactly_as_it_arrived`); upscaling would
+  be a quality lie, and it costs bytes on every frame.
+* **aspect ratio is preserved by construction**, and the sender's own `C=1` /
+  `preserveAspectRatio=0` is dropped when we resize — an image squashed to fit is
+  not a fix.
+* **sixel stays draw-or-skip**, because there is no "please scale" in DCS.
+* **chunked kitty transmissions are drawn as asked**, because a sequence split
+  over twenty-five APCs cannot be rewritten as one (`Placement::Native`).
+* a move still costs one line: the fitted `a=p` replay is `_Ga=p,i=…,c=…,r=…`
+  with no payload (`a_fitted_kitty_move_is_still_one_line`).
 
 ### Where S3 leaves the plan
 

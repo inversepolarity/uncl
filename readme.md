@@ -31,10 +31,12 @@ whatever your terminal can do:
 
 - kitty graphics and iTerm2 inline images work out of the box.
 - sixel is opt-in (`UNCL_SIXEL=1`) and only on a terminal that can draw it.
-- an image wider than the float is not cropped: it is drawn from its cell and
-  your terminal clips it at the screen edge, so it may overlap the border. (uncl
-  measures your cell size from the tty at startup and reports it to children;
-  `UNCL_CELL_PX=WxH` overrides the measurement, `uncl --doctor` prints it.)
-- sixel images larger than the float are skipped, once, with a note on stderr.
+- an image too big for the float is scaled down to fit it (by your terminal - the
+  bytes are passed through untouched), keeping its aspect ratio. Small images are
+  never scaled up. uncl measures your cell size from the tty at startup and
+  reports it to children; `UNCL_CELL_PX=WxH` overrides the measurement and
+  `uncl --doctor` prints it.
+- sixel images larger than the float are skipped, once, with a note on stderr:
+  sixel has no way to ask for a size, and uncl never re-encodes.
 - no animation, no alpha, no scaling, no re-encoding.
 - the background shell's images are not carried through - only the float's.

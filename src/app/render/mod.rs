@@ -205,7 +205,8 @@ impl Renderer {
 
         // Graphics go last, after the grid: a pixel-based image is destroyed by
         // any text painted over it, and a kitty image would be covered by the
-        // grid rows above it.
+        // grid rows above it. Each image is sized to the room it has left inside
+        // the float, so none of them can spill over the border.
         let repainted = !float_plan.is_empty() || borders;
         let content = float_at.map(|(_, rect)| content_rect(rect));
         self.emit_images(images, content, repainted);
@@ -289,13 +290,27 @@ impl Renderer {
                 let moved = layout_changed && image.replay().is_some();
                 let erased = repainted && image.pixel_based();
 
+                // Everything from the anchor cell to the float's bottom-right
+                // corner is the room an image is allowed to take. The child's
+                // grid is the content rect (S1's geometry law), so a child that
+                // drew at its own origin lands inside the float, instead of
+                // across the border and over the owner's screen.
+                let avail = (
+                    content.width.saturating_sub(col),
+                    content.height.saturating_sub(row),
+                );
+
                 if fresh || moved || erased {
+                    // Re-placing an image the terminal already holds costs one
+                    // line; anything else is the payload, sized to `avail`.
+                    let bytes = match image.replay() {
+                        Some(_) if !fresh => image
+                            .replace(Some(avail))
+                            .unwrap_or_else(|| image.render(Some(avail))),
+                        _ => image.render(Some(avail)),
+                    };
                     cup(&mut self.out, content.y.saturating_add(row), content.x.saturating_add(col));
-                    match image.replay() {
-                        // Re-placing an image the terminal already holds.
-                        Some(replay) if !fresh => self.out.extend_from_slice(replay),
-                        _ => self.out.extend_from_slice(image.bytes()),
-                    }
+                    self.out.extend_from_slice(&bytes);
                     emitted = true;
                 }
 
@@ -1368,5 +1383,70 @@ mod tests {
             images: Some(&store),
         }));
         assert!(!frame.contains("QUJD"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn an_oversized_inline_image_is_fitted_to_the_float() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"hi");
+
+        // A 2000x1000 PNG, drawn by a child that never said how big to make it —
+        // exactly what `wezterm imgcat uncl.png` sends.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&2000u32.to_be_bytes());
+        png.extend_from_slice(&1000u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let payload = {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for chunk in png.chunks(3) {
+                let mut block = [0u8; 3];
+                block[..chunk.len()].copy_from_slice(chunk);
+                let value = (u32::from(block[0]) << 16)
+                    | (u32::from(block[1]) << 8)
+                    | u32::from(block[2]);
+                for index in 0..4 {
+                    if index <= chunk.len() {
+                        out.push(char::from(ALPHABET[((value >> (18 - index * 6)) & 0x3f) as usize]));
+                    } else {
+                        out.push('=');
+                    }
+                }
+            }
+            out
+        };
+        let sequence = format!("\x1b]1337;File=inline=1:{payload}\x07");
+
+        let mut store = Store::new();
+        assert!(matches!(
+            store.ingest(
+                crate::app::images::Kind::Osc,
+                sequence.as_bytes(),
+                (0, 0),
+                (10, 3)
+            ),
+            Ingest::Stored
+        ));
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+        }));
+
+        assert!(frame.contains("1337;File="), "frame: {frame:?}");
+        // The header now asks for a box instead of the image's native 2000 px.
+        assert!(frame.contains("preserveAspectRatio=1"), "frame: {frame:?}");
+        assert!(!frame.contains("width=2000px"), "must not draw at native size: {frame:?}");
+        assert!(frame.contains("px;height="), "frame: {frame:?}");
     }
 }

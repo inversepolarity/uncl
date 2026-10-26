@@ -218,6 +218,11 @@ impl Capabilities {
         // docs/rendering-report.md) can ask "will uncl carry my images?" without
         // guessing from TERM. Nothing outside uncl reads this.
         cmd.env("UNCL_GRAPHICS", "kitty,iterm2");
+        // `FORCE_HYPERLINK` is the convention tools use to mean "this terminal
+        // renders `OSC 8`", and since S3.5 uncl carries them (`app::term::links`),
+        // so saying so is the truth. Without it, most programs fall back to
+        // plain text and nothing is clickable.
+        cmd.env("FORCE_HYPERLINK", "1");
         if let Some(program) = &self.term_program {
             cmd.env("UNCL_HOST_TERM_PROGRAM", program);
         }
@@ -226,7 +231,7 @@ impl Capabilities {
     /// A few lines for `uncl doctor`.
     pub fn summary(&self) -> String {
         format!(
-            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)\n  cell size: {}x{} px ({}), reported to children as CSI 16t (UNCL_CELL_PX)",
+            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)\n  cell size: {}x{} px ({}), reported to children as CSI 16t (UNCL_CELL_PX)\n  hyperlinks: OSC 8 carried inside the float; FORCE_HYPERLINK=1 for children",
             if self.term.is_empty() { "<unset>" } else { &self.term },
             self.term_program.as_deref().unwrap_or("<unset>"),
             self.colorterm.as_deref().unwrap_or("<unset>"),

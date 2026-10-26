@@ -24,6 +24,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use vt100::{Callbacks, Screen};
 
 use super::caps::{ANSI_PALETTE, Capabilities, DEFAULT_BG, DEFAULT_FG, cell_px, rgb_spec};
+use super::links::SharedLinks;
 
 /// Write half of a child's pty, installed once the pty writer exists.
 ///
@@ -44,10 +45,12 @@ impl ReplySink {
     }
 }
 
-/// Modes a child switched on that `vt100` does not model for us.
+/// Modes a child switched on that `vt100` does not model for us, and the
+/// hyperlinks it drew (see [`super::links`]).
 #[derive(Debug, Default)]
 pub struct ChildState {
     focus_reporting: AtomicBool,
+    links: SharedLinks,
 }
 
 impl ChildState {
@@ -57,6 +60,11 @@ impl ChildState {
 
     fn set_focus_reporting(&self, enabled: bool) {
         self.focus_reporting.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The pane's hyperlinks, for the renderer.
+    pub fn links(&self) -> &SharedLinks {
+        &self.links
     }
 }
 
@@ -113,7 +121,14 @@ impl Callbacks for ChildCallbacks {
         }
     }
 
-    fn unhandled_osc(&mut self, _screen: &mut Screen, params: &[&[u8]]) {
+    fn unhandled_osc(&mut self, screen: &mut Screen, params: &[&[u8]]) {
+        // `OSC 8 ; <params> ; <target>`: a hyperlink. This is the only place the
+        // cursor still knows which cells the link covers, so the span is
+        // recorded here and re-emitted by the renderer.
+        if let Some((id, target)) = osc8(params) {
+            self.state.links.osc(screen, id, &target);
+            return;
+        }
         if let Some(reply) = reply_for_osc(params) {
             self.sink.send(reply);
         }
@@ -223,6 +238,36 @@ fn window_report(screen: &Screen, first: Option<u16>) -> Option<Vec<u8>> {
     };
 
     Some(format!("\x1b[{code};{height};{width}t").into_bytes())
+}
+
+/// Split an `OSC 8` into `(params, target)`, or `None` if it is another OSC.
+///
+/// `vte` splits the payload on `;`, and a URI may legitimately contain one
+/// (`?a=1;b=2`), so everything after the second field is glued back together.
+/// An empty target is the close of the previous link.
+fn osc8(params: &[&[u8]]) -> Option<(&[u8], Vec<u8>)> {
+    let (first, rest) = params.split_first()?;
+    if *first != b"8" {
+        return None;
+    }
+
+    match rest.split_first() {
+        // `OSC 8 ; ; url` and `OSC 8 ; id=1 ; url`
+        Some((id, target)) if !target.is_empty() => {
+            let mut url = Vec::new();
+            for (index, piece) in target.iter().enumerate() {
+                if index > 0 {
+                    url.push(b';');
+                }
+                url.extend_from_slice(piece);
+            }
+            Some((*id, url))
+        }
+        // `OSC 8 ; url` — no parameter field at all. Rare, but unambiguous.
+        Some((only, _)) if !only.is_empty() => Some((b"", only.to_vec())),
+        // `OSC 8 ; ;` closes the link.
+        _ => Some((b"", Vec::new())),
+    }
 }
 
 /// Build the reply to an OSC sequence `vt100` did not handle.
@@ -431,6 +476,57 @@ mod tests {
 
         let sent = rx.try_recv().expect("a reply should have been queued");
         assert!(sent.starts_with(b"\x1b[?"));
+    }
+
+    #[test]
+    fn an_osc8_is_split_into_parameters_and_a_target() {
+        assert_eq!(
+            osc8(&[&b"8"[..], &b""[..], &b"https://x.example"[..]]),
+            Some((&b""[..], b"https://x.example".to_vec()))
+        );
+        assert_eq!(
+            osc8(&[&b"8"[..], &b"id=1"[..], &b"file:///tmp"[..]]),
+            Some((&b"id=1"[..], b"file:///tmp".to_vec()))
+        );
+        // A URI containing `;` is glued back together, because `vte` split it.
+        assert_eq!(
+            osc8(&[&b"8"[..], &b""[..], &b"https://x.example/?a=1"[..], &b"b=2"[..]]),
+            Some((&b""[..], b"https://x.example/?a=1;b=2".to_vec()))
+        );
+        // Closing forms, and the two-field variant.
+        assert_eq!(osc8(&[&b"8"[..], &b""[..], &b""[..]]), Some((&b""[..], Vec::new())));
+        assert_eq!(osc8(&[&b"8"[..], &b"x"[..]]), Some((&b""[..], b"x".to_vec())));
+        // Anything that is not a hyperlink is left alone.
+        assert_eq!(osc8(&[&b"52"[..], &b"c"[..], &b"aGk="[..]]), None);
+        assert_eq!(osc8(&[]), None);
+    }
+
+    #[test]
+    fn a_hyperlink_is_recorded_and_drawn_later() {
+        let (mut callbacks, _sink, state) = ChildCallbacks::new(caps(), host().0);
+        let mut parser = vt100::Parser::new(nz(4), nz(20), 0);
+
+        callbacks.unhandled_osc(parser.screen_mut(), &[&b"8"[..], &b""[..], &b"https://x"[..]]);
+        parser.process(b"link");
+        callbacks.unhandled_osc(parser.screen_mut(), &[&b"8"[..], &b""[..], &b""[..]]);
+
+        let links = state.links().snapshot();
+        assert_eq!(links.for_row(parser.screen(), 0).len(), 1);
+        assert_eq!(links.for_row(parser.screen(), 0)[0].span(), (0, 4));
+        assert_eq!(links.for_row(parser.screen(), 0)[0].target(), b"https://x");
+    }
+
+    #[test]
+    fn an_osc8_is_not_answered() {
+        // A hyperlink is not a query: replying would put bytes on the child's
+        // stdin that it never asked for.
+        let (mut callbacks, sink, _state) = ChildCallbacks::new(caps(), host().0);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        sink.install(&tx);
+
+        let mut parser = vt100::Parser::new(nz(4), nz(20), 0);
+        callbacks.unhandled_osc(parser.screen_mut(), &[&b"8"[..], &b""[..], &b"https://x"[..]]);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

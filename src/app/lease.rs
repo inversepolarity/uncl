@@ -1,6 +1,6 @@
 use crate::app::images::Store;
 use crate::app::pty::{ChildParser, PtySession};
-use crate::app::term::callbacks::{ChildCallbacks, ReplySink};
+use crate::app::term::callbacks::{ChildCallbacks, ChildState, ReplySink};
 use crate::app::ui::tenant::Overlay;
 use crate::constants::*;
 
@@ -19,6 +19,8 @@ pub struct Lease {
     /// Graphics the float's child has drawn (S3). Empty for a shell that never
     /// emits an image, which is the common case.
     pub tenant_images: Arc<Mutex<Store>>,
+    /// What the float's child told us about itself: hyperlinks, focus reporting.
+    pub tenant_state: Arc<ChildState>,
     pub tenant_visible: bool,
     /// Kept whole (not just its channels) so that dropping the lease kills the
     /// child and unblocks its reader thread.
@@ -30,13 +32,14 @@ impl Lease {
         caps: Arc<crate::app::term::caps::Capabilities>,
         host: UnboundedSender<Vec<u8>>,
     ) -> Self {
-        let (parser, sink) = new_parser(caps, host);
+        let (parser, sink, state) = new_parser(caps, host);
         Self {
             tenant_visible: false,
             tenant: Overlay::new(),
             tenant_parser: parser,
             tenant_sink: sink,
             tenant_images: Arc::new(Mutex::new(Store::new())),
+            tenant_state: state,
             session: None,
         }
     }
@@ -127,8 +130,8 @@ impl Lease {
 pub fn new_parser(
     caps: Arc<crate::app::term::caps::Capabilities>,
     host: UnboundedSender<Vec<u8>>,
-) -> (Arc<RwLock<ChildParser>>, ReplySink) {
-    let (callbacks, sink, _state) = ChildCallbacks::new(caps, host);
+) -> (Arc<RwLock<ChildParser>>, ReplySink, Arc<ChildState>) {
+    let (callbacks, sink, state) = ChildCallbacks::new(caps, host);
     let parser = ChildParser::new_with_callbacks(nz(DEFAULT_HEIGHT), nz(DEFAULT_WIDTH), 0, callbacks);
-    (Arc::new(RwLock::new(parser)), sink)
+    (Arc::new(RwLock::new(parser)), sink, state)
 }

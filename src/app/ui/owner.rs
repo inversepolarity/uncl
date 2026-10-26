@@ -35,8 +35,9 @@ use crate::app::input::encode::{ChildModes, encode_key, encode_mouse};
 use crate::app::input::mouse::{self, MouseRoute};
 use crate::app::lease::{Lease, new_parser};
 use crate::app::pty::{self, ChildParser, PtySession};
+use crate::app::term::callbacks::ChildState;
 use crate::app::signal::Signal;
-use crate::app::render::{Panes, Renderer};
+use crate::app::render::{FrameLinks, Panes, Renderer};
 use crate::app::term::callbacks::ReplySink;
 use crate::app::term::caps::Capabilities;
 use crate::constants::*;
@@ -143,6 +144,7 @@ pub struct Container {
     pub size: Size,
     pub caps: Arc<Capabilities>,
     pub parser: Arc<RwLock<ChildParser>>,
+    pub parser_state: Arc<ChildState>,
     pub parser_sink: ReplySink,
     pub session: Option<PtySession>,
     pub lease: Lease,
@@ -173,13 +175,14 @@ impl Container {
 
         let caps = Arc::new(Capabilities::from_env());
         let (host_tx, host_rx) = unbounded_channel::<Vec<u8>>();
-        let (parser, parser_sink) = new_parser(caps.clone(), host_tx.clone());
+        let (parser, parser_sink, parser_state) = new_parser(caps.clone(), host_tx.clone());
 
         Self {
             rect: Rect::new(0, 0, cols, rows),
             size: Size { cols, rows },
             caps: caps.clone(),
             parser,
+            parser_state,
             parser_sink,
             session: None,
             lease: Lease::new(caps, host_tx.clone()),
@@ -313,12 +316,20 @@ impl Container {
         // lock first, then this one), so a frame cannot deadlock a reader.
         let images = self.lease.tenant_images.lock().unwrap();
 
+        // Hyperlinks are snapshotted, not borrowed: the frames own their inputs,
+        // and an empty snapshot allocates nothing.
+        let links = FrameLinks {
+            owner: self.parser_state.links().snapshot(),
+            float: self.lease.tenant_state.links().snapshot(),
+        };
+
         let bytes = self.renderer.render(Panes {
             owner,
             owner_area,
             float,
             float_focused: visible,
             images: Some(&*images),
+            links,
         });
 
         if !bytes.is_empty() {

@@ -296,7 +296,8 @@ Goal: *an image the child emits shows up inside the float*. No decode, no scalin
 | `chafa`, `viu`, `img2sixel` (sixel) | child bytes → DCS tap → re-emit | Exact **if it fits** the float; skipped if not. No scaling. |
 | kitty-capable apps, `kitten icat` | child bytes → APC tap → re-emit + placement crop | Exact, croppable, survives occlusion by the float's own repaint order. |
 | `feh`-style direct `/dev/tty` writes | bypasses the PTY | never supported (also unsupported by tmux) |
-| anything requiring `TIOCGWINSZ` in pixels | we answer `TIOCGWINSZ` cells only (`portable-pty` limitation) | pixel-size queries return 0; most tools fall back to cell math |
+| anything asking for geometry in pixels (`CSI 14/15/16/18/19 t`) | answered by the capability proxy from the measured cell size (S3.1) | consistent numbers, never zero: `wezterm imgcat`, `chafa`, `timg` all size correctly |
+| `ls --hyperlink`, `gcc`, `gh`, anything emitting `OSC 8` | child bytes → span recorded by the callback → re-emitted around the cells (S3.5) | clickable inside the float; single-line links only |
 
 The dependency order that actually matters here is S1 → S3, not S2 → S3: the tap can be added to today's `vt100` reader thread in an afternoon. But **without the capability probe in §6.2.4 nothing will ever emit an image**, so that probe is the real first step of "images".
 
@@ -322,7 +323,7 @@ Sources for the ConPTY v1/v2 distinction: Windows Terminal 1.22 release notes (`
 | S1 correctness + input + capability proxy | ~5 d | ~+700 | BTOP/htop/nvim/lazygit render at the right size **and are mouse-interactive**; paste; query replies; sixel capability advertised (prerequisite for any image ever appearing) | Medium — the encoder branches per mode and per platform; mitigated by the encoder trait and a golden-sequence table. |
 | S2 own emitter — **shipped** | ~1 wk | ~+1,200/−350, −4 crates | Native-speed scan-out; a hook for out-of-band bytes; no per-cell `Style`; `ratatui`/`tui-term` gone | Medium — off-by-one/clipping bugs are visible; mitigate with the §8.1 golden-frame harness. **Load-bearing: do not defer behind S3.** |
 | S3 cheap-tier images — **shipped** | ~3 d | ~+450 | kitty images (croppable), sixel (if it fits), passthrough | Medium-low, because the quality contract is explicit (§6.4 non-goals). |
-| S3.5 hyperlinks (`OSC 8`) | 1 d | ~+60 | clickable links inside the float | Low; or free with S4. |
+| S3.5 hyperlinks (`OSC 8`) — **shipped** | 1 d | ~+430 | clickable links inside the float | Low; or free with S4. |
 | S4 engine swap (`alacritty_terminal`) | 3–5 d | ~+600 | underline colour/styles, hyperlinks, kitty-keyboard input, sync output, `EventListener` (title/clipboard/bell) | Medium; **requires S2** (you must own the encoder before leaving `vt100`). Optional — skip unless users ask for the fidelity *inside* a float. |
 | §6.6 Windows delta | 1–2 d | ~+120 | Windows build that runs a TUI float (no images) | Medium; needs a real Windows box or CI runner to validate input modes. |
 
@@ -366,10 +367,10 @@ Still genuinely open, in the order they will bite:
 ## 10. Implementation checklist (drop-in order)
 
 Each line is a reviewable PR; the sequence is the shortest dependency-satisfying one.
-S0 (items 1–5), S1 (items 6–10), S2 (items 11–13) and S3 (items 15–16) are implemented —
-see Appendices C, D, E and F for the file maps and the verification status. Item 14 (the
-golden-frame corpus in CI) is the one S2 item still open, and S3 deliberately skips item
-17 (`OSC 8` hyperlinks, still an S3.5/S4 item).
+S0 (items 1–5), S1 (items 6–10), S2 (items 11–13), S3 (items 15–16) and S3.5 (item 17,
+`OSC 8` hyperlinks) are implemented — see Appendices C, D, E, F and G for the file maps and
+the verification status. Item 14 (the golden-frame corpus in CI) is the one S2 item still
+open. Only S4 (the `alacritty_terminal` swap) and the Windows delta remain.
 
 ```
 S0  1. vendor adapter (src/app/ui/adapter.rs) + vt100 0.18.1 + drop tui-term        [½ d]
@@ -1109,6 +1110,119 @@ Deliberate limits, all tested:
   over twenty-five APCs cannot be rewritten as one (`Placement::Native`).
 * a move still costs one line: the fitted `a=p` replay is `_Ga=p,i=…,c=…,r=…`
   with no payload (`a_fitted_kitty_move_is_still_one_line`).
+
+---
+
+## Appendix G — S3.5 implementation log (2026-10-27): `OSC 8` hyperlinks
+
+A child that prints `ls --hyperlink` gets its words through the float today, and
+its links through nothing at all. §6 called this "1 day, ~+60 LOC, or free with
+S4". It came in at ~430 lines because the honest version needs the encoder, not
+just the tap.
+
+### Why the tap alone cannot do it
+
+Every other out-of-band sequence S3 handles can be lifted out of the byte stream
+and put back verbatim: an image is a rectangle at a cell. A hyperlink is a
+*property of a run of cells*, and S2 paints rows by re-encoding cells — so the
+sequence has to be re-established around the run, at paint time, in the middle of
+a row that `vt100` handed us as one string.
+
+`vt100` does not model hyperlinks at all (`Cell` is contents + attrs), so:
+
+| Question | Where it is answered |
+|---|---|
+| where does the link start and end? | `Callbacks::unhandled_osc` — the only place where the cursor still knows, at open *and* at close |
+| which cells does it still belong to? | the stored span plus the text it covered, re-checked at paint time |
+| how are the cells painted with a link around them? | the row is emitted in column-ranged segments, `OSC 8` between them |
+
+### The pieces
+
+| # | Change | File |
+|---|---|---|
+| 1 | `Link` / `Links`: spans per row, the `OSC 8` splitter (a URI may contain `;`, which `vte` splits on), open/close tracking, staleness check, `MAX_LINKS = 64` | `src/app/term/links.rs` (new, 8 tests) |
+| 2 | `unhandled_osc` records `OSC 8` into the pane's `ChildState` and returns early, so a hyperlink is never mistaken for a query and answered | `src/app/term/callbacks.rs` (+3 tests) |
+| 3 | `new_parser` hands back the `ChildState`, so the UI can read both panes' links (the float's dies with its child: it is recreated with the parser) | `src/app/lease.rs`, `src/app/ui/owner.rs` |
+| 4 | `FrameLinks` in `Panes`; linked rows are painted **whole** (a diff is a sparse set of cells and has no span to wrap); `emit_row_segments` wraps each span in `OSC 8` … `OSC 8 ;;` | `src/app/render/mod.rs` (+5 tests) |
+| 5 | `FORCE_HYPERLINK=1` for children — the convention tools check — and a `--doctor` line | `src/app/term/caps.rs` |
+
+### Why segments, not byte offsets
+
+The obvious implementation is to splice `OSC 8` into `vt100`'s encoded row at the
+right byte offset. There is no honest way to compute that offset: the string
+contains SGR runs, wide characters occupy two cells, and combining marks attach to
+the preceding cell. Instead each piece is asked for **by column range** —
+`rows_formatted(start, len)` — which is the same call the float already uses to
+repair the owner's tail. Wide characters, styles and wide-cell skipping stay
+`vt100`'s problem, exactly as before.
+
+### Compromises (the cheap tier's contract)
+
+- **One row per link.** A link the child wraps across a line break is dropped: the
+  span would have to be split, and `vt100` does not report where the grid wrapped.
+  (S4 gets this for free.)
+- **A link does not dirty its row.** Links are not part of a cell, so a cell diff
+  cannot see one appear. Rows that carry a link are therefore repainted in full —
+  for the float in `plan_float`, for the owner by merging the linked rows into
+  `owner_rows`. That is more bytes than a diff, on rows that have links, and
+  nothing at all on rows that do not.
+- **Stale spans are not drawn.** The covered text is stored with the span and
+  re-checked when the row is painted; if the cells no longer say the same thing,
+  the link is dead. A clickable region over the wrong words is worse than none.
+- **Bounded**: 64 spans per pane, oldest first out.
+- **Not a link click handler.** uncl emits the sequence; the *host* terminal does
+  the opening (with whatever modifier it requires). That is the correct division,
+  and it means nothing here can open a URL by accident.
+
+### What this buys beyond the taste of it
+
+`FORCE_HYPERLINK=1` is the whole reason a user will see this at all: without it,
+most programs decide "no hyperlinks" and print plain text. Since S3.5 makes the
+claim true, the environment now says so — the same rule as DA1 and sixel, in the
+other direction: *advertise only what you carry, but do carry what you advertise.*
+
+### Verification status
+
+- **141 tests** (was 125: +8 links, +3 callbacks, +5 renderer).
+- Every file parses with `tree-sitter-rust`; still **no Rust toolchain here**, so
+  this has not been compiled. The `vte` behaviour relied on (`osc_dispatch` →
+  `unhandled_osc`, params split on `;`) was read from the vendored sources, and
+  `rows_formatted(start, width)`'s "pane-local, forward-only moves within a
+  sub-range" was checked against `row.rs::write_contents_formatted` and
+  `term.rs::MoveFromTo` (forward moves are `CSI n C`, which is relative, so the
+  segment's `CUP` is enough).
+
+### Acceptance script (S3.5 exit criteria)
+
+```sh
+cargo test                                        # 141
+cargo build --release && ./target/release/uncl
+
+# 1. an explicit link: cmd-click (or ctrl-click) it in the float.
+printf '\e]8;;https://example.com\e\\example.com\e]8;;\e\\\n'
+
+# 2. a real one, from a real program:
+ls --hyperlink=always --color=always
+
+# 3. `uncl --doctor` now prints "hyperlinks: OSC 8 carried inside the float;
+#    FORCE_HYPERLINK=1 for children", and a child can check it:
+printf '%s\n' "$FORCE_HYPERLINK"
+
+# 4. drag the float: the link follows its cells and is still clickable.
+# 5. Home twice: the link comes and goes with the float. Nothing sticks to the
+#    owner's screen (links are part of the row, so they are repainted with it).
+# 6. repaint over the linked words (`ls` again with different output): the link
+#    must be gone, not attached to whatever is there now.
+```
+
+### Where the plan stands
+
+S0 → S3.5 are in the tree: fast, correct, self-owned emitter, images, links.
+S4 (`alacritty_terminal`) would replace the span bookkeeping with the engine's own
+hyperlinks — plus underline colours, kitty keyboard input and sync output — but
+it is an engine swap and the current behaviour is right for the single-line case
+that covers virtually every real link. The Windows delta (§6.6) is the other
+untouched item.
 
 ### Where S3 leaves the plan
 

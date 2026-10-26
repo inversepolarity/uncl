@@ -37,6 +37,7 @@
 use vt100::Screen;
 
 use crate::app::images::Store;
+use crate::app::term::links::{Link, Links, OSC8_CLOSE};
 use crate::constants::content_rect;
 use crate::geometry::Rect;
 
@@ -63,6 +64,20 @@ pub struct Panes<'a> {
     pub float_focused: bool,
     /// Graphics the float's child has drawn, in the child's own coordinates.
     pub images: Option<&'a Store>,
+    /// Hyperlinks both children drew, in their own coordinates.
+    pub links: FrameLinks,
+}
+
+/// The hyperlinks each pane drew this frame (`OSC 8`, S3.5).
+///
+/// Owned snapshots rather than borrows, for the same reason the screens are
+/// owned: the caller takes them under the parser's lock and the frame is encoded
+/// afterwards. The common case — no links at all — is a `Vec::new()` and costs
+/// nothing.
+#[derive(Clone, Debug, Default)]
+pub struct FrameLinks {
+    pub owner: Links,
+    pub float: Links,
 }
 
 /// Per-frame state: what the host terminal was last told to display.
@@ -139,17 +154,27 @@ impl Renderer {
             float,
             float_focused,
             images,
+            links,
         } = panes;
         let float_at = float.as_ref().map(|(screen, rect)| (screen, *rect));
 
         let owner_full = self.force_full || self.owner_prev.is_none();
         let float_full = self.force_full || self.float_prev.is_none();
 
-        let owner_rows = if owner_area.is_empty() {
+        let mut owner_rows = if owner_area.is_empty() {
             Vec::new()
         } else {
             dirty_rows(&owner, self.owner_prev.as_ref(), owner_area, owner_full)
         };
+
+        // A row that gained a hyperlink has to be repainted even when its cells
+        // did not change: the link is not part of the cell, so the diff cannot
+        // see it.
+        for row in links.owner.rows() {
+            if row < owner_area.height && !owner_rows.contains(&row) {
+                owner_rows.push(row);
+            }
+        }
 
         let (float_plan, borders) = match float_at {
             Some((screen, rect)) => {
@@ -160,6 +185,7 @@ impl Renderer {
                     &owner_rows,
                     owner_area,
                     float_full,
+                    &links.float,
                 );
 
                 // The owner painted over the float's top/bottom border rows, or
@@ -186,6 +212,7 @@ impl Renderer {
                 owner_area,
                 &owner_rows,
                 owner_full,
+                &links.owner,
             );
         }
 
@@ -200,6 +227,7 @@ impl Renderer {
                 owner_area,
                 &float_plan,
                 borders,
+                &links.float,
             );
         }
 
@@ -414,6 +442,7 @@ fn plan_float(
     owner_rows: &[u16],
     owner_area: Rect,
     full: bool,
+    links: &Links,
 ) -> Vec<FloatRow> {
     let mut plan = Vec::new();
 
@@ -424,7 +453,11 @@ fn plan_float(
         let screen_row = content.y.saturating_add(row);
         let covered = owner_rows.contains(&screen_row.saturating_sub(owner_area.y));
 
-        let entry = if full || covered {
+        // A hyperlinked row is painted whole: `rows_diff` only carries the cells
+        // that changed, and there is no honest way to splice a span into that.
+        let linked = links.covers(cur, row);
+
+        let entry = if full || covered || linked {
             Some(FloatRow::Full(row))
         } else {
             match prev {
@@ -451,6 +484,7 @@ fn emit_owner_rows(
     area: Rect,
     rows: &[u16],
     full: bool,
+    links: &Links,
 ) {
     let width = area.width;
 
@@ -465,7 +499,11 @@ fn emit_owner_rows(
             cup(out, area.y.saturating_add(row), area.x);
             reset(out);
             erase_chars(out, width);
-            append_row(out, &text, area.y, area.x);
+            if links.covers(cur, row) {
+                emit_row_segments(out, cur, links, row, area.y, area.x, width);
+            } else {
+                append_row(out, &text, area.y, area.x);
+            }
         }
         return;
     }
@@ -473,7 +511,21 @@ fn emit_owner_rows(
     let prev = prev.unwrap_or(cur);
     for (row, text) in cur.rows_diff(prev, 0, width).enumerate() {
         let row = row as u16;
-        if !rows.contains(&row) || text.is_empty() {
+        if !rows.contains(&row) {
+            continue;
+        }
+
+        // A row that carries a hyperlink is painted whole, so the span can be
+        // wrapped: a diff is a sparse set of cells and has no span to wrap.
+        if links.covers(cur, row) {
+            cup(out, area.y.saturating_add(row), area.x);
+            reset(out);
+            erase_chars(out, width);
+            emit_row_segments(out, cur, links, row, area.y, area.x, width);
+            continue;
+        }
+
+        if text.is_empty() {
             continue;
         }
         cup(out, area.y.saturating_add(row), area.x);
@@ -493,6 +545,7 @@ fn emit_float(
     owner_area: Rect,
     plan: &[FloatRow],
     borders: bool,
+    links: &Links,
 ) {
     let width = content.width;
 
@@ -513,7 +566,7 @@ fn emit_float(
                 diff_at = row.saturating_add(1);
 
                 if !text.is_empty() {
-                    emit_float_row(out, owner, content, rect, owner_area, row, &text, false);
+                    emit_float_row(out, owner, cur, content, rect, owner_area, row, &text, false, links);
                 }
             }
             FloatRow::Full(row) => {
@@ -521,7 +574,7 @@ fn emit_float(
                     .rows_formatted(0, width)
                     .nth(usize::from(row))
                     .unwrap_or_default();
-                emit_float_row(out, owner, content, rect, owner_area, row, &text, true);
+                emit_float_row(out, owner, cur, content, rect, owner_area, row, &text, true, links);
             }
         }
     }
@@ -545,12 +598,14 @@ fn emit_float(
 fn emit_float_row(
     out: &mut Vec<u8>,
     owner: &Screen,
+    cur: &Screen,
     content: Rect,
     rect: Rect,
     owner_area: Rect,
     row: u16,
     text: &str,
     blank_first: bool,
+    links: &Links,
 ) {
     let screen_row = content.y.saturating_add(row);
 
@@ -565,7 +620,11 @@ fn emit_float_row(
         // last painted.
         erase_chars(out, content.width);
     }
-    let erased = append_row(out, text, content.y, content.x);
+    let erased = if links.covers(cur, row) {
+        emit_row_segments(out, cur, links, row, content.y, content.x, content.width)
+    } else {
+        append_row(out, text, content.y, content.x)
+    };
 
     // After the row: an `EL` inside it would have erased the border cell.
     cup(out, screen_row, rect.right().saturating_sub(1));
@@ -574,6 +633,88 @@ fn emit_float_row(
     if erased {
         repair_tail(out, owner, screen_row, rect, owner_area);
     }
+}
+
+/// Paint one row in segments, wrapping each hyperlinked span in `OSC 8`.
+///
+/// The row is written as up to three pieces — plain, linked, plain — because the
+/// span's columns are known while a byte offset *inside* `vt100`'s encoded row is
+/// not. Each piece is asked for by column range, which is the same call
+/// `repair_tail` uses, so wide characters and styles stay correct.
+///
+/// Returns whether any piece ended with `EL` (which the float's caller has to
+/// repair beyond the border).
+fn emit_row_segments(
+    out: &mut Vec<u8>,
+    screen: &Screen,
+    links: &Links,
+    row: u16,
+    origin_y: u16,
+    origin_x: u16,
+    width: u16,
+) -> bool {
+    let found = links.for_row(screen, row);
+    if found.is_empty() {
+        return false;
+    }
+
+    let mut erased = false;
+
+    for (start, len, open) in segments(&found, width) {
+        let Some(text) = screen.rows_formatted(start, len).nth(usize::from(row)) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+
+        cup(
+            out,
+            origin_y.saturating_add(row),
+            origin_x.saturating_add(start),
+        );
+        reset(out);
+        if let Some(open) = open.as_ref() {
+            out.extend_from_slice(open);
+        }
+        // Absolute moves inside the text are pane-local, so only the pane's
+        // origin is added; the segment's own column was set by the `CUP` above.
+        erased |= append_row(out, &text, origin_y, origin_x);
+        if open.is_some() {
+            out.extend_from_slice(OSC8_CLOSE);
+        }
+    }
+
+    erased
+}
+
+/// The row, split at link boundaries: `(start, len, opening sequence)`.
+fn segments(links: &[&Link], width: u16) -> Vec<(u16, u16, Option<Vec<u8>>)> {
+    let mut out = Vec::new();
+    let mut cursor = 0u16;
+
+    for link in links {
+        let (start, end) = link.span();
+        // Overlapping spans cannot both be honoured: the first one wins, which
+        // keeps the painted row a faithful copy of the cells.
+        if start < cursor || start >= width {
+            continue;
+        }
+        let end = end.min(width);
+        if end <= start {
+            continue;
+        }
+        if start > cursor {
+            out.push((cursor, start - cursor, None));
+        }
+        out.push((start, end - start, Some(link.open())));
+        cursor = end;
+    }
+
+    if cursor < width {
+        out.push((cursor, width - cursor, None));
+    }
+    out
 }
 
 /// Repaint what a float row's `EL` erased beyond the float: the owner's tail.
@@ -910,6 +1051,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         });
 
         let frame = text(frame);
@@ -932,6 +1074,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         });
 
         let second = renderer.render(Panes {
@@ -940,6 +1083,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         });
         assert!(second.is_empty(), "second frame: {:?}", text(second));
     }
@@ -957,6 +1101,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         });
 
         parser.process(b"\r\nchanged");
@@ -966,6 +1111,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         }));
 
         assert!(frame.contains("changed"), "frame: {frame:?}");
@@ -988,6 +1134,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: None,
+            links: FrameLinks::default(),
         }));
 
         assert!(frame.contains("floating"), "frame: {frame:?}");
@@ -1012,6 +1159,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         });
         // The float disappearing is a repaint, but the owner's cells are intact.
         let frame = text(renderer.render(Panes {
@@ -1020,6 +1168,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         }));
         assert!(frame.is_empty(), "frame: {frame:?}");
     }
@@ -1037,6 +1186,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         }));
 
         assert!(frame.contains("\x1b[?25l"), "frame: {frame:?}");
@@ -1067,6 +1217,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         }));
 
         let el_at = frame.find("\x1b[K").expect("the float row should erase");
@@ -1095,6 +1246,7 @@ mod tests {
             float: Some((float.screen().clone(), Rect::new(2, 2, 12, 5))),
             float_focused: true,
             images: None,
+            links: FrameLinks::default(),
         };
 
         let mut renderer = Renderer::new();
@@ -1118,6 +1270,7 @@ mod tests {
             float: Some((float.screen().clone(), Rect::new(2, 2, 12, 5))),
             float_focused: true,
             images: None,
+            links: FrameLinks::default(),
         };
 
         let mut renderer = Renderer::new();
@@ -1146,6 +1299,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         });
 
         // Nothing changed, so nothing is painted…
@@ -1155,6 +1309,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         });
         assert!(quiet.is_empty());
 
@@ -1166,6 +1321,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: None,
+            links: FrameLinks::default(),
         }));
 
         assert!(frame.contains("owner"), "frame: {frame:?}");
@@ -1205,6 +1361,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         }));
 
         let row_at = frame.find("hi").expect("the float row is painted");
@@ -1234,6 +1391,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         });
 
         let second = renderer.render(Panes {
@@ -1242,6 +1400,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         });
         assert!(second.is_empty(), "frame: {:?}", text(second));
     }
@@ -1263,6 +1422,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         });
 
         // The float moved: same image, one line of placement, no payload.
@@ -1274,6 +1434,7 @@ mod tests {
             float: Some((float.screen().clone(), moved)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         }));
 
         assert!(frame.contains("\x1b_Ga=p,i=7\x1b\\"), "frame: {frame:?}");
@@ -1297,6 +1458,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         });
 
         // `Home`: the kitty image lives in a layer our repaint cannot reach.
@@ -1307,6 +1469,7 @@ mod tests {
             float: None,
             float_focused: false,
             images: Some(&store),
+            links: FrameLinks::default(),
         }));
         assert!(hidden.contains("\x1b_Ga=d,d=A\x1b\\"), "frame: {hidden:?}");
 
@@ -1318,6 +1481,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         }));
         assert!(shown.contains("QUJD"), "frame: {shown:?}");
     }
@@ -1343,6 +1507,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         });
 
         // Text painted over sixel destroys it, so any repaint has to be followed
@@ -1354,6 +1519,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         }));
         assert!(frame.contains("more"), "frame: {frame:?}");
         assert!(frame.contains("\x1bPq"), "frame: {frame:?}");
@@ -1381,6 +1547,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         }));
         assert!(!frame.contains("QUJD"), "frame: {frame:?}");
     }
@@ -1441,6 +1608,7 @@ mod tests {
             float: Some((float.screen().clone(), rect)),
             float_focused: true,
             images: Some(&store),
+            links: FrameLinks::default(),
         }));
 
         assert!(frame.contains("1337;File="), "frame: {frame:?}");
@@ -1448,5 +1616,173 @@ mod tests {
         assert!(frame.contains("preserveAspectRatio=1"), "frame: {frame:?}");
         assert!(!frame.contains("width=2000px"), "must not draw at native size: {frame:?}");
         assert!(frame.contains("px;height="), "frame: {frame:?}");
+    }
+
+    /// A parser whose first row carries a hyperlink over `text`.
+    fn linked_parser(rows: u16, cols: u16, text: &[u8]) -> (vt100::Parser, Links) {
+        let mut parser = parser(rows, cols);
+        let mut links = Links::new();
+        links.osc(parser.screen(), b"", b"https://example.com");
+        parser.process(text);
+        links.osc(parser.screen(), b"", b"");
+        (parser, links)
+    }
+
+    #[test]
+    fn a_hyperlinked_row_is_wrapped_in_osc8() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let (float, float_links) = linked_parser(3, 10, b"docs");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let content = content_rect(rect);
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: None,
+            links: FrameLinks {
+                owner: Links::new(),
+                float: float_links,
+            },
+        }));
+
+        let open = frame.find("\x1b]8;;https://example.com\x1b\\");
+        let word = frame.find("docs");
+        let close = frame.find("\x1b]8;;\x1b\\");
+        assert!(open.is_some() && word.is_some() && close.is_some(), "frame: {frame:?}");
+        let (open, word, close) = (open.unwrap(), word.unwrap(), close.unwrap());
+        assert!(open < word && word < close, "the link must wrap the cells: {frame:?}");
+
+        // And the span starts at the child's first cell, inside the float.
+        let cup_at = frame.find(&format!("\x1b[{};{}H", content.y + 1, content.x + 1));
+        assert!(cup_at.is_some_and(|cup_at| cup_at < open), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn a_hyperlink_costs_a_full_row_not_a_diff() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let mut renderer = Renderer::new();
+
+        // First frame: the text is there, with no link on it.
+        let mut float = parser(3, 10);
+        float.process(b"docs");
+        renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: None,
+            links: FrameLinks::default(),
+        });
+
+        // The cells do not change; only the link is added. A diff would show
+        // nothing at all, so the row has to be painted whole. The cursor is
+        // walked back over the same words: that is a link with no new text.
+        let mut links = Links::new();
+        float.process(b"\x1b[1;1H");
+        links.osc(float.screen(), b"", b"https://example.com");
+        float.process(b"\x1b[1;5H");
+        links.osc(float.screen(), b"", b"");
+
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: None,
+            links: FrameLinks {
+                owner: Links::new(),
+                float: links,
+            },
+        }));
+        assert!(
+            frame.contains("\x1b]8;;https://example.com\x1b\\"),
+            "frame: {frame:?}"
+        );
+        assert!(frame.contains("docs"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn a_stale_hyperlink_is_not_drawn() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+
+        let (mut float, float_links) = linked_parser(3, 10, b"docs");
+        // The words are replaced; the span no longer points at them.
+        float.process(b"\rOTHER");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: None,
+            links: FrameLinks {
+                owner: Links::new(),
+                float: float_links,
+            },
+        }));
+        assert!(!frame.contains("\x1b]8;"), "no link over the wrong words: {frame:?}");
+    }
+
+    #[test]
+    fn the_owner_row_is_wrapped_too() {
+        let mut owner = parser(10, 40);
+        owner.process(b"before ");
+        let mut links = Links::new();
+        links.osc(owner.screen(), b"", b"file:///tmp");
+        owner.process(b"log");
+        links.osc(owner.screen(), b"", b"");
+
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 40, 10),
+            float: None,
+            float_focused: false,
+            images: None,
+            links: FrameLinks {
+                owner: links,
+                float: Links::new(),
+            },
+        }));
+
+        let open = frame.find("\x1b]8;;file:///tmp\x1b\\").expect("opened");
+        let word = frame.find("log").expect("the word is painted");
+        assert!(open < word, "frame: {frame:?}");
+        assert!(frame[word..].contains("\x1b]8;;\x1b\\"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn segments_cover_the_row_and_never_overlap() {
+        let mut parser = parser(2, 20);
+        let mut links = Links::new();
+        links.osc(parser.screen(), b"", b"a");
+        parser.process(b"abc");
+        links.osc(parser.screen(), b"", b"");
+        parser.process(b"\r\x1b[4C");
+        links.osc(parser.screen(), b"", b"b");
+        parser.process(b"de");
+        links.osc(parser.screen(), b"", b"");
+
+        let screen = parser.screen();
+        let found = links.for_row(screen, 0);
+        assert_eq!(found.len(), 2, "two spans: {found:?}");
+
+        let parts = segments(&found, 10);
+        // (0,3) linked, (3,1) plain, (4,2) linked, (6,4) plain.
+        assert_eq!(
+            parts.iter().map(|(start, len, _)| (*start, *len)).collect::<Vec<_>>(),
+            vec![(0, 3), (3, 1), (4, 2), (6, 4)]
+        );
+        assert!(parts[0].2.is_some() && parts[1].2.is_none() && parts[2].2.is_some());
     }
 }

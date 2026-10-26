@@ -22,6 +22,8 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - supports most terminal emulators, tested on wezterm
 - images inside the float: kitty graphics and iTerm2 inline images are carried
   through (`chafa --format=kitty`, `wezterm imgcat`, `timg -pk`, ...)
+- clickable links inside the float (`OSC 8`): `ls --hyperlink=always`, `gh`,
+  `gcc -fdiagnostics-urls` and friends work; children see `FORCE_HYPERLINK=1`
 
 ### images: what is, and is not, supported
 

@@ -1,4 +1,5 @@
-use crate::app::pty::PtySession;
+use crate::app::pty::{ChildParser, PtySession};
+use crate::app::term::callbacks::{ChildCallbacks, ReplySink};
 use crate::app::ui::tenant::Overlay;
 use crate::constants::*;
 
@@ -10,12 +11,10 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// A floating shell: its geometry, its parser, and the session of its child.
-///
-/// S0 keeps this deliberately thin — it owns the child's lifecycle and the grid
-/// it renders from. Input routing and geometry unification are S1.
 pub struct Lease {
     pub tenant: Overlay,
-    pub tenant_parser: Arc<RwLock<vt100::Parser>>,
+    pub tenant_parser: Arc<RwLock<ChildParser>>,
+    pub tenant_sink: ReplySink,
     pub tenant_visible: bool,
     /// Kept whole (not just its channels) so that dropping the lease kills the
     /// child and unblocks its reader thread.
@@ -23,11 +22,16 @@ pub struct Lease {
 }
 
 impl Lease {
-    pub fn new() -> Self {
+    pub fn new(
+        caps: Arc<crate::app::term::caps::Capabilities>,
+        host: UnboundedSender<Vec<u8>>,
+    ) -> Self {
+        let (parser, sink) = new_parser(caps, host);
         Self {
             tenant_visible: false,
             tenant: Overlay::new(),
-            tenant_parser: new_parser(),
+            tenant_parser: parser,
+            tenant_sink: sink,
             session: None,
         }
     }
@@ -35,6 +39,12 @@ impl Lease {
     /// Wire up a freshly spawned tenant process.
     pub fn attach(&mut self, session: PtySession) {
         self.session = Some(session);
+    }
+
+    /// The tenant child's input modes, read from its parser.
+    pub fn modes(&self) -> crate::app::input::encode::ChildModes {
+        let parser = self.tenant_parser.read().unwrap();
+        crate::app::input::encode::ChildModes::from_screen(parser.screen())
     }
 
     pub fn writer(&self) -> Option<UnboundedSender<Bytes>> {
@@ -73,42 +83,47 @@ impl Lease {
         self.session = None;
     }
 
-    pub fn expired(&mut self) -> bool {
-        if self.tenant.is_dead {
-            self.tenant_visible = false;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// A lease for a fresh shell. Visibility always starts hidden, as before.
-    pub fn renew(&mut self) -> Self {
-        Self::new()
-    }
-
     /// Resize the grid and ask the child to resize too.
+    ///
+    /// Callers pass the *content* size (inside the border): the pty, the parser
+    /// and the painted area must all agree, or a full-screen app draws for a
+    /// size we never render.
     pub fn resize_screen(&mut self, rows: u16, cols: u16) {
         self.tenant_parser
             .write()
             .unwrap()
             .set_size(nz(rows), nz(cols));
 
-        // The child is told the size of the area it actually draws into, i.e.
-        // inside the border. The parser is told the same number, so a
-        // full-screen app can no longer draw for a size we never render.
         if let Some(session) = &self.session {
             if session.resize.send((rows, cols)).is_err() {
                 eprintln!("failed to send resize to tenant");
             }
         }
     }
+
+    /// Re-apply the overlay's current geometry to the child.
+    pub fn sync_size(&mut self) {
+        let (rows, cols) = self.tenant.content_size();
+        let current = {
+            let parser = self.tenant_parser.read().unwrap();
+            let (screen_rows, screen_cols) = parser.screen().size();
+            (screen_rows.get(), screen_cols.get())
+        };
+        if current != (rows, cols) {
+            self.resize_screen(rows, cols);
+        }
+    }
 }
 
-pub fn new_parser() -> Arc<RwLock<vt100::Parser>> {
-    Arc::new(RwLock::new(vt100::Parser::new(
-        nz(DEFAULT_HEIGHT),
-        nz(DEFAULT_WIDTH),
-        0,
-    )))
+/// Build a child parser with the callbacks that answer its queries.
+///
+/// `host` carries the effects that belong to the real terminal (clipboard
+/// copies); everything else is answered back into the child's own pty.
+pub fn new_parser(
+    caps: Arc<crate::app::term::caps::Capabilities>,
+    host: UnboundedSender<Vec<u8>>,
+) -> (Arc<RwLock<ChildParser>>, ReplySink) {
+    let (callbacks, sink, _state) = ChildCallbacks::new(caps, host);
+    let parser = ChildParser::new_with_callbacks(nz(DEFAULT_HEIGHT), nz(DEFAULT_WIDTH), 0, callbacks);
+    (Arc::new(RwLock::new(parser)), sink)
 }

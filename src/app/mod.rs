@@ -2,6 +2,7 @@ pub mod input;
 pub mod lease;
 pub mod pty;
 pub mod signal;
+pub mod term;
 pub mod ui;
 use anyhow::Result;
 

@@ -1,3 +1,4 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResizeDirection {
     TopLeft,
     TopRight,
@@ -30,6 +31,11 @@ pub const INPUT_POLL_INTERVAL_MS: u64 = 50;
 /// yield back to rendering. A paste or a mouse drag can produce thousands of
 /// events; without a budget we would starve the screen.
 pub const INPUT_DRAIN_BUDGET: usize = 512;
+
+/// How long to wait before trying to respawn the floating shell again after a
+/// failure. `exec` can fail for reasons that need user action (a broken `$SHELL`,
+/// a deleted cwd), and retrying every 100 ms tick would spin the event loop.
+pub const TENANT_RESPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Cap on how many bytes we coalesce into a single write to a child PTY.
 pub const PTY_WRITE_BATCH: usize = 64 * 1024;

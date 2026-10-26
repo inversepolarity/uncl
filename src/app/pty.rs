@@ -27,7 +27,11 @@ use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::app::signal::Signal;
+use crate::app::term::callbacks::{ChildCallbacks, ReplySink};
 use crate::constants::PTY_WRITE_BATCH;
+
+/// A child's grid, with the callbacks that answer its terminal queries.
+pub type ChildParser = vt100::Parser<ChildCallbacks>;
 
 /// Everything the UI needs to talk to a spawned child.
 pub struct PtySession {
@@ -69,7 +73,8 @@ pub fn spawn(
     cmd: CommandBuilder,
     rows: u16,
     cols: u16,
-    parser: Arc<RwLock<vt100::Parser>>,
+    parser: Arc<RwLock<ChildParser>>,
+    sink: ReplySink,
     signal: Arc<Signal>,
 ) -> Result<PtySession> {
     let pair = native_pty_system()
@@ -94,6 +99,11 @@ pub fn spawn(
     let mut writer = master.take_writer().context("pty writer")?;
 
     let (writer_tx, mut writer_rx) = unbounded_channel::<Bytes>();
+
+    // Terminal queries are answered through the same writer the user's input
+    // uses, so replies are ordered with keystrokes and coalesced by the batching
+    // task below.
+    sink.install(&writer_tx);
     let (resize_tx, mut resize_rx) = unbounded_channel::<(u16, u16)>();
     let (exited_tx, exited_rx) = unbounded_channel::<()>();
 

@@ -210,7 +210,7 @@ Stages are ordered by *dependency*, not by size, and each one is independently s
 
 **Exit criteria:** idle CPU ≈ 0 with a still screen; ≤2 ms keystroke→PTY; 5 KB paste lands in one write; `htop` inside the float responds to the mouse *offsets* correctly even if not yet fully routed (mode tracking is now real).
 
-### 6.2 S1 — "make it correct, and give the child a voice" — ~5 days, ~700 LOC
+### 6.2 S1 — "make it correct, and give the child a voice" — **shipped**, see Appendix D
 
 1. **One geometry source of truth.** Introduce `Overlay::content_rect() -> Rect` (rect minus border, and minus any off-screen part) and a single `resize_child(cols, rows)` that sets the PTY **and** `parser.screen_mut().set_size()`. Delete both `− 4`s (`tenant.rs:71–72`, `tenant.rs:107–108`) and stop printing `size.rows/cols` as if it were the child's size. On host resize, recompute `rect` and propagate. → §3#1, #6.
 2. **Region-based input routing.** Hit-test first, *then* decide policy:
@@ -541,3 +541,143 @@ as the open "crash on exit fullscreen in wezterm (out of bounds)" issue.
 - Mouse reports to the *owner* shell are still always SGR; the per-mode encoder is S1.
 - **Clicks inside a visible float still go to drag/resize, not to the child.** This is S1's region routing and it needs the local-chord decision in §9.1; until then a float running `btop`/`htop`/`nvim` is keyboard-only.
 - The float title shows the *child's* size (inside the border), which is now the size the pty was actually told.
+
+## Appendix D — S1 implementation log (2026-10-26)
+
+S1 is the "give the child a voice" stage of §6.2. The user-visible goal was narrow and
+concrete: **a TUI running in the float must receive the mouse**, and everything else in
+the float must behave like it is running in a real terminal rather than behind a wall.
+
+### The bug that started it, and why it happened
+
+Clicks and wheel events inside the float never reached the child. Two independent causes,
+both in `mouse.rs`/`owner.rs`:
+
+1. The float had no notion of *regions*. With the float visible, the old handler treated
+   every mouse event as a candidate drag/resize, so presses inside the content area were
+   consumed by uncl (`begin`/`drag`/`end`) and never encoded for the child.
+2. Even if they had been encoded, uncl only knew one encoding — crossterm's host-side
+   event — and forwarded nothing. The child's `mouse_protocol_mode()` /
+   `mouse_protocol_encoding()` were read by nothing outside `keyboard.rs`'s dead code.
+
+S1 replaces both with a single, testable decision function.
+
+### What landed
+
+| File | Change |
+| --- | --- |
+| `src/app/input/mouse.rs` | **rewritten.** `route(overlay, event) -> MouseRoute` is the whole policy: `Alt`+press → local, border → local resize, content → `Child{col,row}` (area-relative), outside → `HideFloat`. `begin/drag/end` own the drag state machine; `direction_for` picks the nearest corner/edge. 12 tests. |
+| `src/app/input/encode.rs` | **new.** `ChildModes::from_screen`, `encode_key` (chars, Ctrl→control range, Alt prefix, DECCKM-aware arrows/Home/End, SS3 F1–F4, tilde keys, xterm modifier parameter), `encode_mouse` (SGR / legacy X10 / UTF-8, mode gating per `MouseProtocolMode`, 1-based coordinates, release handling). 16 tests. |
+| `src/app/term/caps.rs` | **new.** Host capability record (`TERM`, `TERM_PROGRAM`, `COLORTERM`, kitty/sixel flags), `da1()`/`da2()`, xterm palette, `rgb_spec`, `apply_child_env`, `summary` for `uncl --doctor`. 4 tests. |
+| `src/app/term/callbacks.rs` | **new.** `vt100::Callbacks` impl: DA1, DA2, DSR 5/6, `CSI ?6n`, `CSI 18t`, `OSC 10/11/4`; tracks `?1004` (vt100 does not model it); answers through a `ReplySink` installed on the pty writer. 8 tests. |
+| `src/app/pty.rs` | `spawn` takes a `ReplySink` and installs it before the reader thread starts; new `ChildParser` alias. |
+| `src/app/lease.rs` | Owns parser + sink + session; `modes()`, `sync_size()` (the single place that resizes pty **and** grid), `clamp_to` on host resize. |
+| `src/app/ui/tenant.rs` | `content_rect` is the only geometry; `resize_to` clamps instead of bailing (a drag used to freeze when the requested size crossed `MIN_HEIGHT`); new `resize_to_corner` keeps the anchor corner fixed; `clamp_to`; `geometry_key` (Alt+arrows move, Alt+Shift+arrows resize). 14 tests. |
+| `src/app/ui/owner.rs` | Chords → `encode_key`; mouse → `route` → `encode_mouse`; paste wrapped per `?2004`; focus reports per `?1004`; `HostMouse` policy (below); `Ctrl+Alt+q` quits. |
+| `src/main.rs` | `--doctor`, `--version`, `--help`; `uncl` with no arguments still just runs. |
+| `src/app/input/keyboard.rs` | **deleted** — its hand-rolled `vec![27, 91, …]` table is what `encode_key` replaces. |
+
+64 unit tests total (S0 had 18). No new dependencies.
+
+### Two policy decisions worth remembering
+
+**`HostMouse`: the host mode is not the child's mode.** crossterm's `EnableMouseCapture`
+turns on `?1000`, `?1002` *and* `?1003` — any-motion — so every pixel of pointer movement
+becomes an event, is drained, and is then thrown away by the mode filter. uncl now writes
+the DEC private modes itself: SGR encoding always (`?1006`), press always while the float
+is visible (needed for drag and click-away), button-motion/any-motion **only** when the
+focused child asked for them, and everything off when nobody wants it. That also restores
+native host text selection (with the terminal's usual Shift bypass) when the child is not
+a mouse-mode application.
+
+**`TERM` stays `xterm-256color`.** `TERM` is not inherited from the host: until the DCS/APC
+tap exists (S3), claiming `xterm-kitty` or a sixel `TERM` makes a child emit image bytes
+that uncl drops silently. `COLORTERM=truecolor` *is* inherited (24-bit colour survives our
+re-encoding), `TERM_PROGRAM=uncl` is set, and the host's program is preserved as
+`UNCL_HOST_TERM_PROGRAM`. `uncl --doctor` prints exactly what a child will see.
+
+### Closing the gaps the first run exposed
+
+Three things were still lying to the child after the first green build:
+
+**A gesture that leaves the float.** Press inside the float, drag outside: the
+`Drag`/`Up` used to fall outside `content_rect`, so uncl called it "local", the child never
+received the release, and a text selection in an editor stayed stuck. `Overlay::child_grab`
+now records that the child owns the pointer from press to release; while it is set, every
+button event routes to the child, with the coordinates **clamped to the grid** (which is
+what a real terminal reports for a pointer outside the window). `begin()` refuses to start a
+local drag during a grab, so `Alt` cannot strand a drag either. Scroll is deliberately *not*
+captured — it is an independent event, not part of the gesture.
+
+**Clipboard (`OSC 52`).** A child copying to the clipboard was silently dropped: the request
+is not for the child's terminal, it is for the *real* one. `Callbacks::copy_to_clipboard`
+(vt100 validates the selector and the base64 payload) now queues `OSC 52 ; <ty> ; <data>`
+on a host channel, and the owner thread — the only writer of stdout — emits it before the
+next frame. Reading the host clipboard (`OSC 52 ; c ; ?`) is still unanswered on purpose:
+almost no terminal allows it, and a wrong answer is worse than a child falling back.
+
+**Cursor shape (`DECSCUSR`).** Hidden/shown and position were already honoured, but not the
+shape, so nvim's insert-mode beam was a block in the float. The focused pane's
+`screen.cursor_style()` is mapped to `CSI 0..6 SP q` and re-sent only when it changes; the
+`TerminalGuard` resets it on exit, because the host's cursor shape outlives the alternate
+screen.
+
+**A crashing float no longer takes the owner with it.** The float's shell exiting (`exit` in
+the float, a crash) respawns the lease; a *failing* `exec` is now backed off by
+`TENANT_RESPAWN_BACKOFF` (2 s) instead of retried every 100 ms tick, and — the important
+part — an error there no longer propagates out of the event loop, which used to tear down
+the owner shell and exit uncl. The float also comes back **visible** if it was visible when
+it died, so `exit` in the float gives a new prompt rather than a window that has to be
+re-opened with `Home`.
+
+### Deliberately *not* in S1
+
+* **DECRQSS / XTGETTCAP / kitty keyboard (`CSI > u`) / application keypad.** Answering
+  these badly is worse than not answering: a wrong "yes" makes a child emit sequences we
+  cannot honour and the child cannot detect the failure. They belong with the S2 emitter,
+  which is where the answers become true.
+* **Cursor *shape* (`DECSCUSR`).** Hidden/shown and position are honoured; shape is not
+  relayed. Visible cursor in the right cell was the bug; shape is cosmetic.
+* **Sixel/kitty graphics.** Unchanged from S0: gated behind `UNCL_SIXEL` until the image
+  tap exists (§6.4).
+* **Owner-pane scrollback / alt-screen semantics.** Untouched.
+
+### Verification status — read this before trusting the diff
+
+There is **no Rust toolchain in this environment** (installs are blocked), so this code has
+not been compiled or run. What was done instead:
+
+* every file parses cleanly with `tree-sitter-rust`;
+* every method name called in `src/` was cross-checked against a definition in `src/` or in
+  the vendored sources of the exact dependency versions (`ratatui 0.30.2`, `crossterm 0.29`,
+  `vt100 0.18.1`);
+* the `vt100` callback signatures, `Parser<CB>` API, and *which* sequences reach
+  `unhandled_csi`/`unhandled_osc` were read out of `vt100 0.18.1`'s own `perform.rs`
+  (`?h`/`?l` with unknown modes, `c`, `>c`, `n`, and `18t` all land there; `8t` does not);
+* geometry, encoders and routing are covered by the 64 pure tests above.
+
+First thing to run on a machine with cargo: `cargo test`, then the manual script below.
+
+### Manual acceptance script (S1 exit criteria, §6.2)
+
+```sh
+cargo build --release
+./target/release/uncl --doctor          # TERM/COLORTERM a child will see
+# in the float (Home):
+echo $TERM; echo $COLORTERM             # xterm-256color / truecolor
+printf '\e[6n'; timeout 1 cat -v        # CPR: expect ^[[<row>;<col>R, and no stall
+btop                                    # click CPU/mem panes, wheel in the process list
+htop; nvim; lazygit; less /etc/services; fzf
+# select text in nvim/less and drag the pointer out of the float → selection keeps
+#   following the pointer and releases cleanly (no stuck selection)
+# nvim: `i` shows a beam cursor, `Esc` a block (DECSCUSR relayed to the host)
+# `echo -n hello | base64 | xargs -I{} printf '\e]52;c;{}\e\\'` → pastes from the
+#   host clipboard (terminal must allow OSC 52 writes)
+# geometry: Alt+drag to move, drag the border to resize (child must reflow live)
+# Alt+arrows move, Alt+Shift+arrows resize
+# click outside the float → it hides; Home → it comes back
+# `exit` inside the float → a fresh prompt, and the owner shell is untouched
+# mouse outside the float (float hidden) → the owner shell sees nothing, selection is native
+# drag the bottom edge up past MIN_HEIGHT → the float keeps tracking the pointer
+# (`Ctrl+Alt+q` is the escape hatch if anything wedges)
+```

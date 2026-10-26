@@ -1,39 +1,30 @@
+use crate::app::pty::{self, PtySession};
+use crate::app::signal::Signal;
+use crate::constants::{
+    DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_X, DEFAULT_Y, MIN_HEIGHT, MIN_WIDTH, ResizeDirection,
+    TENANT_CHROME_COLS, TENANT_CHROME_ROWS, nz,
+};
+
 use anyhow::Result;
 
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::{
-    Frame, Terminal,
-    backend::Backend,
+    Frame,
     layout::Rect,
-    prelude::CrosstermBackend,
     style::{Color, Style},
     widgets::{Block, Borders, block::Position},
 };
 
-use std::io::{BufWriter, Read, Write};
+use portable_pty::CommandBuilder;
 
-use crossterm::{
-    cursor::MoveTo,
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute, queue,
-    style::ResetColor,
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
-};
+use std::sync::{Arc, RwLock};
 
-use tokio::task::{self};
-
-use tui_term::widget::PseudoTerminal;
 use vt100::Screen;
 
-use crate::app::lease::Lease;
-
-use crate::constants::{
-    DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_X, DEFAULT_Y, MIN_HEIGHT, MIN_WIDTH, ResizeDirection,
-};
+use super::widget::{Cursor, PseudoTerminal};
 
 pub struct Size {
-    cols: u16,
-    rows: u16,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 pub struct Overlay {
@@ -48,7 +39,7 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn new() -> Self {
-        let overlay = Self {
+        Self {
             rect: Rect::new(DEFAULT_X, DEFAULT_Y, DEFAULT_WIDTH, DEFAULT_HEIGHT),
             dragging: false,
             drag_offset: (0, 0),
@@ -59,215 +50,57 @@ impl Overlay {
                 rows: DEFAULT_HEIGHT,
             },
             is_dead: true,
-        };
-
-        overlay
-    }
-
-    pub async fn initialize_pty(&mut self, lease: &mut Lease) -> Result<(), anyhow::Error> {
-        let pty_system = native_pty_system();
-        //Create pty pair
-        let pair = match pty_system.openpty(PtySize {
-            rows: self.size.rows - 4,
-            cols: self.size.cols - 4,
-            pixel_height: 0,
-            pixel_width: 0,
-        }) {
-            Ok(pair) => pair,
-            Err(e) => return Err(e.into()),
-        };
-
-        //Get pty master/slave
-        let master = pair.master;
-        let slave = pair.slave;
-
-        // Create a channel for resize operations
-        let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(10);
-
-        // Set the resize sender in the lease
-        lease.set_resize_sender(resize_tx);
-
-        //Prepare the shell command
-        let mut cmd = CommandBuilder::new_default_prog();
-        let cwd = std::env::current_dir().unwrap();
-        cmd.cwd(cwd);
-
-        // Clone the status sender for the child process monitoring
-        let child_status_tx = lease.tenant_status_tx.clone();
-        let resize_status_tx = lease.tenant_status_tx.clone();
-
-        let mut writer = BufWriter::new(master.take_writer().unwrap());
-        let mut reader = master.try_clone_reader().unwrap();
-
-        task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                while let Some((rows, cols)) = resize_rx.recv().await {
-                    if let Err(e) = master.resize(PtySize {
-                        rows: rows - 4,
-                        cols: cols - 4,
-                        pixel_height: 0,
-                        pixel_width: 0,
-                    }) {
-                        eprintln!("Failed to resize PTY: {}", e);
-                        // Optionally signal error
-                        let _ = resize_status_tx.send(true).await;
-                        break;
-                    }
-                }
-            });
-            drop(master);
-        });
-
-        //Spawn the shell in pty and monitor for exit
-        task::spawn_blocking(move || {
-            let mut child = match slave.spawn_command(cmd) {
-                Ok(child) => child,
-                Err(e) => {
-                    eprintln!("Failed to spawn command: {}", e);
-                    // Signal that the PTY process failed to start
-                    let rt = tokio::runtime::Handle::current();
-                    rt.block_on(async {
-                        let _ = child_status_tx.send(true).await;
-                    });
-                    return;
-                }
-            };
-
-            // Wait for the child process to exit
-            let _exit_status = child.wait().unwrap();
-            drop(slave);
-
-            // Signal that the PTY process has exited
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                let _ = child_status_tx.send(true).await;
-            });
-        });
-
-        // Clone status sender for the reader task
-        let reader_status_tx = lease.tenant_status_tx.clone();
-        {
-            let parser = lease.tenant_parser.clone();
-            task::spawn_blocking(move || {
-                let mut buf = [0u8; 8192];
-                // TODO: magic number?
-
-                let mut processed_buf = Vec::new();
-                loop {
-                    // Handle read errors or EOF
-                    let size = match reader.read(&mut buf) {
-                        Ok(0) => {
-                            // EOF detected - terminal process ended
-                            let rt = tokio::runtime::Handle::current();
-                            rt.block_on(async {
-                                let _ = reader_status_tx.send(true).await;
-                            });
-                            break;
-                        }
-                        Ok(size) => size,
-                        Err(e) => {
-                            eprintln!("Read error: {}", e);
-                            // Signal error
-                            let rt = tokio::runtime::Handle::current();
-                            rt.block_on(async {
-                                let _ = reader_status_tx.send(true).await;
-                            });
-                            break;
-                        }
-                    };
-
-                    if size > 0 {
-                        processed_buf.extend_from_slice(&buf[..size]);
-                        let mut parser = parser.write().unwrap();
-                        parser.process(&processed_buf);
-                        // Clear the processed portion of the buffer
-                        processed_buf.clear();
-                    }
-                }
-            });
         }
-
-        // Set up terminal
-        let backend = CrosstermBackend::new(std::io::stdout());
-        let mut terminal = Terminal::new(backend)?;
-
-        let mut rx = lease.tenant_rx.take().unwrap();
-
-        let stdout = terminal.backend_mut();
-        execute!(stdout, ResetColor)?;
-
-        enable_raw_mode()?;
-
-        execute!(stdout, EnableMouseCapture)?;
-
-        // Critical: Clear terminal buffer before displaying anything
-        queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
-        std::io::Write::flush(stdout)?;
-
-        terminal.clear()?;
-
-        // Handle writing to PTY with error detection
-        tokio::spawn(async move {
-            while let Some(bytes) = rx.recv().await {
-                if let Err(e) = writer.write_all(&bytes) {
-                    eprintln!("Write error: {}", e);
-                    break;
-                }
-                if let Err(e) = writer.flush() {
-                    eprintln!("Flush error: {}", e);
-                    break;
-                }
-            }
-        });
-
-        self.is_dead = false;
-
-        // Restore terminal state
-        disable_raw_mode()?;
-        execute!(std::io::stdout(), DisableMouseCapture)?;
-        terminal.show_cursor()?;
-        Ok(())
     }
 
-    pub fn cleanup<B: Backend + std::io::Write>(
-        &mut self,
-        terminal: &mut Terminal<B>,
-    ) -> Result<()> {
-        // Properly clean up terminal state before returning to owner
-        // This is crucial to prevent control characters and input issues
-        disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            DisableMouseCapture,
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        )?;
+    /// The size the child is told it has, i.e. the area inside the border.
+    ///
+    /// S0 makes the PTY and the parser agree on this number (they used to
+    /// disagree by two cells); unifying it with what the widget paints is S1.
+    pub fn content_size(&self) -> (u16, u16) {
+        (
+            self.size.rows.saturating_sub(TENANT_CHROME_ROWS).max(1),
+            self.size.cols.saturating_sub(TENANT_CHROME_COLS).max(1),
+        )
+    }
 
-        terminal.clear()?;
-        Ok(())
+    /// Spawn the floating shell. No terminal state is touched here: the owner
+    /// screen is already in raw mode and owns the alternate screen, so flipping
+    /// raw mode on and off again (the old behaviour) only caused flicker.
+    pub fn spawn(
+        &mut self,
+        parser: Arc<RwLock<vt100::Parser>>,
+        signal: Arc<Signal>,
+    ) -> Result<PtySession> {
+        let (rows, cols) = self.content_size();
+
+        // The grid must match the size the child is told, from the first byte.
+        parser.write().unwrap().set_size(nz(rows), nz(cols));
+
+        let mut cmd = CommandBuilder::new_default_prog();
+        cmd.cwd(std::env::current_dir()?);
+
+        let session = pty::spawn(cmd, rows, cols, parser, signal)?;
+        self.is_dead = false;
+        Ok(session)
     }
 
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
-        let t = format!("s:{}:{}", self.size.rows, self.size.cols);
+        let (rows, cols) = self.content_size();
         let block = Block::default()
             .borders(Borders::ALL)
             .title_position(Position::Bottom)
             .title_alignment(ratatui::layout::Alignment::Right)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(Color::Green)
-            .title(t)
+            .title(format!("s:{rows}:{cols}"))
             .style(Style::default().bg(Color::Reset));
-        let pseudo_term = PseudoTerminal::new(screen).block(block.clone()).cursor(
-            tui_term::widget::Cursor::default().style(
-                ratatui::style::Style::default()
-                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK),
-            ),
-        );
 
-        let inner = block.inner(self.rect);
-        f.render_widget(pseudo_term, inner);
-        f.render_widget(block.clone(), inner);
+        let pseudo_term = PseudoTerminal::new(screen)
+            .block(block)
+            .cursor(Cursor::default().visibility(true));
+
+        f.render_widget(pseudo_term, self.rect);
     }
 
     pub fn resize_to(
@@ -279,33 +112,26 @@ impl Overlay {
         bounds: (u16, u16),
     ) {
         //FIX: there are more ways to resize than handled here
-        // Ignore any resize attempts that fall below the minimum constraints
         if width < MIN_WIDTH || height < MIN_HEIGHT {
             return;
         }
 
-        // Safeguard: Ensure x and y are within bounds (can't move beyond the bounds of the screen)
-        x = x.max(0).min(bounds.0.saturating_sub(1)); // Prevent x from exceeding bounds width
-        y = y.max(0).min(bounds.1.saturating_sub(1)); // Prevent y from exceeding bounds height
+        x = x.min(bounds.0.saturating_sub(1));
+        y = y.min(bounds.1.saturating_sub(1));
 
-        // Calculate the max width and height that are available for resizing
         let max_width = bounds.0.saturating_sub(x);
         let max_height = bounds.1.saturating_sub(y);
 
-        // Safeguard against overflow by ensuring we do not resize past bounds or minimum sizes
         width = width.min(max_width).max(MIN_WIDTH);
         height = height.min(max_height).max(MIN_HEIGHT);
 
-        // Ensure the x and y positions are within bounds based on the new size
-        // This ensures the new window does not go out of bounds when resizing
         if x > bounds.0.saturating_sub(width) {
-            x = bounds.0.saturating_sub(width); // Prevent x from going past bounds
+            x = bounds.0.saturating_sub(width);
         }
         if y > bounds.1.saturating_sub(height) {
-            y = bounds.1.saturating_sub(height); // Prevent y from going past bounds
+            y = bounds.1.saturating_sub(height);
         }
 
-        // Set the new window dimensions (x, y, width, height)
         self.rect.x = x;
         self.rect.y = y;
         self.rect.width = width;
@@ -320,5 +146,50 @@ impl Overlay {
 
         self.rect.x = target_x.min(max_x);
         self.rect.y = target_y.min(max_y);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_size_leaves_room_for_the_border() {
+        let overlay = Overlay::new();
+        let (rows, cols) = overlay.content_size();
+        assert_eq!(rows, DEFAULT_HEIGHT - TENANT_CHROME_ROWS);
+        assert_eq!(cols, DEFAULT_WIDTH - TENANT_CHROME_COLS);
+    }
+
+    #[test]
+    fn content_size_never_reaches_zero() {
+        let mut overlay = Overlay::new();
+        overlay.size = Size { cols: 1, rows: 1 };
+        assert_eq!(overlay.content_size(), (1, 1));
+    }
+
+    #[test]
+    fn resize_keeps_the_float_inside_the_screen() {
+        let mut overlay = Overlay::new();
+        // ask for something absurd; it must be clamped, not overflow
+        overlay.resize_to(100, 100, 500, 500, (120, 40));
+        assert!(overlay.rect.x + overlay.rect.width <= 120);
+        assert!(overlay.rect.y + overlay.rect.height <= 40);
+    }
+
+    #[test]
+    fn resize_refuses_sizes_below_the_minimum() {
+        let mut overlay = Overlay::new();
+        let before = overlay.rect;
+        overlay.resize_to(0, 0, MIN_WIDTH - 1, MIN_HEIGHT - 1, (80, 25));
+        assert_eq!(overlay.rect, before);
+    }
+
+    #[test]
+    fn move_to_clamps_at_the_edges() {
+        let mut overlay = Overlay::new();
+        overlay.move_to(1000, 1000, (80, 25));
+        assert_eq!(overlay.rect.x, 80 - overlay.rect.width);
+        assert_eq!(overlay.rect.y, 25 - overlay.rect.height);
     }
 }

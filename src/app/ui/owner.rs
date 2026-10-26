@@ -1,448 +1,443 @@
 use anyhow::Result;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::CommandBuilder;
 use ratatui::{
     Frame, Terminal,
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend,
     layout::Rect,
-    widgets::{Block, Borders},
+    style::{Modifier, Style},
 };
 
 use bytes::Bytes;
 
 use std::{
-    io::{self, BufWriter, Read, Write},
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    io::{self, Stdout},
+    sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use crossterm::{
-    cursor::MoveTo,
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind, poll, read,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
     },
-    execute, queue,
-    style::ResetColor,
+    execute,
     terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
 
-use tokio::{
-    sync::mpsc::{Receiver, Sender, channel},
-    task::{self},
-};
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use tui_term::widget::PseudoTerminal;
-use vt100::Screen;
-
-pub struct Size {
-    cols: u16,
-    rows: u16,
-}
+use vt100::{MouseProtocolMode, Screen};
 
 use crate::app::input::keyboard::handle_keyboard_input;
 use crate::app::input::mouse::handle_mouse;
-use crate::app::lease::Lease;
+use crate::app::lease::{Lease, new_parser};
+use crate::app::pty::{self, PtySession};
+use crate::app::signal::Signal;
 use crate::constants::*;
 
-use super::tenant::Overlay;
+use super::widget::{Cursor, PseudoTerminal};
+
+pub struct Size {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// What the input handler wants the loop to do next.
+enum Flow {
+    Continue,
+    /// Pane geometry, visibility or terminal size changed: repaint.
+    Redraw,
+    /// Owner shell is gone.
+    Quit,
+}
 
 pub struct Container {
     pub rect: Rect,
     pub size: Size,
     pub parser: Arc<RwLock<vt100::Parser>>,
-    pub tx: Sender<Bytes>,
-    pub rx: Option<Receiver<Bytes>>,
-    pub status_tx: Sender<bool>,
-    pub status_rx: Option<Receiver<bool>>,
+    pub session: Option<PtySession>,
     pub lease: Lease,
-    pub mouse_mode_enabled: Arc<AtomicBool>,
+    pub signal: Arc<Signal>,
 }
 
 impl Container {
     pub fn new() -> Self {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
 
-        let rect = Rect::new(0, 0, cols, rows);
-
-        // FIX: we want to scroll back to start of the owner
-        let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 0)));
-
-        // Create channels for PTY status
-        let (tx, rx) = channel::<Bytes>(32);
-        let (pty_status_tx, pty_status_rx) = channel::<bool>(1);
-
-        let lease = Lease::new();
-        let mouse_mode_enabled = Arc::new(AtomicBool::new(false));
-        let container = Self {
-            rect,
-            parser,
+        Self {
+            rect: Rect::new(0, 0, cols, rows),
             size: Size { cols, rows },
-            tx,
-            rx: Some(rx),
-            status_tx: pty_status_tx,
-            status_rx: Some(pty_status_rx),
-            lease,
-            mouse_mode_enabled,
-        };
-
-        container
+            parser: new_parser(),
+            session: None,
+            lease: Lease::new(),
+            signal: Signal::new(),
+        }
     }
 
-    pub async fn init_tenant(&mut self) -> Result<(), anyhow::Error> {
-        let lease = &mut self.lease;
-        let tenant_ptr: *mut Overlay = &mut lease.tenant;
-        unsafe {
-            (*tenant_ptr).initialize_pty(lease).await.unwrap();
-        }
-
+    /// Spawn the floating shell and store its channels on the lease.
+    fn init_tenant(&mut self) -> Result<()> {
+        let parser = self.lease.tenant_parser.clone();
+        let signal = self.signal.clone();
+        let session = self.lease.tenant.spawn(parser, signal)?;
+        self.lease.attach(session);
         Ok(())
     }
 
-    pub fn tenant_running(&mut self) -> bool {
-        !self.lease.tenant_status_rx.is_closed()
+    fn tenant_running(&self) -> bool {
+        self.lease.running()
     }
 
     pub async fn initialize_pty(&mut self) -> Result<(), anyhow::Error> {
-        self.init_tenant().await?;
+        self.init_tenant()?;
 
-        let pty_system = native_pty_system();
-        //Create pty pair
-        let pair = match pty_system.openpty(PtySize {
-            rows: self.size.rows,
-            cols: self.size.cols,
-            pixel_height: 0,
-            pixel_width: 0,
-        }) {
-            Ok(pair) => pair,
-            Err(e) => return Err(e.into()),
-        };
+        // Size the owner's grid to the real terminal before spawning, so the
+        // shell never starts at 80x25 on a 200x60 screen.
+        self.parser
+            .write()
+            .unwrap()
+            .set_size(nz(self.size.rows), nz(self.size.cols));
 
-        enable_raw_mode()?;
-        //Get pty master/slave
-        let master = pair.master;
-        let slave = pair.slave;
-
-        //Prepare the shell command
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let mut cmd = CommandBuilder::new(shell);
-        let cwd = std::env::current_dir().unwrap();
-        cmd.args(&["-y", "-i", "--login"]);
-        cmd.cwd(cwd);
+        cmd.args(["-y", "-i", "--login"]);
+        cmd.cwd(std::env::current_dir()?);
         cmd.env("TERM", "xterm-256color");
 
-        // Clone the status sender for the child process monitoring
-        let child_status_tx = self.status_tx.clone();
+        let session = pty::spawn(
+            cmd,
+            self.size.rows,
+            self.size.cols,
+            self.parser.clone(),
+            self.signal.clone(),
+        )?;
+        self.session = Some(session);
 
-        //Spawn the shell in pty and monitor for exit
-        task::spawn_blocking(move || {
-            let mut child = match slave.spawn_command(cmd) {
-                Ok(child) => child,
-                Err(e) => {
-                    eprintln!("Failed to spawn command: {}", e);
-                    // Signal that the PTY process failed to start
-                    let rt = tokio::runtime::Handle::current();
-                    rt.block_on(async {
-                        let _ = child_status_tx.send(true).await;
-                    });
-                    return;
-                }
-            };
+        enable_raw_mode()?;
 
-            // Wait for the child process to exit
-            let _exit_status = child.wait().unwrap();
-            drop(slave);
-
-            // Signal that the PTY process has exited
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                let _ = child_status_tx.send(true).await;
-            });
-        });
-
-        let mut writer = BufWriter::new(master.take_writer().unwrap());
-        let mut reader = master.try_clone_reader().unwrap();
-
-        // Clone status sender for the reader task
-        let reader_status_tx = self.status_tx.clone();
-
-        {
-            let parser = self.parser.clone();
-            let mouse_tracker = self.mouse_mode_enabled.clone();
-
-            task::spawn_blocking(move || {
-                let mut buf = [0u8; 8192];
-                // TODO: magic number?
-                let mut processed_buf = Vec::new();
-                loop {
-                    // Handle read errors or EOF
-                    let size = match reader.read(&mut buf) {
-                        Ok(0) => {
-                            // EOF detected - terminal process ended
-                            let rt = tokio::runtime::Handle::current();
-                            rt.block_on(async {
-                                let _ = reader_status_tx.send(true).await;
-                            });
-                            break;
-                        }
-                        Ok(size) => size,
-                        Err(e) => {
-                            eprintln!("Read error: {}", e);
-                            // Signal error
-                            let rt = tokio::runtime::Handle::current();
-                            rt.block_on(async {
-                                let _ = reader_status_tx.send(true).await;
-                            });
-                            break;
-                        }
-                    };
-
-                    if size > 0 {
-                        processed_buf.extend_from_slice(&buf[..size]);
-
-                        let data_str = String::from_utf8_lossy(&processed_buf);
-
-                        // Check for mouse mode ENABLE sequences (more comprehensive)
-                        if data_str.contains("\x1b[?1000h") ||  // VT200 mouse tracking
-                        data_str.contains("\x1b[?1002h") ||  // VT200 button event mouse tracking
-                        data_str.contains("\x1b[?1003h") ||  // VT200 any event mouse tracking  
-                        data_str.contains("\x1b[?1006h") ||  // SGR mouse mode
-                        data_str.contains("\x1b[?1015h") ||  // URXVT mouse mode
-                        data_str.contains("\x1b[?9h") ||     // X10 mouse tracking
-                        data_str.contains("\x1b[?1005h") ||  // UTF-8 mouse mode
-                        data_str.contains("\x1b[?1004h")
-                        {
-                            // Focus events (often used with mouse)
-                            mouse_tracker.store(true, Ordering::Relaxed);
-                        }
-
-                        // Check for mouse mode DISABLE sequences
-                        if data_str.contains("\x1b[?1000l")
-                            || data_str.contains("\x1b[?1002l")
-                            || data_str.contains("\x1b[?1003l")
-                            || data_str.contains("\x1b[?1006l")
-                            || data_str.contains("\x1b[?1015l")
-                            || data_str.contains("\x1b[?9l")
-                            || data_str.contains("\x1b[?1005l")
-                            || data_str.contains("\x1b[?1004l")
-                        {
-                            mouse_tracker.store(false, Ordering::Relaxed);
-                        }
-
-                        // Additional check: Look for DECSET sequences that might indicate mouse capability
-                        if data_str.contains("\x1b[?47h") ||    // Alternate screen buffer (often used with mouse apps)
-                        data_str.contains("\x1b[?1047h") ||   // Alternate screen buffer
-                        data_str.contains("\x1b[?1049h")
-                        {
-                            // Alternate screen buffer + cursor save
-                            // Many mouse-capable apps use alternate screen, so enable mouse preemptively
-                            // but only if we're in a terminal that likely supports it
-                            if std::env::var("TERM").unwrap_or_default().contains("xterm")
-                                || std::env::var("TERM").unwrap_or_default().contains("screen")
-                            {
-                                mouse_tracker.store(true, Ordering::Relaxed);
-                            }
-                        }
-
-                        // Check for alternate screen disable (often means mouse apps are exiting)
-                        if data_str.contains("\x1b[?47l")
-                            || data_str.contains("\x1b[?1047l")
-                            || data_str.contains("\x1b[?1049l")
-                        {
-                            mouse_tracker.store(false, Ordering::Relaxed);
-                        }
-                        let mut parser = parser.write().unwrap();
-                        parser.process(&processed_buf);
-                        // Clear the processed portion of the buffer
-                        processed_buf.clear();
-                    }
-                }
-            });
-        }
-
-        // Set up terminal
         let mut stdout = io::stdout();
-        execute!(stdout, ResetColor)?;
-        execute!(stdout, EnableMouseCapture, EnterAlternateScreen,)?;
+        execute!(
+            stdout,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            EnterAlternateScreen
+        )?;
 
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+        terminal.clear()?;
 
-        let mut rx = self.rx.take().expect("rx already taken");
-        let mut status_rx = self.status_rx.take().expect("status rx already taken");
+        let result = self.run(&mut terminal).await;
 
-        // Handle writing to PTY with error detection
-        tokio::spawn(async move {
-            while let Some(bytes) = rx.recv().await {
-                if let Err(e) = writer.write_all(&bytes) {
-                    eprintln!("Write error: {}", e);
-                    break;
-                }
-                if let Err(e) = writer.flush() {
-                    eprintln!("Flush error: {}", e);
-                    break;
-                }
-            }
-            // Clean up resources
-            drop(writer);
-            drop(master);
-        });
-
-        // Run the terminal UI with PTY status monitoring
-        self.run(&mut terminal, self.parser.clone(), &mut status_rx)
-            .await?;
-
-        // Restore terminal state
-        //if self.tenant_running() {
-        // TODO: kill tenant processes here
-        //}
-
+        // Restore the terminal exactly once, in one batch.
         disable_raw_mode()?;
-        execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+        execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )?;
+
+        result
+    }
+
+    /// Paint the whole screen. Both grids are cloned under their locks first, so
+    /// the parser is never blocked for the duration of a frame.
+    fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        let owner: Screen = self.parser.read().unwrap().screen().clone();
+        let tenant: Screen = self.lease.tenant_parser.read().unwrap().screen().clone();
+        let tenant_visible = self.lease.tenant_visible && self.tenant_running();
+
+        terminal.draw(|f| self.render(f, &owner, &tenant, tenant_visible))?;
         Ok(())
     }
 
-    pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
-        let block = Block::default().borders(Borders::NONE);
-        let pseudo_term_owner = PseudoTerminal::new(screen).block(block.clone()).cursor(
-            tui_term::widget::Cursor::default()
-                .visibility(!self.lease.tenant_visible)
-                .style(
-                    ratatui::style::Style::default()
-                        .add_modifier(ratatui::style::Modifier::RAPID_BLINK),
-                ),
+    pub fn render(
+        &mut self,
+        f: &mut Frame,
+        owner: &Screen,
+        tenant: &Screen,
+        tenant_visible: bool,
+    ) {
+        let cursor = Cursor::default()
+            .visibility(!tenant_visible)
+            .style(Style::default().add_modifier(Modifier::RAPID_BLINK));
+
+        f.render_widget(
+            PseudoTerminal::new(owner).cursor(cursor),
+            self.rect,
         );
 
-        let inner = block.inner(self.rect);
-        f.render_widget(pseudo_term_owner, inner);
-        f.render_widget(block.clone(), inner);
-        if self.lease.tenant_visible && self.tenant_running() {
-            self.lease
-                .tenant
-                .render(f, self.lease.tenant_parser.read().unwrap().screen());
+        if tenant_visible {
+            self.lease.tenant.render(f, tenant);
         }
     }
 
-    pub async fn run<B: Backend + std::io::Write>(
-        &mut self,
-        terminal: &mut Terminal<B>,
-        parser: Arc<RwLock<vt100::Parser>>,
-        pty_status_rx: &mut tokio::sync::mpsc::Receiver<bool>,
-    ) -> Result<()> {
-        let mut stdout = io::stdout();
-        queue!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
-        stdout.flush()?;
-        terminal.clear()?;
-        terminal.flush()?;
+    /// Send bytes to whichever pane currently owns the keyboard.
+    fn active_sender(&self) -> Option<UnboundedSender<Bytes>> {
+        if self.lease.tenant_visible && self.tenant_running() {
+            self.lease.tenant_tx.clone()
+        } else {
+            self.session.as_ref().map(|session| session.writer.clone())
+        }
+    }
 
-        loop {
-            let mut sender: Sender<Bytes> = self.tx.clone();
+    fn active_screen(&self) -> Option<std::sync::RwLockReadGuard<'_, vt100::Parser>> {
+        if self.lease.tenant_visible && self.tenant_running() {
+            self.lease.tenant_parser.read().ok()
+        } else {
+            self.parser.read().ok()
+        }
+    }
 
-            if self.lease.tenant_visible {
-                if self.tenant_running() {
-                    sender = self.lease.tenant_tx.clone();
+    fn forward_paste(&self, text: &str) {
+        let Some(sender) = self.active_sender() else {
+            return;
+        };
+
+        let bracketed = self
+            .active_screen()
+            .is_some_and(|parser| parser.screen().bracketed_paste());
+
+        let mut payload = Vec::with_capacity(text.len() + 12);
+        if bracketed {
+            payload.extend_from_slice(b"\x1b[200~");
+        }
+        payload.extend_from_slice(text.as_bytes());
+        if bracketed {
+            payload.extend_from_slice(b"\x1b[201~");
+        }
+
+        let _ = sender.send(Bytes::from(payload));
+    }
+
+    /// Forward a mouse event to the owner shell when it asked for mouse
+    /// reporting. Mode-awareness replaces the old hand-rolled byte sniffing;
+    /// per-mode encoding (X10/UTF-8) is S1.
+    fn forward_mouse(&self, m: MouseEvent) {
+        let mouse_mode = self
+            .parser
+            .read()
+            .unwrap()
+            .screen()
+            .mouse_protocol_mode();
+        if matches!(mouse_mode, MouseProtocolMode::None) {
+            return;
+        }
+
+        let (button_code, final_byte) = match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => (0, 'M'),
+            MouseEventKind::Up(MouseButton::Left) => (0, 'm'),
+            MouseEventKind::Down(MouseButton::Right) => (2, 'M'),
+            MouseEventKind::Up(MouseButton::Right) => (2, 'm'),
+            MouseEventKind::Down(MouseButton::Middle) => (1, 'M'),
+            MouseEventKind::Up(MouseButton::Middle) => (1, 'm'),
+            MouseEventKind::Drag(MouseButton::Left) => (32, 'M'),
+            MouseEventKind::Drag(MouseButton::Right) => (34, 'M'),
+            MouseEventKind::Drag(MouseButton::Middle) => (33, 'M'),
+            MouseEventKind::ScrollUp => (64, 'M'),
+            MouseEventKind::ScrollDown => (65, 'M'),
+            _ => return,
+        };
+
+        let Some(sender) = self
+            .session
+            .as_ref()
+            .map(|session| session.writer.clone())
+        else {
+            return;
+        };
+
+        let sequence = format!(
+            "\x1b[<{};{};{}{}",
+            button_code,
+            m.column + 1,
+            m.row + 1,
+            final_byte
+        );
+        let _ = sender.send(Bytes::from(sequence.into_bytes()));
+    }
+
+    fn handle_event(&mut self, event: Event) -> Flow {
+        // Cached, not queried: this used to be an ioctl per input event.
+        let term_size = (self.size.cols, self.size.rows);
+
+        match event {
+            Event::Key(key) => {
+                // Windows reports release/repeat events as well; sending all of
+                // them made every keystroke fire twice there.
+                if key.kind != KeyEventKind::Press {
+                    return Flow::Continue;
+                }
+
+                if key.code == KeyCode::Home {
+                    self.lease.tenant_visible = !self.lease.tenant_visible;
+                    return Flow::Redraw;
+                }
+
+                let Some(sender) = self.active_sender() else {
+                    return Flow::Continue;
+                };
+
+                let quit = handle_keyboard_input(
+                    &mut self.lease,
+                    &sender,
+                    key,
+                    term_size,
+                );
+
+                if quit { Flow::Quit } else { Flow::Continue }
+            }
+
+            Event::Mouse(m) => {
+                if self.lease.tenant_visible {
+                    handle_mouse(&mut self.lease, m, term_size);
+                    Flow::Redraw
                 } else {
-                    // Important: If tenant is visible but not running, reset state
-                    self.lease.tenant_visible = false;
+                    self.forward_mouse(m);
+                    Flow::Continue
                 }
             }
 
-            // Poll for terminal events with a short timeout
-            if poll(std::time::Duration::from_millis(0))? {
-                let (term_width, term_height) = crossterm::terminal::size()?;
+            Event::Paste(text) => {
+                self.forward_paste(&text);
+                Flow::Continue
+            }
 
-                match read()? {
-                    Event::Key(key_event) => {
-                        if handle_keyboard_input(
-                            &mut self.lease,
-                            &sender,
-                            key_event,
-                            (term_width, term_height),
-                        )
-                        .await
-                        {
+            Event::Resize(cols, rows) => {
+                self.size = Size { cols, rows };
+                self.rect = Rect::new(0, 0, cols, rows);
+                self.parser
+                    .write()
+                    .unwrap()
+                    .set_size(nz(rows), nz(cols));
+                // TODO(S1): move the float back inside the new bounds and
+                // resize its child; today we only re-anchor the owner grid.
+                Flow::Redraw
+            }
+
+            _ => Flow::Continue,
+        }
+    }
+
+    /// Blocking crossterm reads run on their own thread so the event loop can
+    /// `select!` over input, PTY output and a frame timer instead of sleeping.
+    fn spawn_input_pump() -> UnboundedReceiver<Event> {
+        let (tx, rx) = unbounded_channel::<Event>();
+        tokio::task::spawn_blocking(move || {
+            loop {
+                match event::poll(Duration::from_millis(INPUT_POLL_INTERVAL_MS)) {
+                    Ok(true) => match event::read() {
+                        Ok(event) => {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("input read error: {err}");
                             break;
                         }
+                    },
+                    Ok(false) => {}
+                    Err(err) => {
+                        eprintln!("input poll error: {err}");
+                        break;
                     }
-                    Event::Mouse(m) => {
-                        if !self.lease.tenant_visible {
-                            // Only send mouse events if application has enabled mouse mode
-                            if self.mouse_mode_enabled.load(Ordering::Relaxed) {
-                                let (button_code, action) = match m.kind {
-                                    MouseEventKind::Down(MouseButton::Left) => (0, 'M'),
-                                    MouseEventKind::Up(MouseButton::Left) => (0, 'm'),
-                                    MouseEventKind::Down(MouseButton::Right) => (2, 'M'),
-                                    MouseEventKind::Up(MouseButton::Right) => (2, 'm'),
-                                    MouseEventKind::Down(MouseButton::Middle) => (1, 'M'),
-                                    MouseEventKind::Up(MouseButton::Middle) => (1, 'm'),
-                                    MouseEventKind::Drag(MouseButton::Left) => (32, 'M'),
-                                    MouseEventKind::Drag(MouseButton::Right) => (34, 'M'),
-                                    MouseEventKind::Drag(MouseButton::Middle) => (33, 'M'),
-                                    MouseEventKind::ScrollUp => (64, 'M'),
-                                    MouseEventKind::ScrollDown => (65, 'M'),
-                                    _ => (-1, ' '),
-                                };
+                }
+            }
+        });
+        rx
+    }
 
-                                if button_code >= 0 {
-                                    let mouse_sequence = format!(
-                                        "\x1b[<{};{};{}{}",
-                                        button_code,
-                                        m.column + 1,
-                                        m.row + 1,
-                                        action
-                                    );
+    pub async fn run(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        let mut input_rx = Self::spawn_input_pump();
+        let signal = self.signal.clone();
+        let mut ticker = tokio::time::interval(Duration::from_millis(IDLE_TICK_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the first tick is immediate
 
-                                    let bytes = Bytes::from(mouse_sequence.into_bytes());
-                                    if let Err(e) = sender.try_send(bytes) {
-                                        eprintln!("Failed to send mouse event: {}", e);
-                                    }
+        let mut redraw = true;
+
+        loop {
+            if redraw {
+                self.draw(terminal)?;
+                redraw = false;
+            }
+
+            // Bytes may have landed while we were painting.
+            if signal.take() {
+                redraw = true;
+                continue;
+            }
+
+            // No `biased;` on purpose: input must not be able to starve
+            // repaints (a paste flood) nor repaints starve input (a child
+            // flooding output), and both arms are cheap and resumable.
+            tokio::select! {
+                maybe_event = input_rx.recv() => {
+                    let Some(first) = maybe_event else {
+                        // input pump is gone: nothing can drive the UI anymore
+                        break;
+                    };
+
+                    match self.handle_event(first) {
+                        Flow::Quit => break,
+                        Flow::Redraw => redraw = true,
+                        Flow::Continue => {}
+                    }
+
+                    // Drain whatever else is already queued, so a paste or a
+                    // mouse drag does not take one frame per event.
+                    let mut budget = INPUT_DRAIN_BUDGET;
+                    while budget > 0 {
+                        match input_rx.try_recv() {
+                            Ok(event) => {
+                                budget -= 1;
+                                match self.handle_event(event) {
+                                    Flow::Quit => return Ok(()),
+                                    Flow::Redraw => redraw = true,
+                                    Flow::Continue => {}
                                 }
                             }
-                            // If mouse mode not enabled, ignore mouse events completely
-                        } else {
-                            handle_mouse(&mut self.lease, m, (term_width, term_height));
+                            Err(_) => break,
                         }
                     }
-                    Event::FocusGained => {}
-                    Event::FocusLost => {}
-                    Event::Paste(_) => {}
-                    Event::Resize(cols, rows) => {
-                        //TODO: fix
-                        parser.write().unwrap().set_size(rows, cols);
-                        if self.lease.tenant_visible {
-                            self.lease.resize_screen(
-                                self.lease.tenant.rect.height,
-                                self.lease.tenant.rect.width,
-                            );
-                        }
-                    }
-                };
+                }
+
+                _ = signal.changed() => {
+                    // Consume the flag here: the paint below already sees every
+                    // byte that was parsed before this point, so leaving it set
+                    // would cost a second, identical frame.
+                    signal.take();
+                    redraw = true;
+                }
+
+                _ = ticker.tick() => {}
             }
 
-            // Check if the PTY process has ended (non-blocking)
-            if let Ok(true) = pty_status_rx.try_recv() {
-                break;
-            }
-
-            if let Ok(true) = self.lease.tenant_status_rx.try_recv() {
+            // Child lifecycle (cheap, non-blocking; covers both panes).
+            if self.lease.poll_exit() {
                 self.lease.tenant_visible = false;
-                self.lease.tenant.is_dead = true;
+                redraw = true;
+            }
+
+            if let Some(session) = self.session.as_mut() {
+                match session.exited.try_recv() {
+                    Ok(()) | Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => {}
+                }
             }
 
             if self.lease.expired() {
-                self.lease.tenant.cleanup(terminal)?;
                 self.lease = self.lease.renew();
-                self.init_tenant().await?;
-                enable_raw_mode()?;
-                execute!(stdout, EnableMouseCapture)?;
+                self.init_tenant()?;
+                redraw = true;
             }
-
-            // Small sleep to prevent CPU spinning
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;
         }
 
         Ok(())

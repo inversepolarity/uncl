@@ -13,3 +13,44 @@ pub const DEFAULT_HEIGHT: u16 = 25;
 
 pub const DEFAULT_X: u16 = 10;
 pub const DEFAULT_Y: u16 = 5;
+
+/// How often the event loop wakes up when nothing else is happening.
+///
+/// Frames are driven by PTY output and input events (see `app::signal::Signal`),
+/// so this timer exists only for housekeeping — noticing that a child has
+/// exited — and it is deliberately coarse: a 60 Hz idle wake-up would burn CPU
+/// for nothing, which is exactly what S0 is fixing.
+pub const IDLE_TICK_MS: u64 = 100;
+
+/// How often the blocking crossterm poll in the input pump gives up and
+/// re-checks whether it should shut down.
+pub const INPUT_POLL_INTERVAL_MS: u64 = 50;
+
+/// Maximum number of queued input events handled per loop iteration before we
+/// yield back to rendering. A paste or a mouse drag can produce thousands of
+/// events; without a budget we would starve the screen.
+pub const INPUT_DRAIN_BUDGET: usize = 512;
+
+/// Cap on how many bytes we coalesce into a single write to a child PTY.
+pub const PTY_WRITE_BATCH: usize = 64 * 1024;
+
+/// Rows/cols consumed by the floating window's border, title and padding.
+pub const TENANT_CHROME_ROWS: u16 = 4;
+pub const TENANT_CHROME_COLS: u16 = 4;
+
+/// `vt100` 0.18 requires non-zero dimensions (it used to panic on zero), so
+/// every size that comes from the environment goes through here.
+pub fn nz(value: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(value).unwrap_or(std::num::NonZeroU16::MIN)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nz_never_returns_zero() {
+        assert_eq!(nz(0).get(), 1);
+        assert_eq!(nz(80).get(), 80);
+    }
+}

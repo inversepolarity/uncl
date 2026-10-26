@@ -200,7 +200,7 @@ Two consequences worth internalising:
 
 Stages are ordered by *dependency*, not by size, and each one is independently shippable. Effort assumes one developer familiar with the code.
 
-### 6.1 S0 — "make it fast" — ~2–3 days, ~200 LOC changed
+### 6.1 S0 — "make it fast" — **shipped**, see Appendix C
 
 1. **Drain-to-empty input.** Replace `if poll(0) { read() }` with `while poll(0)? { handle(read()?) }`, bounded by a per-tick budget (e.g. 512 events) to stay fair to rendering. → §2.2, ~20 LOC.
 2. **Dirty-driven redraw.** Add `Arc<AtomicBool>` (or a `tokio::sync::Notify`) set by the reader threads when they process bytes; render only when dirty, or at a 60 Hz floor while an animation/`REP` is in flight, or on input. Replace `sleep(10)` with `select!` on `Notify` + a 16 ms timer. → §2.1, ~40 LOC.
@@ -366,6 +366,7 @@ Still genuinely open, in the order they will bite:
 ## 10. Implementation checklist (drop-in order)
 
 Each line is a reviewable PR; the sequence is the shortest dependency-satisfying one.
+S0 (items 1–5) is implemented — see Appendix C for the file map and the verification status.
 
 ```
 S0  1. vendor adapter (src/app/ui/adapter.rs) + vt100 0.18.1 + drop tui-term        [½ d]
@@ -409,3 +410,59 @@ v1 of this report proposed promoting the float to full screen whenever its child
 - **A debugging switch** (`UNCL_PASSTHROUGH=1`) to bisect "is this uncl's compositor or the child?" in one run.
 
 Mechanics, if it is ever picked up: detect `?1049h`/`?47h` on the child (`vt100` tracks alt-screen internally; `Screen` exposes it via the mode set), set `raw` relay for the affected pane, stop compositing it, and splice the child's bytes into the frame between a `CUP` to the origin and the exit sequence. `?1049l` restores. ~250 LOC, no emulation work — but it *removes* the float while it is active, so it cannot be the default (decision 1).
+
+## Appendix C — S0 implementation log (2026-10-26)
+
+### What landed
+
+| S0 item | Change | Where |
+|---|---|---|
+| 1 | `vt100` pinned to 0.18.1; its cell→buffer mapping vendored (123 LOC, MIT); `PseudoTerminal` reimplemented against `ratatui::Buffer`; `tui-term` removed | `Cargo.toml`, `src/app/ui/adapter.rs`, `src/app/ui/widget.rs` |
+| 2 | The byte-sniffing block is **deleted**. Mouse gating, bracketed paste and cursor visibility are read from the parser (`mouse_protocol_mode()`, `bracketed_paste()`, `hide_cursor()`), so a sequence split across reads can no longer desynchronise anything | `owner.rs::forward_mouse`, `owner.rs::forward_paste`, `widget.rs` |
+| 3 | Input moved to a dedicated blocking pump thread; the loop drains up to 512 queued events per iteration instead of one per 10 ms | `owner.rs::spawn_input_pump`, `owner.rs::handle_event` |
+| 4 | One coalescing writer per pane: unbounded channel, up to 64 KiB joined into a single `write_all` + `flush`; every `send().await.unwrap()` is gone | `src/app/pty.rs` (new) |
+| 5 | Frames are driven by a sticky `Signal` raised by the reader threads; the old `sleep(10)+draw` pair is gone; a 100 ms housekeeping tick exists only to notice child exit; show/hide/resize/keys request an explicit repaint | `src/app/signal.rs` (new), `owner.rs::run` |
+
+Folded in because they were one-liners on the same code paths (and were on the bug list): the tenant no longer toggles raw mode or builds a throwaway `Terminal`/`Screen`; its grid is sized to the same number the PTY is told; `crossterm::terminal::size()` is no longer called per input event; the mouse resize path uses saturating arithmetic (it could panic on a tiny terminal); `KeyEventKind::Press` is enforced (Windows sent press+release, so every key fired twice); bracketed paste is enabled on the host and `Event::Paste` is forwarded as one write.
+
+Also new: a shared `pty::spawn()` used by both panes (`src/app/pty.rs`), so owner and tenant can no longer drift apart in how they wire readers, writers, resizes and exit detection.
+
+### Deliberately *not* in S0 (they are S1)
+
+- One geometry source of truth (the float still gives its child `rect − 4` while painting `rect − 2`).
+- Region-based input routing (a visible float still swallows every mouse event).
+- Terminal-query replies / capability proxy.
+- Scrollback for the float.
+
+### Verification status — read this before trusting the diff
+
+There is **no Rust toolchain in the environment this was written in** (crates.io, static.rust-lang.org and the Debian/Ubuntu archives are all outside the sandbox allowlist; `apt` has no working index). So:
+
+- ✅ All 14 source files parse cleanly under tree-sitter-rust (no `ERROR`/missing nodes).
+- ✅ Every external API call was checked against the actual sources of `vt100` 0.18.1, `crossterm` 0.27.0 and `ratatui` 0.29.0 (`Buffer::{cell, cell_mut, empty}`, `Style::patch`, `Cell::{symbol, style, set_symbol, set_style}`, `Frame::render_widget`, `Terminal::try_draw`'s autoresize, `KeyEventKind`, `Event::Paste`, `MouseEvent: Copy`, `Parser::new(NonZeroU16, …)`, `Screen::{mouse_protocol_mode, bracketed_paste, hide_cursor, cursor_position, cell}`, `Callbacks`).
+- ❌ **Not compiled.** Expect a handful of borrow-checker or clippy nits on first build; the risky spots are the `select!` arm bodies (they call `&mut self` while the futures borrow only locals) and `pty::spawn`'s partial move of `PtyPair`.
+- ⚠️ `Cargo.lock` was not regenerated (no cargo here): it still lists `tui-term` and `vt100 0.15.2`. `cargo build` will rewrite it; the dependency graph change is `−tui-term −vt100 0.15 −vte 0.11`, `+vt100 0.18.1 +vte 0.15`.
+
+First commands on a machine with a toolchain:
+
+```sh
+cargo build           # refreshes Cargo.lock, surfaces the compile nits
+cargo test            # 13 new unit tests: widget/adapter, float geometry, Signal
+cargo run             # then, in the shell: btop, nvim, lazgit, less, fzf
+```
+
+### What to measure once it runs (the §2 claims, now testable)
+
+| Claim | Check | Expected |
+|---|---|---|
+| Idle cost was tick-driven (§2.1) | leave a prompt idle, `perf stat -e task-clock -p $(pgrep uncl) -- sleep 5` | ≈ 0, not the old 100 Hz redraw |
+| Input was capped at 1 event/tick (§2.2) | paste 5 KB of text into the float | lands in one write, no character-by-character crawl |
+| Paste/queue no longer stall the loop (§2.3) | hold a key down / drag while a child floods output | typing stays responsive, no freeze |
+| Mode tracking is now real (§2.5) | `htop` in the float, then move the mouse in the *owner* area | no phantom reports when the child never enabled mouse mode |
+
+### Known behaviours kept on purpose (so the diff stays reviewable)
+
+- `Home` still toggles the float and is still not forwardable to the child (S1 gives it back and moves the toggle).
+- Backspace still sends `0x08` (not `0x7f`) — unchanged from before, tracked in S1 with the mode-aware encoder.
+- Mouse reports are still always SGR; the per-mode encoder is S1.
+- The float title still shows a size, now the *child's* size rather than the overlay's, so it stops lying about what the PTY was told.

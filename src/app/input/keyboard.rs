@@ -2,272 +2,234 @@ use crate::app::lease::Lease;
 
 use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 
-pub async fn handle_keyboard_input(
+/// Push bytes at the focused child.
+///
+/// Sends are non-blocking (unbounded channel) and never panic: a closed channel
+/// means the child is gone, which the owner loop notices on its own.
+#[inline]
+fn send(tx: &UnboundedSender<Bytes>, bytes: Bytes) {
+    let _ = tx.send(bytes);
+}
+
+#[inline]
+fn send_static(tx: &UnboundedSender<Bytes>, bytes: &'static [u8]) {
+    send(tx, Bytes::from_static(bytes));
+}
+
+#[inline]
+fn send_bytes(tx: &UnboundedSender<Bytes>, bytes: Vec<u8>) {
+    send(tx, Bytes::from(bytes));
+}
+
+/// Translate one key event for the focused child.
+///
+/// Returns `true` when uncl itself should exit. Local chords (float resize and
+/// move) are handled here when the float is visible, otherwise the same key
+/// combination is forwarded to the child.
+pub fn handle_keyboard_input(
     lease: &mut Lease,
-    sender: &Sender<Bytes>,
+    sender: &UnboundedSender<Bytes>,
     key_event: KeyEvent,
     term_size: (u16, u16),
 ) -> bool {
-    let x = lease.tenant.rect.x;
-    let y = lease.tenant.rect.y;
-    let width = lease.tenant.rect.width;
-    let height = lease.tenant.rect.height;
-
-    if key_event.code == KeyCode::Home {
-        lease.tenant_visible = !lease.tenant_visible;
-        return false;
-    }
+    let rect = lease.tenant.rect;
 
     if key_event.modifiers.contains(KeyModifiers::SHIFT) {
         match key_event.code {
             KeyCode::Left => {
                 if lease.tenant_visible {
-                    lease
-                        .tenant
-                        .resize_to(x, y, width.saturating_sub(1), height, term_size);
-                    lease.resize_screen(height, width.saturating_sub(1));
-                    return false;
+                    let width = rect.width.saturating_sub(1);
+                    lease.tenant.resize_to(rect.x, rect.y, width, rect.height, term_size);
+                    lease.resize_screen(rect.height, width);
                 } else {
-                    // Send Shift+Left escape sequence
-                    sender
-                        .send(Bytes::from(b"\x1b[1;2D".to_vec()))
-                        .await
-                        .unwrap();
-                    return false;
+                    send_static(sender, b"\x1b[1;2D");
                 }
+                return false;
             }
             KeyCode::Right => {
                 if lease.tenant_visible {
-                    lease.tenant.resize_to(x, y, width + 1, height, term_size);
-                    lease.resize_screen(height, width + 1);
-                    return false;
+                    let width = rect.width + 1;
+                    lease.tenant.resize_to(rect.x, rect.y, width, rect.height, term_size);
+                    lease.resize_screen(rect.height, width);
                 } else {
-                    // Send Shift+Right escape sequence
-                    sender
-                        .send(Bytes::from(b"\x1b[1;2C".to_vec()))
-                        .await
-                        .unwrap();
-                    return false;
+                    send_static(sender, b"\x1b[1;2C");
                 }
+                return false;
             }
             KeyCode::Up => {
                 if lease.tenant_visible {
-                    lease
-                        .tenant
-                        .resize_to(x, y, width, height.saturating_sub(1), term_size);
-                    lease.resize_screen(height.saturating_sub(1), width);
-                    return false;
+                    let height = rect.height.saturating_sub(1);
+                    lease.tenant.resize_to(rect.x, rect.y, rect.width, height, term_size);
+                    lease.resize_screen(height, rect.width);
                 } else {
-                    // Send Shift+Up escape sequence
-                    sender
-                        .send(Bytes::from(b"\x1b[1;2A".to_vec()))
-                        .await
-                        .unwrap();
-                    return false;
+                    send_static(sender, b"\x1b[1;2A");
                 }
+                return false;
             }
             KeyCode::Down => {
                 if lease.tenant_visible {
-                    lease.tenant.resize_to(x, y, width, height + 1, term_size);
-                    lease.resize_screen(height + 1, width);
-                    return false;
+                    let height = rect.height + 1;
+                    lease.tenant.resize_to(rect.x, rect.y, rect.width, height, term_size);
+                    lease.resize_screen(height, rect.width);
                 } else {
-                    // Send Shift+Down escape sequence
-                    sender
-                        .send(Bytes::from(b"\x1b[1;2B".to_vec()))
-                        .await
-                        .unwrap();
-                    return false;
+                    send_static(sender, b"\x1b[1;2B");
                 }
+                return false;
             }
-            _ => {} // Pass other keys through
+            _ => {}
         }
     } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
         match key_event.code {
             KeyCode::Left => {
                 if lease.tenant_visible {
-                    lease.tenant.move_to(x.saturating_sub(1), y, term_size);
-                    return false;
+                    lease.tenant.move_to(rect.x.saturating_sub(1), rect.y, term_size);
                 } else {
-                    // Send Ctrl+Left escape sequence
-                    sender
-                        .send(Bytes::from(b"\x1b[1;5D".to_vec()))
-                        .await
-                        .unwrap();
-                    return false;
+                    send_static(sender, b"\x1b[1;5D");
                 }
+                return false;
             }
             KeyCode::Right => {
                 if lease.tenant_visible {
-                    lease.tenant.move_to(x + 1, y, term_size);
-                    return false;
+                    lease.tenant.move_to(rect.x + 1, rect.y, term_size);
                 } else {
-                    // Send Ctrl+Right escape sequence
-                    sender
-                        .send(Bytes::from(b"\x1b[1;5C".to_vec()))
-                        .await
-                        .unwrap();
-                    return false;
+                    send_static(sender, b"\x1b[1;5C");
                 }
+                return false;
             }
             KeyCode::Up => {
                 if lease.tenant_visible {
-                    lease.tenant.move_to(x, y.saturating_sub(1), term_size);
-                    return false;
+                    lease.tenant.move_to(rect.x, rect.y.saturating_sub(1), term_size);
                 } else {
-                    // Send Ctrl+Up escape sequence
-                    sender
-                        .send(Bytes::from(b"\x1b[1;5A".to_vec()))
-                        .await
-                        .unwrap();
-                    return false;
+                    send_static(sender, b"\x1b[1;5A");
                 }
+                return false;
             }
             KeyCode::Down => {
                 if lease.tenant_visible {
-                    lease.tenant.move_to(x, y + 1, term_size);
-                    return false;
+                    lease.tenant.move_to(rect.x, rect.y + 1, term_size);
                 } else {
-                    // Send Ctrl+Down escape sequence
-                    sender
-                        .send(Bytes::from(b"\x1b[1;5B".to_vec()))
-                        .await
-                        .unwrap();
-                    return false;
+                    send_static(sender, b"\x1b[1;5B");
                 }
+                return false;
             }
-            _ => {} // Pass other control keys through to the application
+            _ => {}
         }
     }
 
-    // Handle regular characters
     match key_event.code {
         KeyCode::Char(c) => {
             if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                // Handle control characters (ASCII 1-26)
-                let ctrl_char = (c as u8) & 0x1F;
-                //TODO: try sync send
-                sender.send(Bytes::from(vec![ctrl_char])).await.unwrap();
+                // Control characters are ASCII 1-26 for the alphabetic range.
+                let ctrl_char = (c as u32 & 0x1f) as u8;
+                send_bytes(sender, vec![ctrl_char]);
             } else if key_event.modifiers.contains(KeyModifiers::ALT) {
-                sender.send(Bytes::from(vec![27, c as u8])).await.unwrap();
+                // ALT is transmitted as an ESC prefix; the character keeps its
+                // UTF-8 encoding so non-ASCII binds survive.
+                let mut buf = [0u8; 4];
+                let mut bytes = Vec::with_capacity(5);
+                bytes.push(27);
+                bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                send_bytes(sender, bytes);
             } else {
-                // Regular character
-                sender
-                    .send(Bytes::from(c.to_string().into_bytes()))
-                    .await
-                    .unwrap();
+                let mut buf = [0u8; 4];
+                send_bytes(sender, c.encode_utf8(&mut buf).as_bytes().to_vec());
             }
+            false
         }
 
         KeyCode::Enter => {
-            sender.send(Bytes::from(vec![b'\r'])).await.unwrap();
+            send_static(sender, b"\r");
+            false
         }
 
         KeyCode::Backspace => {
-            sender.send(Bytes::from(vec![8])).await.unwrap();
+            send_bytes(sender, vec![8]);
+            false
         }
 
         KeyCode::Delete => {
-            // Send the standard escape sequence for Delete key
-            sender
-                .send(Bytes::from(vec![27, 91, 51, 126]))
-                .await
-                .unwrap();
+            send_static(sender, b"\x1b[3~");
+            false
+        }
+
+        KeyCode::Insert => {
+            send_static(sender, b"\x1b[2~");
+            false
         }
 
         KeyCode::Tab => {
-            sender.send(Bytes::from(vec![9])).await.unwrap();
+            send_bytes(sender, vec![9]);
+            false
         }
 
         KeyCode::BackTab => {
-            sender.send(Bytes::from(vec![27, 91, 90])).await.unwrap();
+            send_static(sender, b"\x1b[Z");
+            false
         }
 
         KeyCode::Left => {
-            sender.send(Bytes::from(vec![27, 91, 68])).await.unwrap();
+            send_static(sender, b"\x1b[D");
+            false
         }
 
         KeyCode::Right => {
-            sender.send(Bytes::from(vec![27, 91, 67])).await.unwrap();
+            send_static(sender, b"\x1b[C");
+            false
         }
 
         KeyCode::Up => {
-            sender.send(Bytes::from(vec![27, 91, 65])).await.unwrap();
+            send_static(sender, b"\x1b[A");
+            false
         }
 
         KeyCode::Down => {
-            sender.send(Bytes::from(vec![27, 91, 66])).await.unwrap();
+            send_static(sender, b"\x1b[B");
+            false
         }
 
         KeyCode::Esc => {
-            sender.send(Bytes::from(vec![27])).await.unwrap();
+            send_static(sender, b"\x1b");
+            false
         }
 
         KeyCode::End => {
-            sender.send(Bytes::from(vec![27, 91, 70])).await.unwrap();
+            send_static(sender, b"\x1b[F");
+            false
         }
 
         KeyCode::PageUp => {
-            sender
-                .send(Bytes::from(vec![27, 91, 53, 126]))
-                .await
-                .unwrap();
+            send_static(sender, b"\x1b[5~");
+            false
         }
 
         KeyCode::PageDown => {
-            sender
-                .send(Bytes::from(vec![27, 91, 54, 126]))
-                .await
-                .unwrap();
+            send_static(sender, b"\x1b[6~");
+            false
         }
 
         KeyCode::F(n) => {
-            // Function keys
             match n {
-                1 => sender.send(Bytes::from(vec![27, 79, 80])).await.unwrap(),
-                2 => sender.send(Bytes::from(vec![27, 79, 81])).await.unwrap(),
-                3 => sender.send(Bytes::from(vec![27, 79, 82])).await.unwrap(),
-                4 => sender.send(Bytes::from(vec![27, 79, 83])).await.unwrap(),
-                5 => sender
-                    .send(Bytes::from(vec![27, 91, 49, 53, 126]))
-                    .await
-                    .unwrap(),
-                6 => sender
-                    .send(Bytes::from(vec![27, 91, 49, 55, 126]))
-                    .await
-                    .unwrap(),
-                7 => sender
-                    .send(Bytes::from(vec![27, 91, 49, 56, 126]))
-                    .await
-                    .unwrap(),
-                8 => sender
-                    .send(Bytes::from(vec![27, 91, 49, 57, 126]))
-                    .await
-                    .unwrap(),
-                9 => sender
-                    .send(Bytes::from(vec![27, 91, 50, 48, 126]))
-                    .await
-                    .unwrap(),
-                10 => sender
-                    .send(Bytes::from(vec![27, 91, 50, 49, 126]))
-                    .await
-                    .unwrap(),
-                11 => sender
-                    .send(Bytes::from(vec![27, 91, 50, 51, 126]))
-                    .await
-                    .unwrap(),
-                12 => sender
-                    .send(Bytes::from(vec![27, 91, 50, 52, 126]))
-                    .await
-                    .unwrap(),
+                1 => send_static(sender, b"\x1bOP"),
+                2 => send_static(sender, b"\x1bOQ"),
+                3 => send_static(sender, b"\x1bOR"),
+                4 => send_static(sender, b"\x1bOS"),
+                5 => send_static(sender, b"\x1b[15~"),
+                6 => send_static(sender, b"\x1b[17~"),
+                7 => send_static(sender, b"\x1b[18~"),
+                8 => send_static(sender, b"\x1b[19~"),
+                9 => send_static(sender, b"\x1b[20~"),
+                10 => send_static(sender, b"\x1b[21~"),
+                11 => send_static(sender, b"\x1b[23~"),
+                12 => send_static(sender, b"\x1b[24~"),
                 _ => {}
             }
+            false
         }
 
-        _ => return false,
+        // Home is consumed by the owner loop (it toggles the float) and every
+        // other key we do not know about is left alone.
+        _ => false,
     }
-
-    false
 }

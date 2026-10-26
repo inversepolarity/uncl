@@ -9,14 +9,19 @@ pub fn handle_mouse(lease: &mut Lease, m: MouseEvent, bounds: (u16, u16)) {
     let x = m.column;
     let y = m.row;
 
+    // Saturating arithmetic throughout: a one-cell terminal used to underflow
+    // here (`rect.x + rect.width - MIN_WIDTH`), which panics in debug builds.
+    let right_edge = rect.x.saturating_add(rect.width);
+    let bottom_edge = rect.y.saturating_add(rect.height);
+
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if is_within_overlay(m, rect) {
                 if lease.tenant_visible {
-                    let near_left = x <= rect.x + 1;
-                    let near_right = x >= rect.x + rect.width.saturating_sub(2);
-                    let near_top = y <= rect.y + 1;
-                    let near_bottom = y >= rect.y + rect.height.saturating_sub(2);
+                    let near_left = x <= rect.x.saturating_add(1);
+                    let near_right = x >= right_edge.saturating_sub(2);
+                    let near_top = y <= rect.y.saturating_add(1);
+                    let near_bottom = y >= bottom_edge.saturating_sub(2);
 
                     if near_left && near_top {
                         overlay.resizing = true;
@@ -35,10 +40,8 @@ pub fn handle_mouse(lease: &mut Lease, m: MouseEvent, bounds: (u16, u16)) {
                         overlay.drag_offset = (x.saturating_sub(rect.x), y.saturating_sub(rect.y));
                     }
                 }
-            } else {
-                if lease.tenant_visible {
-                    lease.tenant_visible = false;
-                }
+            } else if lease.tenant_visible {
+                lease.tenant_visible = false;
             }
         }
 
@@ -48,30 +51,42 @@ pub fn handle_mouse(lease: &mut Lease, m: MouseEvent, bounds: (u16, u16)) {
                     let rect = overlay.rect;
                     let (new_x, new_y, new_width, new_height) = match direction {
                         ResizeDirection::TopLeft => {
-                            let new_x = m.column.min(rect.x + rect.width - MIN_WIDTH).max(0);
-                            let new_y = m.row.min(rect.y + rect.height - MIN_HEIGHT).max(0);
-                            let new_width = (rect.x + rect.width - new_x).max(MIN_WIDTH); // Clamping to MIN_WIDTH
-                            let new_height = (rect.y + rect.height - new_y).max(MIN_HEIGHT); // Clamping to MIN_HEIGHT
+                            let new_x = m
+                                .column
+                                .min(rect.x.saturating_add(rect.width).saturating_sub(MIN_WIDTH));
+                            let new_y = m
+                                .row
+                                .min(rect.y.saturating_add(rect.height).saturating_sub(MIN_HEIGHT));
+                            let new_width = (rect.x.saturating_add(rect.width).saturating_sub(new_x))
+                                .max(MIN_WIDTH);
+                            let new_height = (rect.y.saturating_add(rect.height).saturating_sub(new_y))
+                                .max(MIN_HEIGHT);
                             (new_x, new_y, new_width, new_height)
                         }
 
                         ResizeDirection::TopRight => {
-                            let new_y = m.row.min(rect.y + rect.height - MIN_HEIGHT).max(0);
-                            let new_width = (m.column.saturating_sub(rect.x)).max(MIN_WIDTH);
-                            let new_height = (rect.y + rect.height - new_y).max(MIN_HEIGHT);
+                            let new_y = m
+                                .row
+                                .min(rect.y.saturating_add(rect.height).saturating_sub(MIN_HEIGHT));
+                            let new_width = m.column.saturating_sub(rect.x).max(MIN_WIDTH);
+                            let new_height = (rect.y.saturating_add(rect.height).saturating_sub(new_y))
+                                .max(MIN_HEIGHT);
                             (rect.x, new_y, new_width, new_height)
                         }
 
                         ResizeDirection::BottomLeft => {
-                            let new_x = m.column.min(rect.x + rect.width - MIN_WIDTH).max(0);
-                            let new_width = (rect.x + rect.width - new_x).max(MIN_WIDTH);
-                            let new_height = (m.row.saturating_sub(rect.y)).max(MIN_HEIGHT);
+                            let new_x = m
+                                .column
+                                .min(rect.x.saturating_add(rect.width).saturating_sub(MIN_WIDTH));
+                            let new_width = (rect.x.saturating_add(rect.width).saturating_sub(new_x))
+                                .max(MIN_WIDTH);
+                            let new_height = m.row.saturating_sub(rect.y).max(MIN_HEIGHT);
                             (new_x, rect.y, new_width, new_height)
                         }
 
                         ResizeDirection::BottomRight => {
-                            let new_width = (m.column.saturating_sub(rect.x)).max(MIN_WIDTH);
-                            let new_height = (m.row.saturating_sub(rect.y)).max(MIN_HEIGHT);
+                            let new_width = m.column.saturating_sub(rect.x).max(MIN_WIDTH);
+                            let new_height = m.row.saturating_sub(rect.y).max(MIN_HEIGHT);
                             (rect.x, rect.y, new_width, new_height)
                         }
                     };

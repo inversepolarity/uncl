@@ -654,19 +654,34 @@ impl KittyControls {
 }
 
 /// sixel raster attributes: `"Pan;Pad;Ph;Pv` — the last two are pixels.
+///
+/// The fourth number is *not* followed by a `;`: the first sixel command starts
+/// immediately, so a real header reads `"1;1;640;480#0;2;0;0;0`. Splitting on
+/// `;` alone therefore glued `480#0` together and lost the height, which made
+/// every sixel look unsized. Parse the numbers, then stop.
 fn raster_attributes(data: &[u8]) -> Footprint {
     let Some(quote) = data.iter().position(|byte| *byte == b'"') else {
         return Footprint::Unknown;
     };
 
-    let mut fields = data[quote + 1..]
-        .split(|byte| *byte == b';')
-        .take(4)
-        .filter_map(parse_u32);
+    let mut fields = [None; 4];
+    let mut at = quote + 1;
+    for slot in &mut fields {
+        let start = at;
+        while at < data.len() && data[at].is_ascii_digit() {
+            at += 1;
+        }
+        *slot = parse_u32(&data[start..at]);
+        // `;` separates the attributes; anything else (`#`, `!`, `$`, `-`, or
+        // the end of the payload) starts the image data.
+        if at < data.len() && data[at] == b';' {
+            at += 1;
+        } else {
+            break;
+        }
+    }
 
-    let _pan = fields.next();
-    let _pad = fields.next();
-    match (fields.next(), fields.next()) {
+    match (fields[2], fields[3]) {
         (Some(width), Some(height)) if width > 0 && height > 0 => Footprint::Pixels(width, height),
         _ => Footprint::Unknown,
     }
@@ -1002,7 +1017,7 @@ mod tests {
     fn a_sixel_too_large_for_the_float_is_skipped() {
         let mut store = Store::new();
         // 1000x1000 pixels at the default 10x20 cell is 100x50 cells.
-        let sixel = b"\x1bPq\"1;1;1000;1000#0~~\x1b\\";
+        let sixel = b"\x1bPq\"1;1;1000;1000#0;2;0;0;0#0~~\x1b\\";
         assert!(matches!(
             store.ingest(Kind::Dcs, sixel, (0, 0), (80, 24)),
             Ingest::Stored
@@ -1026,6 +1041,23 @@ mod tests {
             store.ingest(Kind::Osc, download, (1, 2), (80, 24)),
             Ingest::Passthrough
         ));
+    }
+
+    #[test]
+    fn sixel_raster_attributes_end_at_the_first_command() {
+        // Real header: the height runs straight into the first colour command.
+        assert_eq!(
+            raster_attributes(b"q\"1;1;640;480#0;2;0;0;0#0~~"),
+            Footprint::Pixels(640, 480)
+        );
+        // A trailing `;` is tolerated; a missing fourth field is not guessed.
+        assert_eq!(
+            raster_attributes(b"q\"1;1;64;48;#0~~"),
+            Footprint::Pixels(64, 48)
+        );
+        assert_eq!(raster_attributes(b"q\"1;1;64~"), Footprint::Unknown);
+        assert_eq!(raster_attributes(b"q#0~~"), Footprint::Unknown);
+        assert_eq!(raster_attributes(b"q\"0;0;0;0#0~~"), Footprint::Unknown);
     }
 
     #[test]

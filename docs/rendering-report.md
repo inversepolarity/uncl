@@ -855,7 +855,7 @@ protocols that matter on a terminal that is not a sixel terminal.
 | 6 | `TERM`-level advertising: `UNCL_GRAPHICS=kitty,iterm2` for children, `--doctor` says what the tap carries | `src/app/term/caps.rs` |
 | 7 | Non-goals written down where users will find them | `readme.md` |
 
-**116 tests** (S2 shipped 83: +22 tap/store, +6 renderer, +5 window reports and
+**117 tests** (S2 shipped 83: +23 tap/store, +6 renderer, +5 window reports and
 cell size). No new dependencies.
 
 ### The five laws this stage is made of
@@ -953,14 +953,14 @@ Still **no Rust toolchain here**; S3 has not been compiled or run.
 * the kitty control-block grammar, `a=q` reply and `a=d,d=A` deletion were taken
   from kitty's own protocol description, and sixel's raster attributes from the
   `DECSDM`/sixel spec as implemented by `libsixel`/`chafa`;
-* 116 tests, 33 of which are new here: splitter ordering, chunk boundaries, split
+* 117 tests, 34 of which are new here: splitter ordering, chunk boundaries, split
   terminators, C1 forms, classification per protocol, chunk joining, deletion,
   bounds, anchor translation, and the renderer's three emission triggers.
 
 ### Manual acceptance script (S3 exit criteria)
 
 ```sh
-cargo test                       # 116 tests
+cargo test                       # 117 tests
 cargo build --release && ./target/release/uncl
 
 # 1. kitty graphics, no external tools needed: an 8x8 dark-red block, 8 cells wide.
@@ -1034,6 +1034,20 @@ Three invariants are now tests, because "some number" is not the requirement:
   (`window_reports_are_internally_consistent`);
 * a cell-size spec is either usable or ignored — `0x20` is *not* a cell size
   (`a_cell_size_spec_is_either_usable_or_ignored`).
+
+**One more bug fell out of the first `cargo test` run** — and it is worth writing
+down, because the test that caught it was written from the wrong idea of the
+format. `a_sixel_too_large_for_the_float_is_skipped` failed: a 1000x1000 sixel
+inside an 80x24 float was stored instead of skipped. The cause was in
+`raster_attributes`: real sixel writes `"1;1;640;480#0;2;0;0;0`, where the
+fourth number runs *straight into* the first `#` colour command with no `;`
+between them. Splitting on `;` glued `480#0` together, `parse_u32` rejected it,
+the height was lost, the footprint came back `Unknown`, and an unsized image was
+always assumed to fit. So the "too large" test was passing for the wrong reason
+on a fixture I had written in the same wrong shape. The parser now reads four
+numbers and stops at the first non-digit, a `sixel_raster_attributes_end_at_the_first_command`
+test pins the real header shape, and the fixture was corrected — which is the
+only way a fix like this stays fixed.
 
 The general lesson, worth carrying into S4: **every query we answer creates an
 obligation to answer its siblings.** The reply table in `callbacks.rs` is a

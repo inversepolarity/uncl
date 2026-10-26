@@ -502,7 +502,9 @@ impl Store {
         }
     }
 
-    fn ingest_apc(&mut self, bytes: &[u8], anchor: (u16, u16), area: (u16, u16)) -> Ingest {
+    /// `area` is only used by the protocols that cannot be scaled: kitty can be
+    /// asked to fit, so an oversized image is kept and shrunk at emit time.
+    fn ingest_apc(&mut self, bytes: &[u8], anchor: (u16, u16), _area: (u16, u16)) -> Ingest {
         // kitty graphics: `ESC _ G <controls> [; <payload>] ST`
         let Some(body) = payload_of(bytes, b"\x1b_G") else {
             return Ingest::Passthrough;
@@ -644,7 +646,9 @@ impl Store {
         Ingest::Stored
     }
 
-    fn ingest_osc(&mut self, bytes: &[u8], anchor: (u16, u16), area: (u16, u16)) -> Ingest {
+    /// `area` is unused here for the same reason as in `ingest_apc`: iTerm2 takes
+    /// a pixel box, so the size is negotiated when the image is emitted.
+    fn ingest_osc(&mut self, bytes: &[u8], anchor: (u16, u16), _area: (u16, u16)) -> Ingest {
         // iTerm2 inline image: `OSC 1337 ; File=<args> : <base64> BEL|ST`
         let Some(body) = payload_of(bytes, b"\x1b]") else {
             return Ingest::Passthrough;
@@ -1281,7 +1285,14 @@ mod tests {
         assert_eq!(controls.action, b'T');
         assert_eq!(controls.id, Some(7));
         assert_eq!(controls.placement, Some(2));
-        assert_eq!(controls.footprint(), Footprint::Cells(10, 4));
+        assert_eq!(controls.size(), Size::Cells(10, 4));
+
+        // With no `c=`/`r=` the sender is only asked for pixels, which kitty
+        // states as `s=`/`v=` — the fallback that makes fitting possible when a
+        // viewer leaves the cell box to the terminal.
+        let pixelated = KittyControls::parse(b"a=T,f=24,i=9,s=1920,v=1080;AAAA").unwrap();
+        assert_eq!(pixelated.size(), Size::Pixels(1920, 1080));
+        assert_eq!(KittyControls::parse(b"a=T,f=24,i=9;AAAA").unwrap().size(), Size::Unknown);
 
         let replay = String::from_utf8(controls.replay().unwrap()).unwrap();
         assert_eq!(

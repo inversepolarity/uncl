@@ -166,6 +166,11 @@ impl Container {
     pub fn new() -> Self {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
 
+        // Ask the host for its pixel geometry once, before any child can ask us
+        // for ours. Children that size images (and sixel, which only knows
+        // pixels) need it, and "no answer" makes them divide by zero.
+        crate::app::term::caps::probe_cell_px();
+
         let caps = Arc::new(Capabilities::from_env());
         let (host_tx, host_rx) = unbounded_channel::<Vec<u8>>();
         let (parser, parser_sink) = new_parser(caps.clone(), host_tx.clone());

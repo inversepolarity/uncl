@@ -48,6 +48,9 @@ fn run() -> Result<()> {
 
 /// What uncl tells its children about the terminal, and why.
 fn doctor() {
+    // Measure the tty first, so the report shows the cell size children would
+    // actually be given rather than the fallback.
+    app::term::caps::probe_cell_px();
     let caps = app::term::caps::Capabilities::from_env();
     println!("uncl {} — terminal capabilities\n", env!("CARGO_PKG_VERSION"));
     println!("{}", caps.summary());
@@ -56,8 +59,8 @@ fn doctor() {
         if caps.truecolor { "truecolor" } else { "<unset>" });
     println!();
     println!("notes:");
-    println!("  * host TERM is not passed through: images are not transported yet (S3),");
-    println!("    so a sixel/kitty claim would make children emit bytes we drop");
+    println!("  * host TERM is not passed through: a sixel/kitty TERM would make children");
+    println!("    emit bytes this layer may not transport; UNCL_GRAPHICS says what it does");
     println!("  * sixel is advertised only when the DCS tap is enabled (UNCL_SIXEL=1 + a");
     println!("    host known to render it); see docs/rendering-report.md");
     println!("  * kitty keyboard protocol is never advertised");

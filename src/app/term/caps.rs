@@ -17,6 +17,94 @@
 //!   timeout; silence is the bug this module exists to fix.
 
 use std::env;
+use std::sync::OnceLock;
+
+/// The cell size uncl falls back to, in pixels.
+///
+/// Nothing in the terminal protocol tells a program its cell size: the program
+/// has to ask (`CSI 16 t`), and the answer comes from whoever is pretending to
+/// be the terminal — us. So we have to have one: [`probe_cell_px`] measures the
+/// host's tty at startup when it can, `UNCL_CELL_PX=WxH` overrides it, and this
+/// is the last resort.
+///
+/// It matters twice:
+///
+/// * children that size images in pixels ask `CSI 16 t`; answering zero makes
+///   them divide by zero (`wezterm imgcat` panics on exactly that),
+/// * sixel only states its size in pixels, so this is what decides whether it
+///   could fit inside the float.
+pub const DEFAULT_CELL_PX: (u16, u16) = (10, 20);
+
+/// The cell size the host tty reported at startup, if it reported one.
+///
+/// `TIOCGWINSZ` carries the window's pixel size and most terminals fill it in
+/// (WezTerm, kitty, iTerm2, foot); the ones that do not leave it zero, which is
+/// what [`DEFAULT_CELL_PX`] is for.
+static PROBED_CELL_PX: OnceLock<(u16, u16)> = OnceLock::new();
+
+/// Ask the host tty for its window size in pixels and derive the cell size.
+///
+/// Called once, before any child exists. Costs one `ioctl` and cannot fail
+/// loudly: a terminal that does not answer leaves the assumption in place.
+pub fn probe_cell_px() {
+    let Ok(window) = crossterm::terminal::window_size() else {
+        return;
+    };
+    if window.columns == 0 || window.rows == 0 || window.width == 0 || window.height == 0 {
+        return;
+    }
+    // `WindowSize`'s pixel fields are `u16` (an ioctl `winsize` is), so this is
+    // integer division on small numbers; a terminal that reports nonsense gets a
+    // zero cell and is ignored below.
+    let cell_w = window.width / window.columns;
+    let cell_h = window.height / window.rows;
+    if cell_w > 0 && cell_h > 0 {
+        let _ = PROBED_CELL_PX.set((cell_w, cell_h));
+    }
+}
+
+/// The cell size in effect: `UNCL_CELL_PX=WxH`, else the measured one, else
+/// [`DEFAULT_CELL_PX`].
+///
+/// Never zero — a caller may divide by it, and we may be the one telling a
+/// child where to divide.
+pub fn cell_px() -> (u16, u16) {
+    if let Ok(spec) = env::var("UNCL_CELL_PX") {
+        if let Some(measured) = parse_cell_px(&spec) {
+            return measured;
+        }
+    }
+    PROBED_CELL_PX.get().copied().unwrap_or(DEFAULT_CELL_PX)
+}
+
+/// `"12x26"` (also `12,26`), or `None` for anything unusable — including a zero,
+/// because a zero cell size is precisely the answer that panics other people's
+/// programs.
+fn parse_cell_px(spec: &str) -> Option<(u16, u16)> {
+    let mut parts = spec
+        .split(['x', 'X', ','])
+        .filter_map(|part| part.trim().parse::<u16>().ok());
+    match (parts.next(), parts.next()) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
+        _ => None,
+    }
+}
+
+/// One word for where [`cell_px`] came from, for `--doctor`.
+fn cell_px_source() -> &'static str {
+    // Report what was actually used: a malformed spec falls through to the
+    // measured value, and the report should say so.
+    if env::var("UNCL_CELL_PX")
+        .ok()
+        .is_some_and(|spec| parse_cell_px(&spec).is_some())
+    {
+        "UNCL_CELL_PX"
+    } else if PROBED_CELL_PX.get().is_some() {
+        "measured"
+    } else {
+        "assumed"
+    }
+}
 
 /// Capabilities of the *host* terminal, as far as uncl is willing to relay them.
 #[derive(Clone, Debug)]
@@ -113,10 +201,11 @@ impl Capabilities {
 
     /// Apply the environment children should see.
     ///
-    /// `TERM` is *not* inherited: we cannot transport images yet (S3), so
-    /// claiming `xterm-kitty` or a sixel-capable `TERM` would make children emit
-    /// bytes this layer drops. `COLORTERM` is inherited because 24-bit colour
-    /// survives our own re-encoding intact.
+    /// `TERM` is *not* inherited: `xterm-256color` is the honest description of
+    /// what uncl implements, and a `TERM` of `xterm-kitty` or a sixel-capable
+    /// `TERM` would make children emit bytes this layer may not transport.
+    /// `COLORTERM` is inherited because 24-bit colour survives our own
+    /// re-encoding intact, and `UNCL_GRAPHICS` says what the S3 tap carries.
     pub fn apply_child_env(&self, cmd: &mut portable_pty::CommandBuilder) {
         cmd.env("TERM", "xterm-256color");
         if self.truecolor {
@@ -137,7 +226,7 @@ impl Capabilities {
     /// A few lines for `uncl doctor`.
     pub fn summary(&self) -> String {
         format!(
-            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)",
+            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)\n  cell size: {}x{} px ({}), reported to children as CSI 16t (UNCL_CELL_PX)",
             if self.term.is_empty() { "<unset>" } else { &self.term },
             self.term_program.as_deref().unwrap_or("<unset>"),
             self.colorterm.as_deref().unwrap_or("<unset>"),
@@ -146,6 +235,9 @@ impl Capabilities {
             self.kitty_graphics,
             self.kitty_keyboard,
             if self.sixel { "advertised" } else { "not advertised" },
+            cell_px().0,
+            cell_px().1,
+            cell_px_source(),
         )
     }
 }
@@ -231,6 +323,25 @@ mod tests {
     #[test]
     fn da2_is_a_well_formed_reply() {
         assert_eq!(caps(false).da2(), b"\x1b[>0;1;0c".to_vec());
+    }
+
+    #[test]
+    fn a_cell_size_spec_is_either_usable_or_ignored() {
+        assert_eq!(parse_cell_px("12x26"), Some((12, 26)));
+        assert_eq!(parse_cell_px("12,26"), Some((12, 26)));
+        assert_eq!(parse_cell_px(" 12 X 26 "), Some((12, 26)));
+        // Never zero: a zero cell size is what makes a child divide by zero.
+        assert_eq!(parse_cell_px("0x26"), None);
+        assert_eq!(parse_cell_px("12x0"), None);
+        assert_eq!(parse_cell_px("12"), None);
+        assert_eq!(parse_cell_px("auto"), None);
+        assert_eq!(parse_cell_px(""), None);
+    }
+
+    #[test]
+    fn the_fallback_cell_size_is_never_zero() {
+        let (width, height) = DEFAULT_CELL_PX;
+        assert!(width > 0 && height > 0);
     }
 
     #[test]

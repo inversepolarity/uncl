@@ -34,6 +34,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::app::term::caps::cell_px;
+
 /// Sequence numbers are global and monotonic, so a renderer keeps working across
 /// a float restart: a new child's first image is always "newer" than anything the
 /// previous one drew.
@@ -542,25 +544,6 @@ enum Footprint {
     Unknown,
     Cells(u16, u16),
     Pixels(u32, u32),
-}
-
-/// Cell size in pixels, for protocols that only talk in pixels.
-///
-/// uncl cannot ask the terminal (that needs a reply probe we do not run), so this
-/// is an assumption: `UNCL_CELL_PX=WxH`, defaulting to a 10x20 cell. It is only
-/// ever used to decide whether an image *could* fit; the terminal does the
-/// drawing.
-fn cell_px() -> (u16, u16) {
-    let Ok(spec) = std::env::var("UNCL_CELL_PX") else {
-        return (10, 20);
-    };
-    let mut parts = spec
-        .split(['x', 'X', ','])
-        .filter_map(|part| part.parse::<u16>().ok());
-    match (parts.next(), parts.next()) {
-        (Some(width), Some(height)) if width > 0 && height > 0 => (width, height),
-        _ => (10, 20),
-    }
 }
 
 /// The bytes between an introducer and its terminator.

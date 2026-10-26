@@ -33,7 +33,8 @@ whatever your terminal can do:
 - sixel is opt-in (`UNCL_SIXEL=1`) and only on a terminal that can draw it.
 - an image wider than the float is not cropped: it is drawn from its cell and
   your terminal clips it at the screen edge, so it may overlap the border. (uncl
-  does not know your cell size in pixels unless you tell it: `UNCL_CELL_PX=WxH`.)
+  measures your cell size from the tty at startup and reports it to children;
+  `UNCL_CELL_PX=WxH` overrides the measurement, `uncl --doctor` prints it.)
 - sixel images larger than the float are skipped, once, with a note on stderr.
 - no animation, no alpha, no scaling, no re-encoding.
 - the background shell's images are not carried through - only the float's.

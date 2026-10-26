@@ -23,7 +23,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc::UnboundedSender;
 use vt100::{Callbacks, Screen};
 
-use super::caps::{ANSI_PALETTE, Capabilities, DEFAULT_BG, DEFAULT_FG, rgb_spec};
+use super::caps::{ANSI_PALETTE, Capabilities, DEFAULT_BG, DEFAULT_FG, cell_px, rgb_spec};
 
 /// Write half of a child's pty, installed once the pty writer exists.
 ///
@@ -180,18 +180,49 @@ pub fn reply_for_csi(
             Some(format!("\x1b[?{};{}R", row + 1, col + 1).into_bytes())
         }
 
-        // Window size in characters (CSI 18 t).
-        (None, 't') if first == Some(18) => {
-            let (rows, cols) = screen.size();
-            Some(format!("\x1b[8;{};{}t", rows.get(), cols.get()).into_bytes())
-        }
+        // Window reports (CSI n t). A child asking for geometry is asking *us*,
+        // because we are its terminal — so every one of these has to be answered
+        // consistently and none of the numbers may be zero.
+        //
+        // Zero is not a harmless placeholder here: `wezterm imgcat` asks for the
+        // text area (`18t`) and the cell size (`16t`), and divides by the cell
+        // size to turn pixels into cells. With `16t` unanswered it panicked with
+        // "attempt to divide by zero" inside the float.
+        (None, 't') => window_report(screen, first),
 
-        // Text area size in characters (CSI 19 t) is not answerable without a
-        // pixel size, and `XTSMGRAPHICS` (`CSI ? … S`) is answered by DA1
-        // attribute 4 instead, so children that ask for sixel geometry fall back
-        // to what we advertised.
+        // `XTSMGRAPHICS` (`CSI ? … S`) is answered by DA1 attribute 4 instead,
+        // so children that ask for sixel geometry fall back to what we
+        // advertised.
         _ => None,
     }
+}
+
+/// Answer a `CSI n t` window report, or `None` for the ones we cannot know.
+///
+/// The replies are derived from one pair of numbers — the child's grid and
+/// [`cell_px`] — so a tool that cross-checks them (text area in cells times cell
+/// size equals text area in pixels) gets a consistent story.
+fn window_report(screen: &Screen, first: Option<u16>) -> Option<Vec<u8>> {
+    let (rows, cols) = screen.size();
+    let (cell_w, cell_h) = cell_px();
+
+    // Pixel area, clamped: these are u16 fields in the reply and an 8K-wide
+    // terminal at 30px a cell would overflow before it could reach the wire.
+    let pixel_width = (u32::from(cols.get()) * u32::from(cell_w)).min(u32::from(u16::MAX));
+    let pixel_height = (u32::from(rows.get()) * u32::from(cell_h)).min(u32::from(u16::MAX));
+
+    // Every reply is `CSI <code> ; height ; width t` — height first, which is
+    // the opposite of how it reads.
+    let (code, height, width) = match first? {
+        14 => (4, pixel_height, pixel_width),          // text area, pixels
+        15 => (5, pixel_height, pixel_width),          // screen, pixels
+        16 => (6, u32::from(cell_h), u32::from(cell_w)), // one cell, pixels
+        18 => (8, u32::from(rows.get()), u32::from(cols.get())), // text area, cells
+        19 => (9, u32::from(rows.get()), u32::from(cols.get())), // screen, cells
+        _ => return None,
+    };
+
+    Some(format!("\x1b[{code};{height};{width}t").into_bytes())
 }
 
 /// Build the reply to an OSC sequence `vt100` did not handle.
@@ -273,12 +304,79 @@ mod tests {
     }
 
     #[test]
+    fn answers_the_cell_size() {
+        // `wezterm imgcat` divides by this: a silent `16t` is a divide by zero
+        // in the child, which is what this test exists to prevent.
+        let parser = parser();
+        let screen = parser.screen().clone();
+        let reply = reply_for_csi(&screen, &caps(), None, None, &[&[16u16][..]], 't').unwrap();
+        let (cell_w, cell_h) = cell_px();
+        assert_eq!(reply, format!("\x1b[6;{cell_h};{cell_w}t").into_bytes());
+    }
+
+    #[test]
+    fn window_reports_are_internally_consistent() {
+        // A 4-row, 20-column child. The cell size is whatever this machine
+        // reports (`UNCL_CELL_PX` in the environment would legitimately change
+        // it), so the expectations are derived from the same source.
+        let (cell_w, cell_h) = cell_px();
+        let (rows, cols) = (4u32, 20u32);
+
+        let parser = parser();
+        let screen = parser.screen().clone();
+        let ask = |code: u16| {
+            reply_for_csi(&screen, &caps(), None, None, &[&[code][..]], 't')
+                .map(|reply| String::from_utf8(reply).unwrap())
+        };
+
+        assert_eq!(ask(18).unwrap(), format!("\x1b[8;{rows};{cols}t"));
+        assert_eq!(ask(19).unwrap(), format!("\x1b[9;{rows};{cols}t"));
+        assert_eq!(
+            ask(14).unwrap(),
+            format!("\x1b[4;{};{}t", rows * u32::from(cell_h), cols * u32::from(cell_w))
+        );
+        assert_eq!(
+            ask(15).unwrap(),
+            format!("\x1b[5;{};{}t", rows * u32::from(cell_h), cols * u32::from(cell_w))
+        );
+        assert_eq!(ask(16).unwrap(), format!("\x1b[6;{cell_h};{cell_w}t"));
+
+        // The cross-check the terminal protocol promises: the pixel report is
+        // exactly the cell report multiplied by the cell size.
+        let pixel_area: Vec<u32> = ask(14).unwrap()[2..].trim_end_matches('t')
+            .split(';').skip(1).map(|f| f.parse().unwrap()).collect();
+        assert_eq!(pixel_area, vec![rows * u32::from(cell_h), cols * u32::from(cell_w)]);
+    }
+
+    #[test]
+    fn no_window_report_is_ever_zero() {
+        // Whatever the environment says, a zero dimension must never reach a
+        // child: that is the shape of the bug this whole report exists for.
+        for code in [14u16, 15, 16, 18, 19] {
+            let parser = parser();
+            let screen = parser.screen().clone();
+            let reply = reply_for_csi(&screen, &caps(), None, None, &[&[code][..]], 't').unwrap();
+            let text = String::from_utf8(reply).unwrap();
+            let numbers: Vec<u32> = text[2..text.len() - 1]
+                .split(';')
+                .filter_map(|field| field.parse().ok())
+                .collect();
+            assert!(
+                numbers.iter().all(|value| *value > 0),
+                "code {code} answered {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn stays_silent_about_things_it_cannot_answer() {
         let parser = parser();
         let screen = parser.screen().clone();
         assert!(reply_for_csi(&screen, &caps(), Some(b'?'), None, &[&[1u16][..], &[0u16][..]], 'S').is_none());
         assert!(reply_for_csi(&screen, &caps(), Some(b'?'), None, &[&[0u16][..]], 'u').is_none());
-        assert!(reply_for_csi(&screen, &caps(), None, None, &[&[14u16][..]], 't').is_none());
+        // Window *title* reports are the host's business, not ours.
+        assert!(reply_for_csi(&screen, &caps(), None, None, &[&[20u16][..]], 't').is_none());
+        assert!(reply_for_csi(&screen, &caps(), None, None, &[&[21u16][..]], 't').is_none());
     }
 
     #[test]

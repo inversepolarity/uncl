@@ -855,7 +855,8 @@ protocols that matter on a terminal that is not a sixel terminal.
 | 6 | `TERM`-level advertising: `UNCL_GRAPHICS=kitty,iterm2` for children, `--doctor` says what the tap carries | `src/app/term/caps.rs` |
 | 7 | Non-goals written down where users will find them | `readme.md` |
 
-**111 tests** (S2 shipped 83: +22 tap/store, +6 renderer). No new dependencies.
+**116 tests** (S2 shipped 83: +22 tap/store, +6 renderer, +5 window reports and
+cell size). No new dependencies.
 
 ### The five laws this stage is made of
 
@@ -906,14 +907,17 @@ protocols that matter on a terminal that is not a sixel terminal.
   has **no sixel at all** (`uncl --doctor`: `sixel=false kitty_graphics=true`), and
   `wezterm imgcat` is the shortest path to a user seeing an image today.
 - **No source-rect cropping.** §6.4's kitty crop (`x,y,w,h` in *pixels*) needs the
-  cell size in pixels, which needs a host probe (`CSI 16 t`) we do not run. An
+  cell size in pixels. We do have one (see `probe_cell_px`, below), but cropping
+  would mean rewriting a sender's payload, and passthrough is the rule. An
   oversized image therefore overlaps the border instead of being cropped — a
   documented compromise, and the child's own crop parameters are still passed
   through verbatim.
-- **The "does it fit" test is an assumption, not a measurement.** sixel only states
-  its size in pixels, so `UNCL_CELL_PX` (default `10x20`) is used to convert. It
-  only ever decides *skip*: the terminal does the drawing. Kitty's `c=`/`r=` are
-  used when the sender provides them, and unknown footprints are drawn.
+- **The "does it fit" test is an estimate, not a measurement.** sixel only states
+  its size in pixels, so the cell size has to be assumed: measured from the host
+  tty at startup (`TIOCGWINSZ`), overridable with `UNCL_CELL_PX`, falling back to
+  `10x20`. It only ever decides *skip*: the terminal does the drawing. Kitty's
+  `c=`/`r=` are used when the sender provides them, and unknown footprints are
+  drawn.
 - **The capability probe is a reply, not a query.** Rather than interrogating the
   host at startup, the tap answers kitty's `a=q` from the child's own pty (that is
   the probe graphics-aware senders actually use) and advertises
@@ -933,7 +937,9 @@ protocols that matter on a terminal that is not a sixel terminal.
   of travelling with the text. Doing it properly means tracking the grid's scroll
   deltas, which `vt100` does not expose — that is an S4 (`alacritty_terminal`)
   feature, not a cheap one.
-- **A cell-size probe** and therefore real cropping (above).
+- **Real cropping** (above). The cell size itself *is* probed now — see the S3.1
+  section at the end of this appendix — but only for reporting and for the
+  fit test.
 - **A `--doctor` self-test** that emits a sample image; the acceptance script below
   does that in three lines instead.
 
@@ -947,14 +953,14 @@ Still **no Rust toolchain here**; S3 has not been compiled or run.
 * the kitty control-block grammar, `a=q` reply and `a=d,d=A` deletion were taken
   from kitty's own protocol description, and sixel's raster attributes from the
   `DECSDM`/sixel spec as implemented by `libsixel`/`chafa`;
-* 111 tests, 28 of which are new here: splitter ordering, chunk boundaries, split
+* 116 tests, 33 of which are new here: splitter ordering, chunk boundaries, split
   terminators, C1 forms, classification per protocol, chunk joining, deletion,
   bounds, anchor translation, and the renderer's three emission triggers.
 
 ### Manual acceptance script (S3 exit criteria)
 
 ```sh
-cargo test                       # 111 tests
+cargo test                       # 116 tests
 cargo build --release && ./target/release/uncl
 
 # 1. kitty graphics, no external tools needed: an 8x8 dark-red block, 8 cells wide.
@@ -977,10 +983,64 @@ chafa --format=sixel -s 30x15 some.png      # sixel path (needs UNCL_SIXEL=1)
 # 4. Home twice → the image disappears with the float and returns with it.
 # 5. run the image command again in a scrolling TUI (e.g. `less some.png` via
 #    chafa's sixel/kitty output) → no stale image left behind on the owner screen.
-# 6. `uncl --doctor` → "image tap: kitty + iTerm2 always, sixel not advertised".
+# 6. `uncl --doctor` → "image tap: kitty + iTerm2 always, sixel not advertised"
+#    and a `cell size: WxH px (measured|assumed|UNCL_CELL_PX)` line.
 # 7. `UNCL_SIXEL=1 uncl --doctor` → sixel advertised, and a full-screen sixel is
 #    skipped once with "uncl: sixel image is larger than the float; skipping".
 ```
+
+### S3.1 — `wezterm imgcat` panicked: the bug the first real image found
+
+Reported from a WezTerm host, immediately after S3 shipped:
+
+```
+$ wezterm imgcat uncl.png
+ERROR env_bootstrap > panic at wezterm/src/main.rs:383:10
+attempt to divide by zero
+  7: wezterm::ImgCatCommand::compute_image_cell_dimensions
+```
+
+S3 had made the *bytes* survive; it had not made the child believe it could draw
+them. `imgcat` builds the iTerm2 sequence by measuring the terminal first
+(`wezterm/src/main.rs` → `compute_image_cell_dimensions`):
+
+1. `probe.screen_size()` writes `CSI 18 t` (text area in **cells**) and `CSI 16 t`
+   (one cell in **pixels**), then `CSI c` (primary DA) to end the read;
+2. it divides the image's pixel size by `term_size.xpixel` / `ypixel` to get a
+   cell footprint — `(width / cell_pixel_width, height / cell_pixel_height)`;
+3. it bails out with `no size information available` only if **rows and cols are
+   both zero**.
+
+We answered `18 t` (it is in S1's reply table) and nothing else. So termwiz saw a
+usable size in cells, believed the probe had succeeded, and left the cell pixel
+size at its initialised `0` — one division later, the child panicked. The panic
+is in the child, but the missing reply is ours: **a terminal that answers half of
+a compound query is worse than one that answers none**, because the half it
+answers is what convinces the caller it has everything.
+
+Fixes, in the order that matters:
+
+| # | Change |
+|---|---|
+| 1 | `CSI 16 t` is answered — the cell size in pixels, `CSI 6 ; <height> ; <width> t`. This is the one that stops the panic. |
+| 2 | `CSI 14 t` / `15 t` (text area / screen in pixels) and `CSI 19 t` (screen in cells) are answered too, all derived from the same pair of numbers, so a tool that cross-checks them gets a consistent story. |
+| 3 | The cell size is **measured** at startup instead of assumed: `caps::probe_cell_px()` reads the host tty's `TIOCGWINSZ` (via `crossterm::terminal::window_size()`, which is what `wezterm imgcat`'s own producer reports) and divides pixels by cells. `UNCL_CELL_PX=WxH` still overrides, and `DEFAULT_CELL_PX` (10x20) is the last resort. One `ioctl`, no protocol round-trip, no blocking read. |
+| 4 | `--doctor` says where the number came from: `cell size: 10x20 px (measured)`, so a wrong image size is one command away from being explained. |
+
+Three invariants are now tests, because "some number" is not the requirement:
+
+* no window report may contain a zero in any field (`no_window_report_is_ever_zero`);
+* cells × cell size == the pixel report for the same area
+  (`window_reports_are_internally_consistent`);
+* a cell-size spec is either usable or ignored — `0x20` is *not* a cell size
+  (`a_cell_size_spec_is_either_usable_or_ignored`).
+
+The general lesson, worth carrying into S4: **every query we answer creates an
+obligation to answer its siblings.** The reply table in `callbacks.rs` is a
+contract with every terminal application in existence, and the failure mode of a
+partial table is not "the app degrades", it is "the app trusts the half-answer and
+divides by zero". §6.5's fidelity table should eventually be read the same way: a
+capability we claim is a promise about the ones next to it.
 
 ### Where S3 leaves the plan
 

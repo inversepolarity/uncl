@@ -364,20 +364,38 @@ impl Container {
         let mut redraw = true;
 
         loop {
-            if redraw {
+            // 1. Housekeeping first, so a child flooding output cannot starve
+            //    exit detection (all three checks are non-blocking).
+            if self.lease.poll_exit() {
+                self.lease.tenant_visible = false;
+                redraw = true;
+            }
+
+            if let Some(session) = self.session.as_mut() {
+                match session.exited.try_recv() {
+                    Ok(()) | Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+
+            if self.lease.expired() {
+                self.lease = self.lease.renew();
+                self.init_tenant()?;
+                redraw = true;
+            }
+
+            // 2. Paint only when something actually changed: the grid moved on
+            //    (reader signal) or the pane layout/visibility did.
+            let parsed = signal.take();
+            if redraw || parsed {
                 self.draw(terminal)?;
                 redraw = false;
             }
 
-            // Bytes may have landed while we were painting.
-            if signal.take() {
-                redraw = true;
-                continue;
-            }
-
-            // No `biased;` on purpose: input must not be able to starve
-            // repaints (a paste flood) nor repaints starve input (a child
-            // flooding output), and both arms are cheap and resumable.
+            // 3. Sleep until there is work, never on a fixed frame timer.
+            //    No `biased;` on purpose: input must not be able to starve
+            //    repaints (a paste flood) nor repaints starve input (a child
+            //    flooding output); both arms are cheap and resumable.
             tokio::select! {
                 maybe_event = input_rx.recv() => {
                     let Some(first) = maybe_event else {
@@ -392,7 +410,7 @@ impl Container {
                     }
 
                     // Drain whatever else is already queued, so a paste or a
-                    // mouse drag does not take one frame per event.
+                    // mouse drag does not cost one frame per event.
                     let mut budget = INPUT_DRAIN_BUDGET;
                     while budget > 0 {
                         match input_rx.try_recv() {
@@ -410,33 +428,15 @@ impl Container {
                 }
 
                 _ = signal.changed() => {
-                    // Consume the flag here: the paint below already sees every
-                    // byte that was parsed before this point, so leaving it set
-                    // would cost a second, identical frame.
+                    // Consume the flag here: the paint at the top of the next
+                    // iteration already sees every byte parsed before this
+                    // point, so leaving it set would cost a second, identical
+                    // frame.
                     signal.take();
                     redraw = true;
                 }
 
                 _ = ticker.tick() => {}
-            }
-
-            // Child lifecycle (cheap, non-blocking; covers both panes).
-            if self.lease.poll_exit() {
-                self.lease.tenant_visible = false;
-                redraw = true;
-            }
-
-            if let Some(session) = self.session.as_mut() {
-                match session.exited.try_recv() {
-                    Ok(()) | Err(TryRecvError::Disconnected) => break,
-                    Err(TryRecvError::Empty) => {}
-                }
-            }
-
-            if self.lease.expired() {
-                self.lease = self.lease.renew();
-                self.init_tenant()?;
-                redraw = true;
             }
         }
 

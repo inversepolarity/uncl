@@ -60,11 +60,6 @@ impl Link {
         (self.start, self.end)
     }
 
-    /// The URI, as the child wrote it.
-    pub fn target(&self) -> &[u8] {
-        &self.target
-    }
-
     /// The opening sequence, ready to write before the span's cells.
     pub fn open(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.params.len() + self.target.len() + 8);
@@ -260,7 +255,6 @@ mod tests {
         let link = &links.links[0];
         assert_eq!(link.row(), 0);
         assert_eq!(link.span(), (0, 8));
-        assert_eq!(link.target(), b"https://example.com");
         assert_eq!(
             link.open(),
             b"\x1b]8;;https://example.com\x1b\\".to_vec()
@@ -369,7 +363,10 @@ mod tests {
 
         let snapshot = shared.snapshot();
         assert_eq!(snapshot.links.len(), 1);
-        assert_eq!(snapshot.links[0].target(), b"https://example.com");
+        assert_eq!(
+            snapshot.links[0].open(),
+            b"\x1b]8;;https://example.com\x1b\\".to_vec()
+        );
         // And an empty store costs nothing to snapshot: no allocation at all.
         assert!(SharedLinks::new().snapshot().is_empty());
     }

@@ -170,9 +170,11 @@ impl Renderer {
         // A row that gained a hyperlink has to be repainted even when its cells
         // did not change: the link is not part of the cell, so the diff cannot
         // see it.
-        for row in links.owner.rows() {
-            if row < owner_area.height && !owner_rows.contains(&row) {
-                owner_rows.push(row);
+        if !links.owner.is_empty() {
+            for row in links.owner.rows() {
+                if row < owner_area.height && !owner_rows.contains(&row) {
+                    owner_rows.push(row);
+                }
             }
         }
 

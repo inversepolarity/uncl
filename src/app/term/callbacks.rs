@@ -511,9 +511,10 @@ mod tests {
         callbacks.unhandled_osc(parser.screen_mut(), &[&b"8"[..], &b""[..], &b""[..]]);
 
         let links = state.links().snapshot();
-        assert_eq!(links.for_row(parser.screen(), 0).len(), 1);
-        assert_eq!(links.for_row(parser.screen(), 0)[0].span(), (0, 4));
-        assert_eq!(links.for_row(parser.screen(), 0)[0].target(), b"https://x");
+        let found = links.for_row(parser.screen(), 0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].span(), (0, 4));
+        assert_eq!(found[0].open(), b"\x1b]8;;https://x\x1b\\".to_vec());
     }
 
     #[test]

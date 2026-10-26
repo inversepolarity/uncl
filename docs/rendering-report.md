@@ -186,7 +186,7 @@ Two consequences worth internalising:
 
 | Candidate | LOC | Why |
 |---|---|---|
-| `tui-term`'s `vt100_imp.rs` (adapter) | 123 | Lets you pin `vt100 0.18` today. `tui-term 0.3.4` requires `vt100 = 0.16.2` and `ratatui-core 0.1` (i.e. ratatui 0.30.2), so you *cannot* upgrade `vt100` without either vendoring this file or patching the dependency. Copy it into `src/app/ui/adapter.rs` and delete `tui-term`. |
+| `tui-term`'s `vt100_imp.rs` (adapter) | 123 | Lets you drop `tui-term` and pin `vt100 0.18` — **but only together with `ratatui 0.30`**: 0.29 pins `unicode-width` exactly, which makes every `vt100` ≥ 0.16 unresolvable (Appendix C). Copy it into `src/app/ui/adapter.rs`, bump ratatui, delete `tui-term`. |
 | `vt100` patch: forward `hook/put/unhook` to `Callbacks` | ~25 | Upstreamable; unlocks sixel/tmux passthrough with the engine you already have. Otherwise use the side-tap in §6.4. |
 | alacritty's `input/keyboard.rs` (key → sequence, mode-aware) | ~600 | Only if you adopt `alacritty_terminal`. It is the best-tested implementation of application-cursor / keypad / kitty-keyboard encoding. |
 | `alacritty_terminal` itself (dependency, not vendoring) | 11.7k | Apache-2.0 is fine for an MIT project with attribution/NOTICE, but note the licence asymmetry for a "vendored" copy. |
@@ -417,7 +417,7 @@ Mechanics, if it is ever picked up: detect `?1049h`/`?47h` on the child (`vt100`
 
 | S0 item | Change | Where |
 |---|---|---|
-| 1 | `vt100` pinned to 0.18.1; its cell→buffer mapping vendored (123 LOC, MIT); `PseudoTerminal` reimplemented against `ratatui::Buffer`; `tui-term` removed | `Cargo.toml`, `src/app/ui/adapter.rs`, `src/app/ui/widget.rs` |
+| 1 | `vt100` pinned to 0.18.1; its cell→buffer mapping vendored (123 LOC, MIT); `PseudoTerminal` reimplemented against `ratatui::Buffer`; `tui-term` removed. **This forced `ratatui` 0.29 → 0.30.2 as well** — see "the pin that blocked S0" below | `Cargo.toml`, `src/app/ui/adapter.rs`, `src/app/ui/widget.rs` |
 | 2 | The byte-sniffing block is **deleted**. Mouse gating, bracketed paste and cursor visibility are read from the parser (`mouse_protocol_mode()`, `bracketed_paste()`, `hide_cursor()`), so a sequence split across reads can no longer desynchronise anything | `owner.rs::forward_mouse`, `owner.rs::forward_paste`, `widget.rs` |
 | 3 | Input moved to a dedicated blocking pump thread; the loop drains up to 512 queued events per iteration instead of one per 10 ms | `owner.rs::spawn_input_pump`, `owner.rs::handle_event` |
 | 4 | One coalescing writer per pane: unbounded channel, up to 64 KiB joined into a single `write_all` + `flush`; every `send().await.unwrap()` is gone | `src/app/pty.rs` (new) |
@@ -426,6 +426,33 @@ Mechanics, if it is ever picked up: detect `?1049h`/`?47h` on the child (`vt100`
 Folded in because they were one-liners on the same code paths (and were on the bug list): the tenant no longer toggles raw mode or builds a throwaway `Terminal`/`Screen`; its grid is sized to the same number the PTY is told; `crossterm::terminal::size()` is no longer called per input event; the mouse resize path uses saturating arithmetic (it could panic on a tiny terminal); `KeyEventKind::Press` is enforced (Windows sent press+release, so every key fired twice); bracketed paste is enabled on the host and `Event::Paste` is forwarded as one write.
 
 Also new: a shared `pty::spawn()` used by both panes (`src/app/pty.rs`), so owner and tenant can no longer drift apart in how they wire readers, writers, resizes and exit detection.
+
+### The pin that blocked S0 (and corrects §5 of this report)
+
+The first build failed to resolve:
+
+```
+error: failed to select a version for `unicode-width`
+  required by package `vt100 v0.18.1`        (^0.2.2)
+  previously selected `unicode-width v0.2.0` by `ratatui v0.29.0` (=0.2.0)
+```
+
+`ratatui 0.29` **exactly pins** `unicode-width = "=0.2.0"` (upstream does this deliberately, see ratatui issue #1271), while every `vt100` ≥ 0.16 requires `unicode-width = "0.2.1"` (0.16.2) or `"0.2.2"` (0.17+). The two ranges are disjoint, and because 0.2.x is semver-compatible cargo will not keep both copies — it errors instead.
+
+Consequences, all of which were verified against the crates' own manifests:
+
+- The vendored adapter alone (as §5 of this report originally recommended) does **not** make `vt100 0.18` reachable; the UI toolkit has to move too.
+- No `vt100` from 0.16 to 0.18 works with `ratatui 0.29`. The only way to keep ratatui 0.29 is `vt100 0.15.2` — i.e. giving up callbacks and mode getters, which was the entire point of S0.
+- `ratatui 0.30` relaxed the pin to `unicode-width = ">=0.2.0"`, so **0.30.x + vt100 0.18.x** resolves.
+
+Fix applied: `ratatui = "0.30.2"` (and `crossterm = "0.29"` to match the version ratatui's own backend uses, avoiding two crossterm copies in the tree). The only source change 0.30 required was the block title: `title_position(Bottom)` + `title_alignment(Right)` became `title_bottom(Line::…right_aligned())`. Everything else we touch (`Buffer::{empty, cell, cell_mut, area}`, `Cell::{symbol, set_symbol, style, set_style}`, `Style::{new, reset, patch}`, `Frame::render_widget`, `Terminal::{new, clear, draw}`, `widgets::{Block, Borders, BorderType, Clear, Widget}`, `backend::CrosstermBackend`) is unchanged in path and signature.
+
+Two side effects worth recording:
+
+- **MSRV is now 1.88** (ratatui 0.30's `rust-version`); `vt100` needs 1.85 and the crate itself is edition 2024. `rustup update stable` covers it.
+- This is a bump we plan to delete: S2 removes `ratatui`/`crossterm` from the tree entirely (§6.3), which also removes the whole `unicode-width` constraint class. It is plumbing, not architecture.
+
+An alternative we did *not* take: keeping `ratatui 0.29` + `vt100 0.15.2` and running a second `vte` parser in parallel to recover mouse/paste/cursor modes (~120 LOC). It avoids the dependency bump but keeps every 0.17/0.18 parser fix out — including the xterm-compatible `set_size` that the float needs most, since it is resized constantly.
 
 ### Deliberately *not* in S0 (they are S1)
 
@@ -439,9 +466,9 @@ Also new: a shared `pty::spawn()` used by both panes (`src/app/pty.rs`), so owne
 There is **no Rust toolchain in the environment this was written in** (crates.io, static.rust-lang.org and the Debian/Ubuntu archives are all outside the sandbox allowlist; `apt` has no working index). So:
 
 - ✅ All 14 source files parse cleanly under tree-sitter-rust (no `ERROR`/missing nodes).
-- ✅ Every external API call was checked against the actual sources of `vt100` 0.18.1, `crossterm` 0.27.0 and `ratatui` 0.29.0 (`Buffer::{cell, cell_mut, empty}`, `Style::patch`, `Cell::{symbol, style, set_symbol, set_style}`, `Frame::render_widget`, `Terminal::try_draw`'s autoresize, `KeyEventKind`, `Event::Paste`, `MouseEvent: Copy`, `Parser::new(NonZeroU16, …)`, `Screen::{mouse_protocol_mode, bracketed_paste, hide_cursor, cursor_position, cell}`, `Callbacks`).
+- ✅ Every external API call was checked against the actual sources of `vt100` 0.18.1, `crossterm` 0.29.0 and `ratatui` 0.30.2 (`Buffer::{cell, cell_mut, empty}`, `Style::patch`, `Cell::{symbol, style, set_symbol, set_style}`, `Frame::render_widget`, `Terminal::try_draw`'s autoresize, `KeyEventKind`, `Event::Paste`, `MouseEvent: Copy`, `Parser::new(NonZeroU16, …)`, `Screen::{mouse_protocol_mode, bracketed_paste, hide_cursor, cursor_position, cell}`, `Callbacks`).
 - ❌ **Not compiled.** Expect a handful of borrow-checker or clippy nits on first build; the risky spots are the `select!` arm bodies (they call `&mut self` while the futures borrow only locals) and `pty::spawn`'s partial move of `PtyPair`.
-- ⚠️ `Cargo.lock` was not regenerated (no cargo here): it still lists `tui-term` and `vt100 0.15.2`. `cargo build` will rewrite it; the dependency graph change is `−tui-term −vt100 0.15 −vte 0.11`, `+vt100 0.18.1 +vte 0.15`.
+- ⚠️ `Cargo.lock` was not regenerated (no cargo here): it still lists `tui-term`, `vt100 0.15.2` and `ratatui 0.29.0`. `cargo build` rewrites it; the graph change is `−tui-term −vt100 0.15 −vte 0.11 −ratatui 0.29 (−its ratatui-crossterm/crossterm 0.28 chain)`, `+vt100 0.18.1 +vte 0.15 +ratatui 0.30.2 (+ratatui-core/widgets/crossterm)`, and `unicode-width` moves 0.2.0 → 0.2.2.
 
 First commands on a machine with a toolchain:
 

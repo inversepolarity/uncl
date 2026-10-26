@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-crossterm = "0.27"
-ratatui = "0.29"
+# 0.29 pins `unicode-width = "=0.2.0"`, which makes every `vt100` >= 0.16
+# unresolvable (they need >= 0.2.1). 0.30 relaxed that pin to `>=0.2.0`, so the
+# parser upgrade and the UI toolkit can coexist. ratatui disappears entirely in
+# S2 (docs/rendering-report.md §6.3), so this bump is temporary plumbing.
+crossterm = "0.29"
+ratatui = "0.30.2"
 portable-pty = "0.8.1"
 anyhow = "1.0.98"
 # pinned to the version that exposes parser callbacks + terminal modes, so we

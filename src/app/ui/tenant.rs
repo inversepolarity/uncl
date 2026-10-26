@@ -11,7 +11,8 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Style},
-    widgets::{Block, Borders, block::Position},
+    text::Line,
+    widgets::{Block, Borders},
 };
 
 use portable_pty::CommandBuilder;
@@ -87,13 +88,13 @@ impl Overlay {
 
     pub fn render(&mut self, f: &mut Frame, screen: &Screen) {
         let (rows, cols) = self.content_size();
+        // ratatui 0.30 dropped `title_alignment`: the title carries its own
+        // alignment now, and `title_bottom` replaces `title_position(Bottom)`.
         let block = Block::default()
             .borders(Borders::ALL)
-            .title_position(Position::Bottom)
-            .title_alignment(ratatui::layout::Alignment::Right)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(Color::Green)
-            .title(format!("s:{rows}:{cols}"))
+            .title_bottom(Line::from(format!("s:{rows}:{cols}")).right_aligned())
             .style(Style::default().bg(Color::Reset));
 
         let pseudo_term = PseudoTerminal::new(screen)

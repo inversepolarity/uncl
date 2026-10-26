@@ -2,6 +2,7 @@
 
 **Scope:** `uncl` @ `ff09124` (1,286 LOC of Rust, MIT, `ratatui 0.29` + `tui-term 0.2` + `vt100 0.15.2` + `portable-pty 0.8`).
 **Method:** static review of the whole tree (`src/**`), plus source-level inspection of the candidate engines and of `zellij` as the closest sibling design. The sandbox has no Rust toolchain, so **no numbers below are measured** — every performance claim is a structural argument with a cheap way to verify it, given in §2.8.
+**v2 (2026-10-26):** the plan in §6 is revised against the recorded decisions in §0.1 (floating is non-negotiable; images are cheap-tier; mouse required; Windows/Docker nice-to-have; `vt100` upgraded via the vendored adapter).
 
 ---
 
@@ -11,12 +12,22 @@
 2. **`vt100 0.15.2` is the wrong pin, and it is the direct cause of the "poor sequence parsing" you are working around by hand.** `0.16`+ exposes the parser's *callbacks* (unhandled CSI/OSC/ESC) **and** first‑class terminal modes (`mouse_protocol_mode()`, `mouse_protocol_encoding()`, `application_cursor()`, `bracketed_paste()`, `hide_cursor()`, `cursor_style()`). That deletes the `String::from_utf8_lossy` + 20×`contains()` hack in `owner.rs:203–260`, which is both slow and **incorrect across read boundaries**.
 3. **BTOP doesn't render because of three stacked geometry bugs plus a mouse-routing bug, not because of the parser.** The float's PTY is sized `rect − 4`, the parser grid is sized `25×80`/`rect`, and the widget paints into `rect − 2` — for a full-screen TUI, every one of those mismatches shows up as a shifted/garbled frame. And when the float is visible, **all mouse events are consumed by drag/resize** — the child never sees a single mouse event (`owner.rs:371`). BTOP is largely mouse-driven.
 4. **"Renders everything natively" is not reachable by swapping the parser.** No Rust engine paints a *grid back to ANSI* with fidelity, and the features you are missing (`sixel`, kitty graphics, hyperlinks, `OSC 52`) are dropped **below** the grid layer: `vt100` does not implement `vte::Perform::hook/put/unhook` (DCS payloads vanish), and upstream `vte` routes `SOS/PM/APC` bytes into `anywhere()`, which discards them (kitty graphics APCs vanish for *every* `vte`-based engine).
-5. **Shortest path (recommended):** three independent, individually shippable stages, ~**2,000 net LOC**, ~**2–3 focused weeks**:
-   - **S0 — stop being slow** (~1 day): event-driven redraw, drain-to-empty input, `vt100 0.18`, delete the byte-sniffing.
-   - **S1 — stop lying about geometry and input** (~3 days): one source of truth for the float's size, region-based input routing, mode-aware key/mouse encoding, paste, and a **reply channel** for terminal queries.
-   - **S2 — own the emitter** (~1 week): delete `ratatui`+`tui-term`, write ~300 LOC that turns the grid into ANSI bytes using `vt100`'s own `rows_diff`/`state_diff`/`cursor_state_formatted`. This is the change that makes it fast *and* makes graphics possible.
-   - **S3 — graphics passthrough** (~1 week, optional): DCS/APC tap + image re-emit, so sixel/kitty images survive compositing.
-6. **The genuinely shortest path to "native for everything", if you will trade one UX rule:** *passthrough takeover* — when the float's child enters the alternate screen (BTOP, nvim, lazygit, sixel viewers all do), stop compositing and hand the child the whole real screen, relaying its bytes verbatim. Zero parsing, **100% fidelity by construction**, including sixel/kitty graphics. It is ~1 week, needs no new emulation code, and is orthogonal to S0–S3. Hybrid ("float for shells, takeover for alt-screen apps") is the highest value-per-line option on the table — see §6.5.
+5. **Decided plan (§0.1 answers applied): four stages, ~2,300 net LOC, ~16 working days for S0–S3 (~20 with the Windows delta and a buffer).**
+   - **S0 — stop being slow** (~2–3 days): event-driven redraw, drain-to-empty input, bracketed paste, batching writer, `vt100 0.18.1` via the vendored 123-LOC adapter, delete the byte-sniffing.
+   - **S1 — stop lying about geometry and input** (~5 days): one source of truth for the float's size, mouse/key routing by region with mode-aware per-pane encoders, paste, and a **capability-proxying reply channel** (uncl must query the *host* terminal once and relay its answers to children — including the sixel bit, or nothing will ever emit an image).
+   - **S2 — own the emitter** (~1 week): delete `ratatui`+`tui-term`; ~350 LOC turns the grid into ANSI bytes via `vt100`'s own `rows_diff`/`state_diff`/`cursor_state_formatted`. **This is now load-bearing**, because floating is non-negotiable: it is the only route to both speed and pixel fidelity, and the only place out-of-band image bytes can be emitted.
+   - **S3 — cheap-tier images** (~3 days): DCS/APC tap + placement store + re-emit. kitty first (croppable/placeable), sixel best-effort (draw if it fits, otherwise drop). No re-encoding, no scaling.
+6. **Two things are off the critical path.** *Passthrough takeover* (v1 §6.5) is incompatible with "floating is the product" — demoted to Appendix B, where it survives only as a user-invoked "maximize" and as a debugging aid. *Swapping in `alacritty_terminal`* (S4) stays optional: it buys underline colour, `OSC 8` links and kitty-keyboard input, none of which BTOP-class rendering needs.
+
+## 0.1 Decisions recorded (2026-10-26)
+
+| # | Answer | Consequence for the plan |
+|---|---|---|
+| 1 | **Floating while a TUI runs is the entire product — non-negotiable.** | Compositing is mandatory forever. No takeover shortcut. S2 becomes load-bearing rather than optional; budget for it and do not let it slip behind S3. |
+| 2 | **Inline images: good to have; quality compromises accepted; "whatever gets there cheaply".** | Scope = the cheap tier in §6.4–6.5: passthrough the child's own bytes, no decode, no scale, no re-encode, drop what doesn't fit. kitty gets real cropping for free (the terminal does it); sixel gets none. Windows: images are off (§6.6). |
+| 3 | **Mouse interaction is required.** | S1's region routing, per-pane encoding (X10/SGR/UTF-8 by the *child's* reported mode), scroll-wheel mapping and motion filtering are mandatory, not polish. `Home` can no longer be the only local chord, and the float's own drag/resize needs a non-mouse-stomping gesture. |
+| 4 | **Windows / Docker "good to have".** | Adds §6.6: raw-ANSI output needs VT output mode (crossterm already turns it on at startup), ConPTY eats child graphics ⇒ images are Unix-only, and the Windows input path is console records rather than VT sequences ⇒ isolate the input encoder behind a trait and `cfg` it. Docker needs only env/size propagation. |
+| 5 | **Upgrade `vt100` with the adapter if possible.** | Confirmed as S0: copy `tui-term`'s `src/vt100_imp.rs` (123 LOC) into `src/app/ui/adapter.rs`, adjust for the 0.18 API (`NonZeroU16` sizes, `Screen::size`), delete the `tui-term` dependency, pin `vt100 = "0.18.1"`. This unblocks deleting `owner.rs:203–260` in the same PR. |
 
 ---
 
@@ -189,7 +200,7 @@ Two consequences worth internalising:
 
 Stages are ordered by *dependency*, not by size, and each one is independently shippable. Effort assumes one developer familiar with the code.
 
-### 6.1 S0 — "make it fast" — ~1 day, ~200 LOC changed
+### 6.1 S0 — "make it fast" — ~2–3 days, ~200 LOC changed
 
 1. **Drain-to-empty input.** Replace `if poll(0) { read() }` with `while poll(0)? { handle(read()?) }`, bounded by a per-tick budget (e.g. 512 events) to stay fair to rendering. → §2.2, ~20 LOC.
 2. **Dirty-driven redraw.** Add `Arc<AtomicBool>` (or a `tokio::sync::Notify`) set by the reader threads when they process bytes; render only when dirty, or at a 60 Hz floor while an animation/`REP` is in flight, or on input. Replace `sleep(10)` with `select!` on `Notify` + a 16 ms timer. → §2.1, ~40 LOC.
@@ -199,7 +210,7 @@ Stages are ordered by *dependency*, not by size, and each one is independently s
 
 **Exit criteria:** idle CPU ≈ 0 with a still screen; ≤2 ms keystroke→PTY; 5 KB paste lands in one write; `htop` inside the float responds to the mouse *offsets* correctly even if not yet fully routed (mode tracking is now real).
 
-### 6.2 S1 — "make it correct" — ~3 days, ~500 LOC
+### 6.2 S1 — "make it correct, and give the child a voice" — ~5 days, ~700 LOC
 
 1. **One geometry source of truth.** Introduce `Overlay::content_rect() -> Rect` (rect minus border, and minus any off-screen part) and a single `resize_child(cols, rows)` that sets the PTY **and** `parser.screen_mut().set_size()`. Delete both `− 4`s (`tenant.rs:71–72`, `tenant.rs:107–108`) and stop printing `size.rows/cols` as if it were the child's size. On host resize, recompute `rect` and propagate. → §3#1, #6.
 2. **Region-based input routing.** Hit-test first, *then* decide policy:
@@ -207,20 +218,25 @@ Stages are ordered by *dependency*, not by size, and each one is independently s
    - pointer **outside** → uncl's own chords (drag/resize/move), consumed locally.
    - reserve one modifier (or `Home`, which is currently stolen and never forwardable — `keyboard.rs:18`) as the "local" escape hatch. → §3#2.
 3. **Mode-aware key encoding.** `application_cursor()` → `SS3` (`\x1bOD`) for arrows/Home/End, `CSI 1;2D`-style for modifiers, `application_keypad()` for keypad, and honour bracketed paste. Best-effort `CSI > u` (kitty keyboard) is *not* worth doing at this stage — instead, do **not** advertise it (§6.2.5). → ~100 LOC, replaces the hand-rolled table in `keyboard.rs`.
-4. **Reply channel.** Give both parsers a `Callbacks` impl that writes responses back into the corresponding PTY:
+4. **Reply channel = capability proxy.** uncl sits between the child and the real terminal, but the *real terminal's* capabilities currently never reach the child. Give both parsers a `Callbacks` impl that writes responses back into the corresponding PTY, answering from a capability record probed **once at startup from the host**:
    ```
    CSI c        → CSI ?64;1;2;6;9;15;18;21;22 c   (xterm-ish DA1, conservative: list only what you honour)
    CSI > c      → CSI >0;0;0 c                    (DA2: deliberately empty -- do not claim to be a VT level)
    CSI 6 n      → CSI row;col R                   (from screen.cursor_position())
    CSI ? 6 n    → CSI ? row;col R
    DCS $ q ...  → DCS 1 $ r <value> ST            (DECRQSS: only claim what you honour)
-   OSC 10/11;?  → OSC 10;rgb:…  / OSC 11;rgb:…    (query the *host* once at startup, cache)
+   DCS + q ...  → terminal capabilities + "4" if the host has sixel (XTGETTCAP / XTSMGRAPHICS)
+   OSC 10/11;?  → OSC 10;rgb:…   / OSC 11;rgb:…   (host's real fg/bg, probed once and cached)
+   OSC 4 ; n ; ?→ OSC 4;n;rgb:…                   (palette, best-effort)
    ```
-   Do not advertise what you don't implement (kitty keyboard, `XTGETTCAP` for unsupported caps): a conservative DA1 is far better than a lying one. Also forward `OSC 52` from the child to the host clipboard (vt100 0.16+ surfaces it) and answer `OSC 52;c;?` from the host's clipboard if you enable that.
+   **The sixel bit is not optional if you want images (decision 2).** Most image emitters (`chafa`, `img2sixel`, `viu`, `libsixel` apps) choose their protocol by querying the terminal; if the query goes unanswered the child assumes "no images" and never emits one — S3 would then be dead code. Same class of bug for `XTGETTCAP`/`XTGETTCAP Smulx` and `OSC 4` queries: answer conservatively but *answer*.
+   Do not advertise what you don't implement (kitty keyboard `CSI > u`, `XTGETTCAP` for unsupported caps): a conservative DA1 is far better than a lying one — a wrong "yes" produces garbage the child cannot detect.
+   Also forward `OSC 52` from child to host clipboard (`vt100 0.16+` surfaces it as `Callbacks::copy_to_clipboard`) and answer `OSC 52;c;?` from the host clipboard if you enable that.
 5. **Cursor fidelity.** `if screen.hide_cursor() { hide } else { show, and use cursor_style() to emit DECSCUSR }`. Also stop `RAPID_BLINK`-ing the owner cursor. → §3#4.
-6. **Focus/paste passthrough**: if the child enabled `?1004`, emit `CSI I`/`CSI O`. (Small; adds polish for nvim.)
+6. **Focus/paste passthrough**: if the child enabled `?1004`, emit `CSI I`/`CSI O`. Paste: forward `\x1b[200~…\x1b[201~` when the child has `?2004h`, raw bytes otherwise — and **never** translate a paste into `KeyEvent`s (that is the current 100-events/s path in §2.2).
+7. **One encoder table, one owner.** Today `keyboard.rs` hand-rolls ~250 lines of `vec![27, 91, …]` with no mode awareness. Replace it with `fn encode_key(key, modes, host) -> Option<Vec<u8>>` per pane (child's `application_cursor`/`application_keypad`/`bracketed_paste`, plus uncl's own local-chord table), and route *every* `crossterm::Event` through: `Event::Key` → encoder, `Event::Mouse` → hit-test then encoder or local handler, `Event::Paste` → bulk, `Event::Resize` → layout, `Event::FocusGained/Lost` → `CSI I`/`CSI O`. This single function is where decision 3 (mouse) and decision 4 (Windows) both land (§6.6).
 
-**Exit criteria:** BTOP renders a stable full frame at the right size, is mouse-clickable inside the float, hides the cursor correctly, and survives 20 consecutive float resizes with no smearing. `nvim` + `lazygit` + `less` + `fzf` all behave. *(This is the "everything except images/hyperlinks" milestone, and it is about a week of work.)*
+**Exit criteria:** BTOP renders a stable full frame at the right size, is mouse-clickable inside the float (clicks, drags and wheel all land at the right cell *inside the child*), hides the cursor correctly, survives 20 consecutive float resizes with no smearing, and answers `CSI 6n` correctly enough that `CSI 6n`-using scripts do not stall. `nvim` + `lazygit` + `less` + `fzf` + `htop` all behave. *(This is the "everything except images" milestone: ~7 working days for S0+S1.)*
 
 ### 6.3 S2 — "own the emitter" — ~1 week, ~350 LOC, −4 dependencies
 
@@ -252,65 +268,72 @@ Notes that matter:
 
 **Why this is the pivotal stage:** it removes the 100 Hz buffer diffing (§2.1), removes per-cell `Style` construction, drops the lock from the render path (clone-or-snapshot cells into your own `prev` buffer under a short lock), cuts dependencies, and — critically — gives you a place to put **out-of-band bytes after the grid flush**, which is the only way images can be drawn (§6.4).
 
-### 6.4 S3 — "images and links, passthrough" — ~1 week, ~450 LOC
+### 6.4 S3 — "images, cheap tier" — ~3 days, ~300 LOC (decision 2)
+
+Goal: *an image the child emits shows up inside the float*. No decode, no scaling, no re-encoding, no alpha. Passthrough only.
 
 1. **Tap DCS/APC.** Wrap the parse of each chunk:
    ```rust
-   // split at ESC P / ESC _ ; feed prefix to vt100 first so the cursor is current
-   for seg in Splitter::new(chunk) {
+   for seg in Splitter::new(chunk) {          // ~80 LOC: ESC P…ST, ESC _…ST, ESC \
        match seg {
-           Seg::Bytes(b)  => parser.process(b),
-           Seg::Dcs{..} | Seg::Apc{..} => graphics.on_payload(&parser.screen(), seg),
+           Seg::Bytes(b) => parser.process(b),                       // feed prefix first, so the cursor is current
+           Seg::Dcs(p) | Seg::Apc(p) => graphics.on_payload(parser.screen_mut(), seg, p),
        }
    }
    ```
-   `Splitter` is ~80 LOC (`ESC P`…`ST`, `ESC _`…`ST`, `ESC \`, `\x07`-terminated OSC passthrough handled by vt100 anyway). For DCS, prefer patching `vt100` (25 LOC: forward `hook/put/unhook` into `Callbacks`) — cleaner, upstreamable, and keeps one parser.
-2. **Image list.** `struct Placement { rect: Rect, bytes: Vec<u8>, proto: Sixel|Kitty }`. On payload: decode just enough header to know the pixel footprint (sixel: parse the `"` raster attributes, or the DCS `q` params; kitty: `a=T,f=…,s=…,v=…`), convert to cells, store at the current cursor cell.
-3. **Repaint.** After the grid flush, re-emit every placement that intersects the frame. On occlusion by a float or a scroll, drop it (that's what tmux effectively does for panes it doesn't own).
-4. **Clipping.** Kitty graphics support source-rect cropping (`a=p,x=…,y=…,w=…,h=…`), so you can crop to the float. **Sixel has no crop mechanism**, so an oversized sixel image either overflows the float or must be re-encoded (decode → RGB → sixel). Pick "degrade: draw only if it fits", document it, and you have parity with tmux.
-5. **Hyperlinks.** `vt100` doesn't track `OSC 8`. Two options: (a) track it yourself in the same tap (open/close state + per-cell id, ~60 LOC), or (b) move the engine to `alacritty_terminal` and read `cell.hyperlink()` / `cell.underline_color()` / `cell.zerowidth()`. (a) is cheaper if you stay on `vt100`.
+   For DCS, prefer patching `vt100` (~25 LOC: forward `hook/put/unhook` into `Callbacks`) — one parser, upstreamable. APC must be split by us regardless, because upstream `vte` discards it (§4.1).
+2. **Placement store.** `struct Placement { rect: Rect, payload: Vec<u8>, proto: Proto }`. Record at the cursor cell; footprint from the payload header only — kitty: `a=T,f=…,s=<px w>,v=<px h>,c=<cols>,r=<rows>`; sixel: the DCS `"` raster attributes, else 1×1 cell per 6 pixels. Re-emit without understanding the pixels.
+3. **Repaint after the grid flush** (S2 gives you the hook): re-emit every placement intersecting the frame unless a float covers it or the row scrolled away. Emit kitty placements **with the terminal's own clipping is not possible on plain xterm**, so instead use kitty's source-rect crop: `a=p,i=<id>,x=<px>,y=<px>,w=<px>,h=<px>` — the *terminal* crops, which is free and exact. Requires the original image to be transmitted once and then placed by id (`a=t` then `a=p`), which is the cheap path.
+4. **Sixel degrades on purpose.** Sixel has no crop and no place-by-id: one image = one opaque blit at the cursor. Contract: **draw only if it fits inside the float's `content_rect`; otherwise skip it and log once.** That is what tmux effectively does, it costs ~0 LOC, and it satisfies "willing to compromise on quality". Do not implement sixel re-encoding in this stage.
+5. **Hyperlinks (`OSC 8`) are a separate 1-day item, not part of S3.** `vt100` does not track them; the cheap version is state in your splitter (open/close + per-cell run id, ~60 LOC) and emitting `OSC 8` per run in the row encoder. Only worth doing if you actually want clickable links in the float — `alacritty_terminal` (S4) gives them for free, so **defer**.
 
-**Alternative to all of S3, if you want to stop at ~90% fidelity:** note that images can also be handled by *not compositing them* — see §6.5.
+**Explicit non-goals** (state them in the README so nobody files bugs): no image scaling, no sixel cropping, no animation (kitty `a=a`), no alpha/blending, images not clipped by the float border on Windows (see §6.6), no `iTerm2` inline images, no sixel on non-Unix.
 
-### 6.5 The shortcut worth seriously considering: passthrough takeover
+### 6.5 What "cheap" buys, concretely
 
-The float is opaque, so compositing is only needed while a *background* exists to paint over. Full-screen apps take the alternate screen, at which point the background is irrelevant — there is nothing to composite against. So:
+| Producer | Path through uncl | Fidelity after S3 |
+|---|---|---|
+| `chafa`, `viu`, `img2sixel` (sixel) | child bytes → DCS tap → re-emit | Exact **if it fits** the float; skipped if not. No scaling. |
+| kitty-capable apps, `kitten icat` | child bytes → APC tap → re-emit + placement crop | Exact, croppable, survives occlusion by the float's own repaint order. |
+| `feh`-style direct `/dev/tty` writes | bypasses the PTY | never supported (also unsupported by tmux) |
+| anything requiring `TIOCGWINSZ` in pixels | we answer `TIOCGWINSZ` cells only (`portable-pty` limitation) | pixel-size queries return 0; most tools fall back to cell math |
 
-> **When the float's child enters the alternate screen (`?1049h`/`?47h`), and the float is visible, promote the float to the full screen and relay the child's bytes verbatim.** Intercept `?1049l` to demote back.
+The dependency order that actually matters here is S1 → S3, not S2 → S3: the tap can be added to today's `vt100` reader thread in an afternoon. But **without the capability probe in §6.2.4 nothing will ever emit an image**, so that probe is the real first step of "images".
 
-What you get for ~1 week and **zero** emulation work:
+### 6.6 Windows & Docker delta (decision 4)
 
-- BTOP, nvim, lazygit, htop, `less`, sixel/kitty image viewers render **byte-exactly**, because their bytes reach the real terminal unmodified. No parser in the path means no fidelity ceiling at all.
-- Every input mode works for free (you're just a pipe): mouse at native rates, kitty keyboard, focus, paste, `OSC 52`, DCS passthrough, images.
-- S0/S1 still needed (speed, geometry, mode tracking, reply channel), but S2/S3 become optional.
+**Docker:** a non-issue for rendering. `portable-pty` opens a normal pty; `TERM` inherits; `COLORTERM`/`TERM_PROGRAM` should be passed through explicitly (today only `TERM=xterm-256color` is set, `owner.rs:135`), and `SHELL` is already read from the env. Only caveat: `TERM` is hard-coded for the owner — if the host is `xterm-kitty`, the child believes it is not kitty and loses kitty features. Fix: copy the host's `TERM`/`COLORTERM`/`TERM_PROGRAM` and downgrade `TERM` only when the host is `screen`/`tmux` (where passthrough matters).
 
-What you give up: the app is no longer floating while it runs. Drag/resize of a running TUI becomes a full-screen resize (which is what those apps actually want anyway). For the monoplexer's stated purpose — "one floating term as an accomplice to your terminal misdeeds" — a **hybrid** is the best value on the board:
+**Windows:** three separable issues, only one of which is real work.
 
-| Float content | Behaviour |
-|---|---|
-| Shell / line-oriented tools (no alt screen) | stays a floating window, grid-composited (S0–S2 quality) |
-| Alt-screen apps (BTOP &co.) | auto-promoted to full screen, byte-exact passthrough, demoted on exit |
+1. **Output: fine, with one call.** S2 writes raw ANSI to stdout. Windows consoles need `ENABLE_VIRTUAL_TERMINAL_PROCESSING`; crossterm flips it *lazily* through its `ansi_support` module when its command API is used, and that module is public (`pub mod ansi_support`, `supports_ansi()`, present in the 0.27 line you pin) — call it once at startup and treat `false` as "uncl cannot run here" instead of emitting raw ESC into a legacy console.
+2. **Input: the real work.** On Windows, crossterm's input backend produces `Event`s from console records rather than from VT sequences, so the child cannot simply be sent what arrives. Your `encode_key`/`encode_mouse` from §6.2.7 is already the right shape: it takes *semantic* events and produces VT sequences, so Windows needs no separate pipeline — but the mode-dependent branches (application cursor, X10 vs SGR mouse, kitty keyboard) must be exercised on Windows, because you cannot test them by accident. Put the encoder behind a small trait with a `#[cfg(test)]` fake, and keep the `cfg`-specific code to: raw-mode setup (crossterm does it), `tiocgwinsz` replacement (`crossterm::terminal::size()` already abstracts it — `owner.rs:355` uses it, `tenant.rs` uses `PtySize`), and mouse encoding tables (`1006` vs `1015` are not equally supported by ConPTY-era terminals).
+3. **Images: off, and the reason is structural.** The child sits under uncl's *own* ConPTY, so it is one layer further removed than usual. **ConPTY v1** (the in-box implementation on Windows 10/11, and Windows Terminal ≤ 1.21) parses the child's VT into a text buffer and re-renders snapshots — it drops or reorders sequences it does not model, **swallows DCS payloads, and answers `DA1` itself, without the sixel attribute**. That means the child never even asks uncl for sixel: it asks ConPTY, is told no, and falls back to blocks. **ConPTY v2** (shipped with Windows Terminal 1.22+, also redistributable as `conpty.dll`) forwards the original VT bytes through, which is what made sixel work in WT 1.22 at all. Getting images on Windows therefore requires uncl to bundle and load the v2 `conpty.dll` — a packaging change well outside "cheap". Decision: **Windows = no images**, documented, and `uncl doctor` says why. (Consequence for §6.2.4: on Windows do *not* advertise sixel in `XTSMGRAPHICS`/`DA1`, or you will advertise something your PTY layer destroys — the capability record is per-platform, not global.)
 
-That hybrid reaches "renders everything natively" in about **2 weeks** with no emulator work, and S2/S3 remain as the "float a TUI properly" upgrade path afterwards.
+Sources for the ConPTY v1/v2 distinction: Windows Terminal 1.22 release notes (`https://devblogs.microsoft.com/commandline/windows-terminal-preview-1-22-release/`), the conpty-v2 passthrough discussion (`https://github.com/microsoft/terminal/discussions/18500`), and a field report of in-box ConPTY answering DA1 without sixel and swallowing sixel DCS (`https://github.com/openwong2kim/wmux/issues/1932`).
 
-### 6.6 Sequencing summary
+**Also worth doing while in here:** a `--check` / `uncl doctor` that prints the probed capability record (host DA1/DA2, `TERM`, `COLORTERM`, sixel yes/no, kitty yes/no). It is 30 lines, and it is the difference between "btop looks wrong" and a bug report you can reproduce.
+
+### 6.7 Sequencing summary (revised for the decisions)
 
 | Stage | Effort | Net LOC | Unlocks | Risk |
 |---|---|---|---|---|
-| S0 speed | 1 d | ~±200 | Idle CPU → ~0; input 1 event/tick → unbounded; paste instant; real mode tracking | Low. `vt100` 0.18 API churn; vendoring the 123-LOC adapter. |
-| S1 correctness | 3 d | ~+500 | BTOP/htop/nvim/lazygit render at the right size, mouse works, cursor correct, no more resize smearing | Medium — input encoding branches per mode; needs a test matrix. |
-| S2 own emitter | 1 wk | ~+350, −4 crates | Native-speed scan-out; no per-cell `Style`; a hook for out-of-band bytes | Medium — off-by-one/clipping bugs are visible; mitigate with golden frames. |
-| S3 graphics | 1 wk | ~+450 | sixel, kitty graphics, `OSC 8` links, `OSC 52` | Medium-high; sixel clipping is genuinely unsolvable — degrade on purpose. |
-| S4 engine swap (`alacritty_terminal`) | 3–5 d | ~+600 | Underline colour/styles, hyperlinks, kitty-keyboard input, sync output, `EventListener` for title/clipboard/bell | Medium; requires S2 (you must own the encoder before leaving `vt100`). |
-| S5 (alt to S3) takeover | 1 wk | ~+250 | Byte-exact everything for alt-screen apps | Low code cost, product/UX decision. |
+| S0 speed | 2–3 d | ~±200 | Idle CPU → ~0; input 1 event/tick → unbounded; paste instant; real mode tracking; `vt100 0.18.1` via the vendored adapter | Low. `vt100` 0.18 API churn is contained in the 123-LOC adapter; benchmark it against 0.15.2 (see the criterion bench in §8) and keep the pin reversible. |
+| S1 correctness + input + capability proxy | ~5 d | ~+700 | BTOP/htop/nvim/lazygit render at the right size **and are mouse-interactive**; paste; query replies; sixel capability advertised (prerequisite for any image ever appearing) | Medium — the encoder branches per mode and per platform; mitigated by the encoder trait and a golden-sequence table. |
+| S2 own emitter | ~1 wk | ~+350, −4 crates | Native-speed scan-out; a hook for out-of-band bytes; no per-cell `Style`; `ratatui`/`tui-term` gone | Medium — off-by-one/clipping bugs are visible; mitigate with the §8.1 golden-frame harness. **Load-bearing: do not defer behind S3.** |
+| S3 cheap-tier images | ~3 d | ~+300 | kitty images (croppable), sixel (if it fits), passthrough | Medium-low, because the quality contract is explicit (§6.4 non-goals). |
+| S3.5 hyperlinks (`OSC 8`) | 1 d | ~+60 | clickable links inside the float | Low; or free with S4. |
+| S4 engine swap (`alacritty_terminal`) | 3–5 d | ~+600 | underline colour/styles, hyperlinks, kitty-keyboard input, sync output, `EventListener` (title/clipboard/bell) | Medium; **requires S2** (you must own the encoder before leaving `vt100`). Optional — skip unless users ask for the fidelity *inside* a float. |
+| §6.6 Windows delta | 1–2 d | ~+120 | Windows build that runs a TUI float (no images) | Medium; needs a real Windows box or CI runner to validate input modes. |
 
-**Recommended critical path: S0 → S1 → (S5 and/or S2 → S3).** S4 only if you need hyperlinks/underline styles *inside a floating window*.
+**Critical path: S0 → S1 → S2 → S3** (≈16 working days, ≈2,300 net LOC, −4 crates net since `tui-term` and `ratatui` go away). S3.5/S4/Windows are independent tails that can be scheduled by demand. The single highest-risk item is **S2's clipping/repaint correctness**, not the parser or the graphics.
+
 
 ---
 
 ## 7. Things that look like short paths and are not
 
-- **"Just write the child's bytes straight to stdout and overlay the float."** Cursor addressing, clipping, scroll regions and occlusion make this a full sequence *rewriter* (harder than a grid). Only works if the child owns the whole screen — which is exactly §6.5, and only there.
+- **"Just write the child's bytes straight to stdout and overlay the float."** Cursor addressing, clipping, scroll regions and occlusion make this a full sequence *rewriter* (harder than a grid). Only works if the child owns the whole screen — which is Appendix B, and only there.
 - **"Vendor a big emulator and be done."** You still have no grid → ANSI encoder; `alacritty_terminal` and `wezterm-term` both render to GPU surfaces. You'd swap ~50 lines of parser code for ~1,000 lines of encoder plus a large dependency tree.
 - **"Keep `ratatui` and smuggle images/hyperlinks through".** You can put raw `OSC 8` in a cell's symbol and paint images after `flush()`, but `ratatui`'s diff engine will silently erase them on the next frame unless you poison the buffer and force full repaints. This fights the framework continuously and is *more* code than S2.
 - **"Raise the tick rate."** Makes the CPU problem worse and does nothing for input batching (§2.2).
@@ -328,15 +351,44 @@ That hybrid reaches "renders everything natively" in about **2 weeks** with no e
 
 ---
 
-## 9. Open questions (product decisions that change the plan)
+## 9. Decisions taken, and what is still open
 
-1. **Is "floating while a TUI runs" a hard requirement?** If not, §6.5 alone gets you "native for everything" in ~1 week and S3 can be dropped forever.
-2. **Are inline images (sixel/kitty) in scope?** If they are, note that sixel cannot be clipped to an arbitrary rect without re-encoding; if they're not, S3 shrinks to hyperlinks + `OSC 52` (~150 LOC).
-3. **Do you need mouse interaction *inside* the float?** If the float is keyboard-only by design, S1 shrinks by ~150 LOC but BTOP/htop stay awkward — I'd assume yes.
-4. **Windows/Docker targets?** `portable-pty` handles it, but SGR-only mouse encoding and DECSCUSR differ; the reply channel needs a `TERM`-aware capability table.
-5. **`vt100` 0.18 upgrade appetite** — it changes `Parser::new`/`set_size` signatures and is a prerequisite for deleting the sniffing hack. Patching `tui-term` or vendoring its 123-LOC adapter is the only way to have both.
+Recorded (see §0.1): floating is mandatory; images cheap-tier; mouse required; Windows/Docker nice-to-have; `vt100` upgrade via adapter. The plan in §6 is built on those.
 
----
+Still genuinely open, in the order they will bite:
+
+1. **Local chords vs. the child's input.** With mouse required and `Home` the only chord, the float will fight every full-screen app for events. Proposal: `Home` toggles visibility (keep), `Alt`+drag (or a dedicated 1-cell resize gutter drawn on the border) for float geometry, and everything inside `content_rect` goes to the child. Needs your sign-off because it is a UX rule, not a bug fix.
+2. **When the float is hidden, where does input go?** Today it goes to the owner shell and the float freezes but keeps parsing. Consider *always* routing keys to the float and requiring `Home` to reach the owner shell — a monoplexer with one toggle. Cheap to change, changes the feel.
+3. **Scrollback.** `vt100` has it, the float throws it away (`Parser::new(..., 0)`, `lease.rs:24`). Do you want wheel-scroll inside a *shell* float (mouse wheel is required by decision 3 anyway)? If yes, budget 1 day in S1 and note that `vt100 0.18` changed `set_size`/`set_scrollback` semantics.
+4. **`TERM` policy.** Copy the host's `TERM`/`COLORTERM` through (needed for kitty/sixel capability probing, §6.6) or keep the hard-coded `xterm-256color` and let the capability proxy translate? The former is more faithful, the latter is more portable. Recommendation: copy through, downgrade only under `screen`/`tmux`.
+5. **Windows validation hardware.** §6.6 needs a real Windows box (or a CI runner) for the input-mode matrix. Without one, ship Windows as "experimental, no images" and keep the encoder trait testable.
+
+## 10. Implementation checklist (drop-in order)
+
+Each line is a reviewable PR; the sequence is the shortest dependency-satisfying one.
+
+```
+S0  1. vendor adapter (src/app/ui/adapter.rs) + vt100 0.18.1 + drop tui-term        [½ d]
+    2. delete owner.rs:203–260; read modes from Screen                            [½ d]
+    3. drain-to-empty input loop (budget 512/tick) + Select/Dir wrapper           [½ d]
+    4. coalescing PTY writer (unbounded) + remove send().unwrap()                 [½ d]
+    5. dirty flag + select!(notify, 16ms) + forced repaint on show/hide/resize    [1 d]
+S1  6. Overlay::content_rect() as the only geometry; resize_child() sets pty+grid [½ d]
+    7. hit-test → route; mouse encoder per child mode (X10/UTF-8/SGR, motion)     [1 d]
+    8. key encoder trait + mode-aware arrows/keypad/paste; local chord table      [1 d]
+    9. Callbacks: DA1/DA2/DSR/DECRQSS/OSC 10-11/XTGETTCAP + startup probe         [1½ d]
+   10. cursor visibility + shape (DECSCUSR), focus in/out, `uncl doctor`          [1 d]
+S2 11. src/app/render/: rows_diff → CUP+row bytes; prev screen per pane          [1½ d]
+   12. clip by content_rect, paint order owner→float, full-repaint triggers        [1½ d]
+   13. delete ratatui/tui-term, drop the double buffer, one write_all per frame   [1 d]
+   14. golden-frame harness + corpus in CI                                        [1 d]
+S3 15. DCS/APC splitter + placement store + re-emit after grid flush             [1½ d]
+   16. kitty place-by-id + source-rect crop; sixel fit-or-skip                    [1 d]
+   17. (opt) OSC 8 hyperlink runs                                                 [1 d]
+W   18. Windows: ansi_support call, encoder cfg matrix, close the images gap      [1½ d]
+```
+
+`~20 development days` end to end with buffer; `16` for S0–S3 alone.
 
 ## Appendix A — candidate-crate facts used above
 
@@ -348,3 +400,12 @@ That hybrid reaches "renders everything natively" in about **2 weeks** with no e
 | `alacritty_terminal` | 0.26.1-dev | 11,728 | `Term::{renderable_content, grid, mode}`, `TermMode` (incl. `KITTY_KEYBOARD_PROTOCOL`), `RenderableContent{display_iter, cursor, colors, mode}` | Apache-2.0. No sixel/graphics anywhere in the repo. Key *encoding* lives in the binary (`alacritty/src/input/keyboard.rs`), not the library. |
 | `wezterm-term` | 0.1.0 | large | `Terminal` + `Image`/`ImageDataType`, `terminalstate/sixel.rs`, `image.rs` | MIT, git-only workspace crate with `termwiz`/`image`/`terminfo` in tow. |
 | `zellij` panes | HEAD | ~16k | `grid::render → (CharacterChunk, raw_vte_output, SixelImageChunk, KittyImageChunk)`, `kitty_graphics/{store,replies,grid_state}`, `sixel::SixelImageStore`, `hyperlink_tracker` | MIT reference implementation of exactly the architecture recommended here. |
+
+## Appendix B — passthrough takeover (deferred by decision 1)
+
+v1 of this report proposed promoting the float to full screen whenever its child entered the alternate screen and relaying the child's bytes verbatim. It is the cheapest possible route to byte-exact fidelity (no parser, no encoder, no fidelity ceiling, images included), and it stays on the shelf for two narrower uses:
+
+- **`uncl --maximized` / a user-invoked "maximize this pane"** for image-heavy or kitty-keyboard-heavy apps, where the user explicitly wants the float to step aside. Same code, opt-in.
+- **A debugging switch** (`UNCL_PASSTHROUGH=1`) to bisect "is this uncl's compositor or the child?" in one run.
+
+Mechanics, if it is ever picked up: detect `?1049h`/`?47h` on the child (`vt100` tracks alt-screen internally; `Screen` exposes it via the mode set), set `raw` relay for the affected pane, stop compositing it, and splice the child's bytes into the frame between a `CUP` to the origin and the exit sequence. `?1049l` restores. ~250 LOC, no emulation work — but it *removes* the float while it is active, so it cannot be the default (decision 1).

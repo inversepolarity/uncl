@@ -29,6 +29,14 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
   it is not using the mouse itself
 - scrollback in both panes - the float and the shell behind it - sized by
   `UNCL_SCROLLBACK` from the environment you launch uncl in
+- the float's border shows the child's window title (`OSC 0/2`), so a float
+  running `nvim` or `ssh` says what it is; its size and scroll offset sit in the
+  bottom border
+- copy and paste (`OSC 52`) work inside a session - copy in the float, paste in
+  the float - and copies are relayed to your real clipboard
+- children get your terminal's `TERM` (alacritty, foot, wezterm, xterm...), and
+  `xterm-256color` where uncl cannot carry what that `TERM` implies: `screen`/
+  `tmux` dialects, and kitty's keyboard protocol. `uncl --doctor` prints both
 
 ### images: what is, and is not, supported
 

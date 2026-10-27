@@ -26,9 +26,11 @@ use bytes::Bytes;
 use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::app::images::{Ingest, Piece, Splitter, Store};
+use crate::app::images::{Ingest, Kind, Piece, Splitter, Store};
 use crate::app::signal::Signal;
 use crate::app::term::callbacks::{ChildCallbacks, ReplySink};
+use crate::app::term::caps::Capabilities;
+use crate::app::term::dcs;
 use crate::constants::PTY_WRITE_BATCH;
 
 /// A child's grid, with the callbacks that answer its terminal queries.
@@ -83,6 +85,7 @@ pub fn spawn(
     sink: ReplySink,
     signal: Arc<Signal>,
     images: Option<Arc<Mutex<Store>>>,
+    caps: Arc<Capabilities>,
 ) -> Result<PtySession> {
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -129,9 +132,23 @@ pub fn spawn(
                         match piece {
                             Piece::Text(bytes) => parser.process(&bytes),
                             Piece::OutOfBand(kind, bytes) => {
+                                // `DCS` is the one family the parser cannot answer
+                                // for itself: `vt100` implements no `DCS` at all, so
+                                // a `DECRQSS`/`XTGETTCAP` would vanish and its sender
+                                // would wait for a timeout. The tap has the bytes, so
+                                // it answers them here (S3.7).
+                                if kind == Kind::Dcs {
+                                    if let Some(reply) =
+                                        dcs::reply(parser.screen(), &caps, &bytes)
+                                    {
+                                        reader_sink.send(reply);
+                                        continue;
+                                    }
+                                }
+
                                 // Graphics leave the stream here; everything else
-                                // (OSC 52, colour queries, DECRQSS) is handed to
-                                // the parser exactly as it was before the tap.
+                                // (OSC 52, colour queries) is handed to the parser
+                                // exactly as it was before the tap.
                                 let mut kept = false;
                                 if let Some(store) = images.as_ref() {
                                     let anchor = parser.screen().cursor_position();

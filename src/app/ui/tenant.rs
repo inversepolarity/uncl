@@ -74,7 +74,7 @@ impl Overlay {
         parser: Arc<RwLock<ChildParser>>,
         sink: ReplySink,
         signal: Arc<Signal>,
-        caps: &crate::app::term::caps::Capabilities,
+        caps: Arc<crate::app::term::caps::Capabilities>,
         images: Arc<Mutex<Store>>,
     ) -> Result<PtySession> {
         let (rows, cols) = self.content_size();
@@ -86,7 +86,7 @@ impl Overlay {
         cmd.cwd(std::env::current_dir()?);
         caps.apply_child_env(&mut cmd);
 
-        let session = pty::spawn(cmd, rows, cols, parser, sink, signal, Some(images))?;
+        let session = pty::spawn(cmd, rows, cols, parser, sink, signal, Some(images), caps)?;
         self.is_dead = false;
         Ok(session)
     }

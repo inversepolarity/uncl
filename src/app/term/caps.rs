@@ -127,9 +127,10 @@ pub struct Capabilities {
 impl Capabilities {
     /// Best-effort detection from the environment.
     ///
-    /// `TERM` itself is a poor signal here because uncl deliberately does not
-    /// pass the host's `TERM` to children (see `owner.rs`); the useful signals
-    /// are the terminfo-independent env vars that emulators set.
+    /// `TERM` is a weak signal on its own; the reliable ones are the
+    /// terminfo-independent variables emulators set (`TERM_PROGRAM`,
+    /// `COLORTERM`, `KITTY_WINDOW_ID`, `WEZTERM_EXECUTABLE`). What children end up
+    /// seeing is decided by [`Self::child_term`], not by this.
     pub fn from_env() -> Self {
         let term = env::var("TERM").unwrap_or_default();
         let term_lower = term.to_ascii_lowercase();
@@ -199,15 +200,45 @@ impl Capabilities {
         b"\x1b[>0;1;0c".to_vec()
     }
 
+    /// The `TERM` children see.
+    ///
+    /// The host's family is passed through, because which terminal you are running
+    /// in is real information: `alacritty`, `foot`, `wezterm` and `ghostty` all
+    /// imply capabilities uncl transports faithfully (24-bit colour, and for the
+    /// image protocols the S3 tap carries the bytes through untouched). Three cases
+    /// are downgraded instead:
+    ///
+    /// * **passthrough wrappers** (`screen*`, `tmux*`): their `TERM` describes a
+    ///   multiplexer's own escape dialect, which we do not speak,
+    /// * **`xterm-kitty`**: kitty's `TERM` is what makes applications enable the
+    ///   kitty *keyboard* protocol, and uncl speaks the legacy key encodings — so
+    ///   the claim would be false about input. Kitty's *graphics* are advertised
+    ///   separately (`UNCL_GRAPHICS`, and the image tap carries them), which is the
+    ///   half we can honestly deliver,
+    /// * **nothing usable** (`dumb`, `linux`, unset): `xterm-256color` is the lowest
+    ///   honest description of what this layer implements.
+    ///
+    /// `--doctor` prints both this and the host's own `TERM`, so the mapping is
+    /// never a mystery.
+    pub fn child_term(&self) -> &str {
+        let term = self.term.as_str();
+        let lower = term.to_ascii_lowercase();
+        let downgrade = term.is_empty()
+            || matches!(lower.as_str(), "dumb" | "linux")
+            || lower.starts_with("screen")
+            || lower.starts_with("tmux")
+            || lower.contains("kitty");
+        if downgrade { "xterm-256color" } else { term }
+    }
+
     /// Apply the environment children should see.
     ///
-    /// `TERM` is *not* inherited: `xterm-256color` is the honest description of
-    /// what uncl implements, and a `TERM` of `xterm-kitty` or a sixel-capable
-    /// `TERM` would make children emit bytes this layer may not transport.
-    /// `COLORTERM` is inherited because 24-bit colour survives our own
-    /// re-encoding intact, and `UNCL_GRAPHICS` says what the S3 tap carries.
+    /// `TERM` follows [`Self::child_term`]: the host's family where we can carry
+    /// what it implies, `xterm-256color` where we cannot. `COLORTERM` is inherited
+    /// because 24-bit colour survives our own re-encoding intact, and
+    /// `UNCL_GRAPHICS` says what the S3 tap carries.
     pub fn apply_child_env(&self, cmd: &mut portable_pty::CommandBuilder) {
-        cmd.env("TERM", "xterm-256color");
+        cmd.env("TERM", self.child_term());
         if self.truecolor {
             cmd.env("COLORTERM", "truecolor");
         }
@@ -231,7 +262,7 @@ impl Capabilities {
     /// A few lines for `uncl doctor`.
     pub fn summary(&self) -> String {
         format!(
-            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)\n  cell size: {}x{} px ({}), reported to children as CSI 16t (UNCL_CELL_PX)\n  hyperlinks: OSC 8 carried inside the float; FORCE_HYPERLINK=1 for children\n  scrollback: {} lines per pane, in both panes (UNCL_SCROLLBACK)",
+            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)\n  cell size: {}x{} px ({}), reported to children as CSI 16t (UNCL_CELL_PX)\n  hyperlinks: OSC 8 carried inside the float; FORCE_HYPERLINK=1 for children\n  scrollback: {} lines per pane, in both panes (UNCL_SCROLLBACK)\n  child TERM={} ({})",
             if self.term.is_empty() { "<unset>" } else { &self.term },
             self.term_program.as_deref().unwrap_or("<unset>"),
             self.colorterm.as_deref().unwrap_or("<unset>"),
@@ -244,6 +275,12 @@ impl Capabilities {
             cell_px().1,
             cell_px_source(),
             crate::constants::scrollback_lines(),
+            self.child_term(),
+            if self.child_term() == self.term.as_str() {
+                "the host's own"
+            } else {
+                "downgraded: uncl does not carry what that TERM implies"
+            },
         )
     }
 }
@@ -342,6 +379,37 @@ mod tests {
         assert_eq!(parse_cell_px("12"), None);
         assert_eq!(parse_cell_px("auto"), None);
         assert_eq!(parse_cell_px(""), None);
+    }
+
+    #[test]
+    fn the_child_gets_the_hosts_terminal_unless_we_cannot_carry_it() {
+        let with = |term: &str| Capabilities {
+            term: term.into(),
+            term_program: None,
+            colorterm: None,
+            kitty_graphics: false,
+            sixel: false,
+            kitty_keyboard: false,
+            truecolor: false,
+        };
+
+        // Faithful families pass through: the claim is true of this layer too.
+        for term in ["alacritty", "foot", "wezterm", "xterm-256color", "ghostty"] {
+            assert_eq!(with(term).child_term(), term);
+        }
+
+        // A multiplexer's dialect we do not speak, kitty's keyboard protocol we do
+        // not implement, and consoles that cannot do any of it.
+        for term in [
+            "screen-256color",
+            "tmux-256color",
+            "xterm-kitty",
+            "dumb",
+            "linux",
+            "",
+        ] {
+            assert_eq!(with(term).child_term(), "xterm-256color", "{term:?}");
+        }
     }
 
     #[test]

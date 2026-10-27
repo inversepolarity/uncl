@@ -72,6 +72,10 @@ pub struct Panes<'a> {
     /// Is the *focused* pane scrolled back? Then there is no cursor to place: the
     /// child's cursor belongs to a line that is not on screen.
     pub focused_scrolled: bool,
+    /// The float's child named itself (`OSC 0/2`). Drawn in the float's top
+    /// border, which is otherwise unused: the size and the scroll offset live in
+    /// the bottom one.
+    pub float_title: Option<&'a str>,
 }
 
 /// The hyperlinks each pane drew this frame (`OSC 8`, S3.5).
@@ -108,6 +112,8 @@ pub struct Renderer {
     images_forgotten: bool,
     /// The scroll offset the border was last drawn with.
     scroll: usize,
+    /// The title the top border was last drawn with, so a rename repaints it.
+    title: Option<String>,
 }
 
 impl Renderer {
@@ -126,6 +132,7 @@ impl Renderer {
             images_shown: false,
             images_forgotten: false,
             scroll: 0,
+            title: None,
         }
     }
 
@@ -166,15 +173,20 @@ impl Renderer {
             links,
             scroll,
             focused_scrolled,
+            float_title,
         } = panes;
         let float_at = float.as_ref().map(|(screen, rect)| (screen, *rect));
 
         let owner_full = self.force_full || self.owner_prev.is_none();
         let float_full = self.force_full || self.float_prev.is_none();
 
-        // The scroll offset is drawn in the border, so a change has to repaint it.
+        // The scroll offset and the title are drawn in the border, so a change to
+        // either has to repaint it — a rename that never appears is worse than no
+        // title at all.
         let scrolled = self.scroll != scroll;
         self.scroll = scroll;
+        let retitled = self.title.as_deref() != float_title;
+        self.title = float_title.map(str::to_string);
 
         let mut owner_rows = if owner_area.is_empty() {
             Vec::new()
@@ -209,6 +221,7 @@ impl Renderer {
                 // the whole float is new: both borders have to be redrawn.
                 let borders = float_full
                     || scrolled
+                    || retitled
                     || owner_rows
                         .iter()
                         .any(|row| *row == rect.y || *row == rect.bottom().saturating_sub(1));
@@ -247,6 +260,7 @@ impl Renderer {
                 borders,
                 &links.float,
                 scroll,
+                float_title,
             );
         }
 
@@ -577,6 +591,7 @@ fn emit_float(
     borders: bool,
     links: &Links,
     scroll: usize,
+    title: Option<&str>,
 ) {
     let width = content.width;
 
@@ -619,6 +634,7 @@ fn emit_float(
             Corner::BottomLeft,
             Corner::BottomRight,
         );
+        emit_top_title(out, rect, title);
         emit_title(out, rect, content, scroll);
     }
 }
@@ -817,6 +833,36 @@ fn emit_horizontal_border(
     reset(out);
 }
 
+/// The child's own name, printed in the top border, left-aligned after the corner.
+///
+/// Truncated to the room the border has, because a title comes from a child and a
+/// child can print anything. The count is of characters, not cells: the border is
+/// decoration, and a wide glyph in a title is not worth a `unicode-width`
+/// dependency in the one function that would use it.
+fn emit_top_title(out: &mut Vec<u8>, rect: Rect, title: Option<&str>) {
+    let Some(title) = title else {
+        return;
+    };
+    let available = usize::from(rect.width.saturating_sub(2));
+    if available == 0 {
+        return;
+    }
+
+    let mut painted: String = title.chars().take(available).collect();
+    // A single space keeps the title off the corner even when it fills the border.
+    if painted.chars().count() == available && available > 1 {
+        painted = title.chars().take(available - 1).collect();
+    }
+    if painted.is_empty() {
+        return;
+    }
+
+    cup(out, rect.y, rect.x.saturating_add(1));
+    out.extend_from_slice(BORDER_COLOR);
+    out.extend_from_slice(painted.as_bytes());
+    reset(out);
+}
+
 /// The child's size, printed in the bottom border — plus how far back the view is
 /// scrolled, if it is. ASCII only, so `len()` is the cell count.
 fn emit_title(out: &mut Vec<u8>, rect: Rect, content: Rect, scroll: usize) {
@@ -995,6 +1041,9 @@ fn parse_u16(bytes: &[u8]) -> Option<u16> {
 }
 
 #[cfg(test)]
+mod golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::images::Ingest;
@@ -1095,6 +1144,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
 
         let frame = text(frame);
@@ -1120,6 +1170,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
 
         let second = renderer.render(Panes {
@@ -1131,6 +1182,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
         assert!(second.is_empty(), "second frame: {:?}", text(second));
     }
@@ -1151,6 +1203,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
 
         parser.process(b"\r\nchanged");
@@ -1163,6 +1216,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         assert!(frame.contains("changed"), "frame: {frame:?}");
@@ -1188,6 +1242,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         assert!(frame.contains("floating"), "frame: {frame:?}");
@@ -1215,6 +1270,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
         // The float disappearing is a repaint, but the owner's cells are intact.
         let frame = text(renderer.render(Panes {
@@ -1226,6 +1282,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
         assert!(frame.is_empty(), "frame: {frame:?}");
     }
@@ -1246,6 +1303,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         assert!(frame.contains("\x1b[?25l"), "frame: {frame:?}");
@@ -1279,6 +1337,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         let el_at = frame.find("\x1b[K").expect("the float row should erase");
@@ -1310,6 +1369,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         };
 
         let mut renderer = Renderer::new();
@@ -1336,6 +1396,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         };
 
         let mut renderer = Renderer::new();
@@ -1367,6 +1428,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
 
         // Nothing changed, so nothing is painted…
@@ -1379,6 +1441,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
         assert!(quiet.is_empty());
 
@@ -1393,6 +1456,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         assert!(frame.contains("owner"), "frame: {frame:?}");
@@ -1435,6 +1499,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         let row_at = frame.find("hi").expect("the float row is painted");
@@ -1467,6 +1532,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
 
         let second = renderer.render(Panes {
@@ -1478,6 +1544,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
         assert!(second.is_empty(), "frame: {:?}", text(second));
     }
@@ -1502,6 +1569,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
 
         // The float moved: same image, one line of placement, no payload.
@@ -1516,6 +1584,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         assert!(frame.contains("\x1b_Ga=p,i=7\x1b\\"), "frame: {frame:?}");
@@ -1542,6 +1611,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
 
         // `Home`: the kitty image lives in a layer our repaint cannot reach.
@@ -1555,6 +1625,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
         assert!(hidden.contains("\x1b_Ga=d,d=A\x1b\\"), "frame: {hidden:?}");
 
@@ -1569,8 +1640,53 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
         assert!(shown.contains("QUJD"), "frame: {shown:?}");
+    }
+
+    #[test]
+    fn the_float_border_names_the_thing_running_in_it() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 20);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 22, 5);
+        let mut renderer = Renderer::new();
+        let mut frame_for = |title: Option<&str>| {
+            text(renderer.render(Panes {
+                owner: owner.screen().clone(),
+                owner_area: Rect::new(0, 0, 40, 10),
+                float: Some((float.screen().clone(), rect)),
+                float_focused: true,
+                images: None,
+                links: FrameLinks::default(),
+                scroll: 0,
+                focused_scrolled: false,
+                float_title: title,
+            }))
+        };
+
+        // The cells do not change, so the title appearing has to be what repaints
+        // the border — otherwise a child that renames itself is invisible.
+        let untitled = frame_for(None);
+        assert!(!untitled.contains("btop"), "frame: {untitled:?}");
+
+        let named = frame_for(Some("btop"));
+        assert!(named.contains("btop"), "frame: {named:?}");
+
+        // A rename is a repaint too.
+        let renamed = frame_for(Some("nvim"));
+        assert!(renamed.contains("nvim"), "frame: {renamed:?}");
+
+        // A title longer than the border is clipped inside it, and the right-hand
+        // corner survives: a child must not be able to paint over the frame.
+        let long_title = "x".repeat(200);
+        let long = frame_for(Some(long_title.as_str()));
+        assert!(long.contains(&"x".repeat(19)), "frame: {long:?}");
+        assert!(!long.contains(&"x".repeat(21)), "frame: {long:?}");
+        assert!(long.contains('┐'), "frame: {long:?}");
     }
 
     #[test]
@@ -1593,6 +1709,7 @@ mod tests {
                 links: FrameLinks::default(),
                 scroll,
                 focused_scrolled: scroll > 0,
+                float_title: None,
             }))
         };
 
@@ -1636,6 +1753,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
 
         // Text painted over sixel destroys it, so any repaint has to be followed
@@ -1650,6 +1768,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
         assert!(frame.contains("more"), "frame: {frame:?}");
         assert!(frame.contains("\x1bPq"), "frame: {frame:?}");
@@ -1680,6 +1799,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
         assert!(!frame.contains("QUJD"), "frame: {frame:?}");
     }
@@ -1743,6 +1863,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         assert!(frame.contains("1337;File="), "frame: {frame:?}");
@@ -1783,6 +1904,7 @@ mod tests {
             },
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         let open = frame.find("\x1b]8;;https://example.com\x1b\\");
@@ -1817,6 +1939,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         });
 
         // The cells do not change; only the link is added. A diff would show
@@ -1840,6 +1963,7 @@ mod tests {
             },
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
         assert!(
             frame.contains("\x1b]8;;https://example.com\x1b\\"),
@@ -1871,6 +1995,7 @@ mod tests {
             },
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
         assert!(!frame.contains("\x1b]8;"), "no link over the wrong words: {frame:?}");
     }
@@ -1897,6 +2022,7 @@ mod tests {
             },
             scroll: 0,
             focused_scrolled: false,
+            float_title: None,
         }));
 
         let open = frame.find("\x1b]8;;file:///tmp\x1b\\").expect("opened");
@@ -1949,6 +2075,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: true,
+            float_title: None,
         }));
         assert!(frame.contains(&oldest), "frame: {frame:?}");
         assert!(!frame.contains("line9"), "frame: {frame:?}");
@@ -1973,6 +2100,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: scroll > 0,
+            float_title: None,
         };
 
         // The live screen first, in full: the newest line is on it.
@@ -1993,6 +2121,7 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: true,
+            float_title: None,
         }));
         assert!(!back.is_empty(), "scrolling must repaint");
 
@@ -2025,6 +2154,7 @@ mod tests {
                 links: FrameLinks::default(),
                 scroll,
                 focused_scrolled: scroll > 0,
+                float_title: None,
             }))
         };
 

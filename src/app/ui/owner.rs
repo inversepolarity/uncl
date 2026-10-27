@@ -29,13 +29,14 @@ use crossterm::{
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use vt100::{CursorStyle, MouseProtocolMode, Screen};
+use vt100::{MouseProtocolMode, Screen};
 
 use crate::app::input::encode::{ChildModes, encode_key, encode_mouse};
 use crate::app::input::mouse::{self, MouseRoute, Wheel};
 use crate::app::lease::{Lease, new_parser};
 use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::term::callbacks::ChildState;
+use crate::app::term::dcs;
 use crate::app::signal::Signal;
 use crate::app::render::{FrameLinks, Panes, Renderer};
 use crate::app::term::callbacks::ReplySink;
@@ -225,7 +226,7 @@ impl Container {
         let session = self
             .lease
             .tenant
-            .spawn(parser, sink, signal, &self.caps, images)?;
+            .spawn(parser, sink, signal, self.caps.clone(), images)?;
         self.lease.attach(session);
         Ok(())
     }
@@ -264,6 +265,7 @@ impl Container {
             // The owner pane is the real terminal: its images are as invisible as
             // they were before S3, which is honest — we never claim otherwise.
             None,
+            self.caps.clone(),
         )?;
         self.session = Some(session);
 
@@ -283,6 +285,10 @@ impl Container {
             MoveTo(0, 0)
         )?;
         self.sync_host_mouse();
+        // Nobody has the mouse or the bell until the toggle says so: the float is
+        // visible at startup, so it is the focused pane (`refocus` is what makes
+        // the two mechanisms agree).
+        self.refocus(self.float_focused());
 
         // The first frame paints every cell; nothing is inherited from the
         // screen that was there before.
@@ -368,6 +374,10 @@ impl Container {
             float: self.lease.tenant_state.links().snapshot(),
         };
 
+        // The float's child may have named itself (`OSC 0/2`); the border is the
+        // only place a floating window can say what is running in it.
+        let float_title = self.lease.tenant_state.title();
+
         let bytes = self.renderer.render(Panes {
             owner,
             owner_area,
@@ -378,6 +388,7 @@ impl Container {
             // Shown in the float's bottom border while scrolled back.
             scroll: self.tenant_scroll,
             focused_scrolled,
+            float_title: float_title.as_deref(),
         });
 
         if !bytes.is_empty() {
@@ -578,7 +589,7 @@ impl Container {
             self.parser.read().unwrap().screen().cursor_style()
         };
 
-        let code = decscusr(style);
+        let code = dcs::decscusr(style);
         if code == self.cursor_style {
             return;
         }
@@ -624,6 +635,10 @@ impl Container {
     fn refocus(&self, focus_float: bool) {
         self.send_focus(!focus_float, false);
         self.send_focus(focus_float, true);
+        // uncl's own copy of "who has the keyboard": the bell only rings from the
+        // focused pane, so a hidden float cannot interrupt the owner's shell.
+        self.parser_state.set_focused(!focus_float);
+        self.lease.tenant_state.set_focused(focus_float);
     }
 
     fn forward_paste(&self, text: &str) {
@@ -1052,19 +1067,6 @@ impl Container {
         }
 
         Ok(())
-    }
-}
-
-/// `DECSCUSR` parameter for a `vt100` cursor style.
-fn decscusr(style: CursorStyle) -> u16 {
-    match style {
-        CursorStyle::Default => 0,
-        CursorStyle::BlinkBlock => 1,
-        CursorStyle::SteadyBlock => 2,
-        CursorStyle::BlinkUnderline => 3,
-        CursorStyle::SteadyUnderline => 4,
-        CursorStyle::BlinkVerticalBar => 5,
-        CursorStyle::SteadyVerticalBar => 6,
     }
 }
 

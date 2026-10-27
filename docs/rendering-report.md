@@ -325,6 +325,7 @@ Sources for the ConPTY v1/v2 distinction: Windows Terminal 1.22 release notes (`
 | S3 cheap-tier images — **shipped** | ~3 d | ~+450 | kitty images (croppable), sixel (if it fits), passthrough | Medium-low, because the quality contract is explicit (§6.4 non-goals). |
 | S3.5 hyperlinks (`OSC 8`) — **shipped** | 1 d | ~+430 | links *emitted* inside the float | Low; or free with S4. |
 | S3.6 clicks + scrollback — **shipped** | 1 d | ~+650 | links in the float actually **open**; history in both panes, sized by `UNCL_SCROLLBACK` | Low-medium: the click is uncl's because the host never sees it (§Appendix H), and the scrollback copy is a per-frame cost that `UNCL_SCROLLBACK` trades against |
+| S3.7 compatibility batch — **shipped** | 1 d | ~+700 | `DECRQSS`, `XTGETTCAP`, `TERM` pass-through, the bell, the child's title in the border, in-session clipboard, and the golden-frame harness that guards all of it | Low: every answer is derived from state `vt100` already tracks, and anything it does not track is refused rather than approximated |
 | S4 engine swap (`alacritty_terminal`) | 3–5 d | ~+600 | underline colour/styles, hyperlinks, kitty-keyboard input, sync output, `EventListener` (title/clipboard/bell) | Medium; **requires S2** (you must own the encoder before leaving `vt100`). Optional — skip unless users ask for the fidelity *inside* a float. |
 | §6.6 Windows delta | 1–2 d | ~+120 | Windows build that runs a TUI float (no images) | Medium; needs a real Windows box or CI runner to validate input modes. |
 
@@ -1456,26 +1457,28 @@ item 14) remain the two open items nobody has needed yet.
 ## Appendix I — the remaining roadmap, as of 2026-10-27
 
 S0 → S3.6 are in the tree (`bb1d575`): 150 tests, all of them unit tests. This is
-what is actually left, ordered by *value per day* rather than by stage number. Each
+what is actually left, ordered by *value per day* rather than by stage number.
+**S3.7 (Appendix J) has since closed A1, A2, A4, A5, A6 and B1, and half of A3**;
+the rows below are kept as they were written, with a note on each one that moved. Each
 row says how I know it is open — a grep, an absent directory, or a comment — so the
 list can be re-derived instead of trusted.
 
-### A. Small user-visible gaps (½–1 day each, no dependency)
+### A. Small user-visible gaps (½–1 day each, no dependency) — **all closed in S3.7 except A3's system clipboard**
 
 | # | Item | Evidence it is open | Fix | Buys |
 |---|---|---|---|---|
-| A1 | **`DCS $q` (DECRQSS)** | only mentioned in comments; `callbacks::reply_for_*` never answers it | answer `m` (SGR), `r` (DECSTBM), `s` (DECSLRM), ` q` (DECSCUSR) from the live `Screen`, and answer *unknown* with `DCS 0$r ST` rather than silence | `vim`/`neovim` under `:terminal`, `tmux` interop, anything that probes "can I use this style" stops guessing |
-| A2 | **`XTGETTCAP`** | zero hits in `src/` | static table (`TN`, `Co`, `RGB`, `colors`, `Smulx` → *absent* until S4) | `kitty`-family tools, `nvim`'s `--embed` probing, and `ncurses` fallbacks stop falling back for the wrong reason |
-| A3 | **`OSC 52` *reads*** | `reply_for_osc` explicitly returns `None` for `52;c;?` | forward the query to the host and route the answer back into the child's pty (the host's reply arrives as *input*, so this needs a one-shot pending-reply slot) | "paste from system clipboard" inside the float works instead of timing out |
-| A4 | **`TERM` pass-through** (§9 item 4) | `caps::apply_child_env` hard-codes `xterm-256color` | copy the host's `TERM`/`COLORTERM`/`TERM_PROGRAM`, downgrade `TERM` under `screen`/`tmux`, and keep the capability proxy as the source of truth for sixel/kitty | a kitty host's children stop believing they are on a dumb 256-colour terminal |
-| A5 | **`BEL` from the float** | no `\x07` is ever written to the host outside image parsers | pass the bell through when the *focused* pane rings | `nvim`/`readline` bells are audible again |
-| A6 | **Child title** | `OSC 0/2` is dropped (only 20t/21t *queries* are considered) | show the child's title in the float's top border, keeping `s:H:W +N` in the bottom one | a float running `ssh`/`nvim` says what it is, which is most of what the border is for |
+| A1 **shipped** | **`DCS $q` (DECRQSS)** | only mentioned in comments; `callbacks::reply_for_*` never answers it | answer `m` (SGR), `r` (DECSTBM), `s` (DECSLRM), ` q` (DECSCUSR) from the live `Screen`, and answer *unknown* with `DCS 0$r ST` rather than silence | `vim`/`neovim` under `:terminal`, `tmux` interop, anything that probes "can I use this style" stops guessing |
+| A2 **shipped** | **`XTGETTCAP`** | zero hits in `src/` | static table (`TN`, `Co`, `RGB`, `colors`, `Smulx` → *absent* until S4) | `kitty`-family tools, `nvim`'s `--embed` probing, and `ncurses` fallbacks stop falling back for the wrong reason |
+| A3 | **`OSC 52` *reads*** — **half shipped** | `paste_from_clipboard` is now answered from an in-session record; the *system* clipboard is still out of reach | forward the query to the host and route the answer back into the child's pty — the reply arrives as *input*, and stdin belongs to `crossterm`, so this needs raw input to be taken over (S3.7 explains why that was not done) | "copy here, paste here" works today (Appendix J); "paste what you copied in another window" does not |
+| A4 **shipped** | **`TERM` pass-through** (§9 item 4) | `caps::apply_child_env` hard-codes `xterm-256color` | copy the host's `TERM`/`COLORTERM`/`TERM_PROGRAM`, downgrade `TERM` under `screen`/`tmux`, and keep the capability proxy as the source of truth for sixel/kitty | a kitty host's children stop believing they are on a dumb 256-colour terminal |
+| A5 **shipped** | **`BEL` from the float** | no `\x07` is ever written to the host outside image parsers | pass the bell through when the *focused* pane rings | `nvim`/`readline` bells are audible again |
+| A6 **shipped** | **Child title** | `OSC 0/2` is dropped (only 20t/21t *queries* are considered) | show the child's title in the float's top border, keeping `s:H:W +N` in the bottom one | a float running `ssh`/`nvim` says what it is, which is most of what the border is for |
 
-### B. The regression net (1 day, pays for itself immediately)
+### B. The regression net (1 day, pays for itself immediately) — **closed in S3.7**
 
 | # | Item | Evidence it is open | Fix |
 |---|---|---|---|
-| B1 | **Golden-frame harness + corpus** (§8.1, §10 item 14) | no `tests/` directory, no CI workflow | a `tests/` binary that feeds a recorded stream to a parser at a fixed size, renders through uncl's emitter, replays the result into a fresh `vt100`, and compares `contents_formatted()` — two engines, one assertion, no terminal. Corpus: `?1049`, mouse modes, `?2004`, wide/CJK/emoji, combining marks, `OSC 8`, a small sixel and a small kitty image |
+| B1 **shipped** | **Golden-frame harness + corpus** (§8.1, §10 item 14) | no `tests/` directory, no CI workflow | a `tests/` binary that feeds a recorded stream to a parser at a fixed size, renders through uncl's emitter, replays the result into a fresh `vt100`, and compares `contents_formatted()` — two engines, one assertion, no terminal. Corpus: `?1049`, mouse modes, `?2004`, wide/CJK/emoji, combining marks, `OSC 8`, a small sixel and a small kitty image |
 
 B1 is the only item that makes the other rows cheaper: S3.6's own test bug (asserting
 a word from a frame that emits a cell diff) is exactly the class this catches.
@@ -1525,3 +1528,162 @@ prints the capability record including the scrollback size.
 `A1 A2 A4` (one day, three real-world compatibility bugs) → `B1` (the net) →
 `A3 A5 A6` → `D2` (a decision, then maybe an afternoon) → `C` (the swap, with B1 in
 place) → `E` (Windows) whenever a box exists.
+
+## Appendix J — S3.7 implementation log (2026-10-27): the compatibility batch
+
+Appendix I sorted the remaining work by value per day and put six small gaps first,
+because each one is a program deciding uncl cannot do something and falling back to
+a worse path. This is that batch. Nothing here is a new capability: it is uncl
+answering questions about capabilities it already had, plus three things `vt100`
+parses and nobody was listening to.
+
+### The shape of the bug, five times over
+
+Every item below is the same failure: **the child asked, and nothing answered.**
+
+| What the child asked | What `vt100` does with it | What happened before |
+|---|---|---|
+| `DCS $ q m ST` (DECRQSS: what is your SGR?) | nothing at all — `vte`'s `hook`/`put`/`unhook` reach no callback | the child waited out its timeout and assumed defaults |
+| `DCS + q 544e ST` (XTGETTCAP: what *are* you?) | nothing at all | "not kitty, then: no truecolor, no underline styles" — a guess, sometimes the right one by luck |
+| `OSC 2 ; title` (name yourself) | stores it, calls `set_window_title` — which was unimplemented | the float's border never said what was running in it |
+| `^G` | calls `audible_bell` — which was unimplemented | a bell nobody could hear |
+| `OSC 52 ; c ; ?` (paste) | calls `paste_from_clipboard` — which was unimplemented | copy-then-paste inside the float silently did nothing |
+
+The general law, now written down because it has bitten twice: **`vt100`'s
+`Callbacks` trait is a list of things the engine refuses to be responsible for.**
+Every unimplemented method on it is a sequence the child sends and uncl drops.
+
+### What landed
+
+| # | Change | File |
+|---|---|---|
+| 1 | `dcs::reply()` — `DECRQSS` and `XTGETTCAP` answered from the live `Screen`; `DECRQSS` reports the pen (`SGR m`) and the cursor shape (` q`), and refuses (`DCS 0 $ r`) anything this engine does not track: scroll margins, `DECSLRM`, `DECSCL`. `XTGETTCAP` answers `TN`, `Co`/`colors`, `RGB` (only when truecolor is real), and refuses `Smulx`/`Setulc` until S4 | `src/app/term/dcs.rs` (new, 10 tests) |
+| 2 | the answer is produced in the pty reader, where the image tap already separates `DCS` from the stream — `vt100` drops `DCS` wholesale, so this is the only place it can happen | `src/app/pty.rs` |
+| 3 | `decscusr()` moved here from `ui::owner`, so the host's cursor and a `DECRQSS` answer come from one table | `src/app/term/dcs.rs`, `src/app/ui/owner.rs` |
+| 4 | `caps::child_term()` — the host's `TERM` family passed through, downgraded for `screen*`/`tmux*` (a dialect we do not speak), `xterm-kitty` (its `TERM` enables the kitty *keyboard* protocol, which we do not implement — the graphics half is advertised through `UNCL_GRAPHICS`), and consoles | `src/app/term/caps.rs` (+2 tests, one `--doctor` line) |
+| 5 | `audible_bell` forwarded to the host, but only from the pane that owns the keyboard (`ChildState::focused`, set by `refocus`) | `src/app/term/callbacks.rs` |
+| 6 | `set_window_title` recorded per pane, sanitised (control characters stripped, 256 bytes max) | `src/app/term/callbacks.rs` |
+| 7 | `Panes::float_title` + `emit_top_title`: the title in the float's **top** border, clipped to the border, with the size and scroll offset left in the bottom one; a rename forces a border repaint (a title that never appears is worse than none) | `src/app/render/mod.rs` (+1 test) |
+| 8 | `paste_from_clipboard` answered from an in-session record of what a child copied, matched by selector; a request for something never copied here stays unanswered | `src/app/term/callbacks.rs` (+1 test) |
+
+### Why the clipboard is in-session only
+
+`OSC 52 ; c ; ?` is a *request to the terminal*, so answering it properly means
+asking the host and reading its reply. That reply arrives as **input**, and
+uncl's input is `crossterm`'s event stream: it parses stdin into key events, and an
+`OSC 52` reply is not a key event — it would be dropped, or worse, misparsed into
+stray keystrokes. Doing this properly means taking over raw stdin and demultiplexing
+it ourselves, which is a real change to the input path (§6.2.7's encoder work), not
+a callback.
+
+What *is* cheap and fixes the case people actually hit is the round trip: a child
+that copies and then pastes. `copy_to_clipboard` already relays every copy to the
+host, so the payload passes through uncl; remembering it costs one `Vec` per pane.
+`vim`'s `"+y` / `"+p` now works inside the float. Pasting what you copied in
+*another* window still does not, and Appendix I keeps that half open rather than
+pretending otherwise.
+
+### Why `TERM` is now passed through (carefully)
+
+`xterm-256color` was honest when uncl could transport nothing but text. It is no
+longer: the image tap carries kitty and iTerm2 payloads byte for byte, `OSC 8`
+arrives at the host, and 24-bit colour survives the re-encode. Refusing the host's
+`TERM` made every child take the degraded path for no reason — the same
+"advertise only what you carry, but *do* carry what you advertise" rule that
+`FORCE_HYPERLINK` and DA1 follow, in the other direction.
+
+Three families are still downgraded, and the reason is input rather than output:
+
+* `screen*`, `tmux*` — their `TERM` describes a multiplexer's own escape dialect.
+* `xterm-kitty` — kitty's `TERM` is what makes applications turn **on the kitty
+  keyboard protocol**, and uncl's encoder speaks the legacy key encodings
+  (Appendix I, item C2). Claiming it would make the claim false about *keys*, which
+  is the one direction uncl cannot fake. Kitty's graphics are advertised where they
+  belong: `UNCL_GRAPHICS` and the tap.
+* `dumb`, `linux`, unset — nothing to pass through.
+
+`uncl --doctor` prints both the host's `TERM` and the child's, with the reason when
+they differ, so this mapping is never a mystery in a bug report.
+
+### The golden-frame harness (§8.1, the last open S2 item)
+
+`src/app/render/golden.rs` — a `#[cfg(test)]` module rather than a `tests/` binary,
+because uncl is a binary crate with no library target to import; keeping it inside
+the module tree is what lets it use the real `Renderer` with no visibility changes,
+and it runs under the same `cargo test`.
+
+Three tests, one idea:
+
+1. **`every_corpus_stream_replays_to_the_screen_it_drew`** — 15 recorded streams
+   (plain text, 16/256/truecolor SGR, inverse bars, wide CJK, combining marks,
+   erase/delete/insert, cursor moves, autowrap off, `\r` progress overwrites, tabs
+   and backspace, `REP`, an alt-screen round trip, an `OSC 8` span, hidden cursor +
+   `DECSCUSR`, and a bottom-of-grid scroll) are each written into a `vt100` parser,
+   rendered through uncl's emitter, and fed to a **second** `vt100`. Every cell —
+   contents *and* attributes — plus the cursor position must match.
+2. **`a_growing_corpus_replays_frame_by_frame`** — the same corpus grown one frame
+   at a time against a terminal that has already seen the previous frames, which is
+   the **diff** path and where clipping bugs live. Plus: an unchanged screen must
+   paint nothing.
+3. **`a_resize_repaints_and_the_result_replays`** — a painted grid, resized, painted
+   again; nothing else in the suite covered that transition end to end.
+
+Why this is not a tautology — it feeds uncl's *output* to a fresh parser and
+compares against the *input's* screen, so it fails for exactly the bugs that matter
+(clipping, a lost attribute, a mis-shifted row) and for nothing else. Why it has no
+golden files: the expectation is the source screen, so the corpus can grow without
+anyone re-blessing fixtures.
+
+The one subtlety worth recording, because it was checked against the source before
+writing the harness: `Screen::rows_diff` positions *each row* from its own start
+(`prev_pos: Pos { row: i, col: start }`), so the only move a diff row can begin with
+is a relative `CSI n C` from column `start` — never `\r\n`, never an absolute
+`CUP`. That is exactly what uncl's `cup(row, start)` + `append_row` assumes. Had it
+used the crate-level `write_contents_diff` instead, rows would have begun with
+`\r\n` and every diffed row would have landed one line low; the harness would have
+caught that on its first run, which is the point of having it.
+
+### Verification status
+
+- **169 tests** (was 150: +10 `dcs`, +4 callbacks, +2 caps, +1 renderer, +3 golden —
+  minus the two `owner` tests that moved with `decscusr`, which had none).
+- Still **no Rust toolchain here**: every file parses with `tree-sitter-rust`, and
+  the `vt100` facts relied on were read from the sources — `Callbacks` has
+  `audible_bell`, `set_window_title`, `copy_to_clipboard` and `paste_from_clipboard`
+  and **no** `DCS` hook; `PasteFromClipboard`/`OSC 52` with `?` reaches the callback
+  (`perform.rs` `oscd`ispatch); `Screen` exposes the pen (`bold`/`dim`/`italic`/
+  `underline`/`inverse`/`fgcolor`/`bgcolor`) and `cursor_style()`, which is what makes
+  the `DECRQSS` answers true rather than conventional.
+- The golden harness has never been run. It is the one thing in this batch that could
+  legitimately fail on first run, and if it does, the frame it prints is the bug
+  report: the failure message carries the cell, both values, the whole screen text
+  and the frame bytes.
+
+### Acceptance script (S3.7 exit criteria)
+
+```sh
+cargo test                                        # 169
+cargo build --release && ./target/release/uncl --doctor   # TERM, child TERM, scrollback
+
+# 1. DECRQSS: a program that asks what the pen is now gets a true answer.
+printf '\eP$qm\e\\'                 # expect  \eP1$r0m\e\\   (and the same after \e[1;31m)
+printf '\eP$q q\e\\'                # expect  \eP1$r0 q\e\\
+
+# 2. XTGETTCAP: what the terminal claims.
+printf '\eP+q544e\e\\'              # TN  -> hex of the child's TERM
+printf '\eP+q436f\e\\'              # Co  -> 323536 (256)
+printf '\eP+q536d756c78\e\\'        # Smulx -> refused (0+r) until S4
+
+# 3. the child's title in the top border:
+printf '\e]2;hello from the float\a'; the float's top border reads it.
+#    `nvim` / `ssh` set it themselves; a rename updates the border immediately.
+
+# 4. the bell: `printf '\a'` in the float is audible; in the owner shell while the
+#    float is *visible* it is not (only the focused pane rings).
+
+# 5. clipboard round trip inside the float: `printf '\e]52;c;aGk=\e\\'` (copy "hi"),
+#    then `printf '\e]52;c;?\e\\'` (paste) -> the same base64 comes back.
+#    In a program: vim's `"+y` then `"+p`.
+
+# 6. TERM: `echo $TERM` in the float. Under WezTerm/alacritty/foot it is the host's
+#    own; under kitty, screen or tmux it is `xterm-256color` and --doctor says why.

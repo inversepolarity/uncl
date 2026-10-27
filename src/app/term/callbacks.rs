@@ -15,7 +15,7 @@
 //! interleave its bytes with a frame.
 
 use std::sync::{
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -45,12 +45,23 @@ impl ReplySink {
     }
 }
 
-/// Modes a child switched on that `vt100` does not model for us, and the
-/// hyperlinks it drew (see [`super::links`]).
+/// What a child asked of its terminal that the screen itself does not record:
+/// the modes it switched on, the window title it set, whether it is the pane with
+/// the keyboard, and the hyperlinks it drew (see [`super::links`]).
 #[derive(Debug, Default)]
 pub struct ChildState {
     focus_reporting: AtomicBool,
+    /// Does this pane own the keyboard? Set by the UI on every focus change; used
+    /// to decide whether the child may ring the *host's* bell and to keep the
+    /// host's mouse grab in step.
+    focused: AtomicBool,
     links: SharedLinks,
+    /// The `OSC 0/2` title, sanitised. `None` until the child sets one.
+    title: Mutex<Option<String>>,
+    /// The last clipboard payload a child copied, verbatim base64, with its
+    /// selector. This is uncl's own in-session clipboard — see
+    /// `paste_from_clipboard` for why it is not the system's.
+    clipboard: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
 }
 
 impl ChildState {
@@ -62,10 +73,70 @@ impl ChildState {
         self.focus_reporting.store(enabled, Ordering::Relaxed);
     }
 
+    /// Is this the pane with the keyboard?
+    pub fn focused(&self) -> bool {
+        self.focused.load(Ordering::Relaxed)
+    }
+
+    /// Called by the UI when the keyboard moves. Not a child request: this is
+    /// uncl's own bookkeeping.
+    pub fn set_focused(&self, focused: bool) {
+        self.focused.store(focused, Ordering::Relaxed);
+    }
+
     /// The pane's hyperlinks, for the renderer.
     pub fn links(&self) -> &SharedLinks {
         &self.links
     }
+
+    /// The child's window title, for the float's border.
+    pub fn title(&self) -> Option<String> {
+        self.title.lock().ok()?.clone()
+    }
+
+    fn set_title(&self, title: &[u8]) {
+        let title = sanitize_title(title);
+        if let Ok(mut slot) = self.title.lock() {
+            *slot = title;
+        }
+    }
+
+    fn remember_copy(&self, ty: &[u8], data: &[u8]) {
+        if let Ok(mut slot) = self.clipboard.lock() {
+            *slot = Some((ty.to_vec(), data.to_vec()));
+        }
+    }
+
+    /// The payload to hand a child that asked to paste from the clipboard.
+    ///
+    /// Served from this pane's own record of what a child last copied, and only
+    /// when the selector matches — `c` for the clipboard, `p`/`s` for the primary
+    /// selection. `None` means "nothing was copied here", and the honest answer to
+    /// that is silence.
+    pub fn clipboard(&self, ty: &[u8]) -> Option<Vec<u8>> {
+        let stored = self.clipboard.lock().ok()?.clone()?;
+        let (stored_ty, data) = stored;
+        // `c` is the clipboard; `p`, `s` and the numbered selectors are
+        // selections. Only hand back what was stored under the same one.
+        (stored_ty == ty).then_some(data)
+    }
+}
+
+/// How long a title the border will ever be asked to hold. The renderer truncates
+/// to the float's width anyway; this only bounds what a child can make us keep.
+const MAX_TITLE: usize = 256;
+
+/// Strip what must not reach the border: control characters (a title can contain
+/// `ESC`, and this text is painted into a frame) and the sequences that would
+/// move the cursor if they did get through.
+fn sanitize_title(title: &[u8]) -> Option<String> {
+    let text: String = String::from_utf8_lossy(title)
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_TITLE)
+        .collect();
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +205,25 @@ impl Callbacks for ChildCallbacks {
         }
     }
 
+    /// `^G` — the child's bell. The host's bell, in fact: the child's output never
+    /// reaches the real terminal (S2 owns the frame), so a bell nobody forwards is
+    /// a bell nobody hears.
+    ///
+    /// Only the focused pane rings. A hidden float that is still parsing must not
+    /// be able to interrupt what the user is doing in the shell behind it.
+    fn audible_bell(&mut self, _screen: &mut Screen) {
+        if self.state.focused() {
+            let _ = self.host.send(b"\x07".to_vec());
+        }
+    }
+
+    /// `OSC 0` / `OSC 2` — the child naming its window. Kept per pane; the float's
+    /// border draws it (`app::render`), which is the one place a floating window
+    /// can say what it is running.
+    fn set_window_title(&mut self, _screen: &mut Screen, title: &[u8]) {
+        self.state.set_title(title);
+    }
+
     /// `OSC 52 ; <selector> ; <base64>` — the child copying to the clipboard.
     ///
     /// This is not a query about the child's terminal, it is a request the real
@@ -141,7 +231,30 @@ impl Callbacks for ChildCallbacks {
     /// validated both the selector and the payload as base64, which means we can
     /// relay it byte for byte without decoding.
     fn copy_to_clipboard(&mut self, _screen: &mut Screen, ty: &[u8], data: &[u8]) {
+        self.state.remember_copy(ty, data);
         let _ = self.host.send(osc52(ty, data));
+    }
+
+    /// `OSC 52 ; <selector> ; ?` — the child pasting from the clipboard.
+    ///
+    /// The *system* clipboard is out of reach here, and not because of a missing
+    /// feature: reading it means sending a query to the host terminal and reading
+    /// its reply out of stdin, and stdin belongs to `crossterm`, which parses it
+    /// into key events and would drop or misparse an `OSC 52` reply. Uncl would
+    /// have to take over raw input to do this (tracked in the rendering report,
+    /// Appendix I, item A3).
+    ///
+    /// What *is* reachable, and is the case that actually breaks today, is a child
+    /// that copies and then pastes in the same session (`vim`'s `"+y` then `"+p`,
+    /// an editor's "copy path" command). Every copy goes through
+    /// [`Self::copy_to_clipboard`], so the payload is already here. Answering from
+    /// that record makes the round trip work without pretending to own the
+    /// system's clipboard, and a request for something never copied here stays
+    /// unanswered, which is the truthful reply.
+    fn paste_from_clipboard(&mut self, _screen: &mut Screen, ty: &[u8]) {
+        if let Some(data) = self.state.clipboard(ty) {
+            self.sink.send(osc52(ty, &data));
+        }
     }
 }
 
@@ -438,6 +551,84 @@ mod tests {
         assert!(reply_for_osc(&[&b"4"[..], &b"99"[..], &b"?"[..]]).is_none());
         assert!(reply_for_osc(&[&b"52"[..], &b"c"[..], &b"?"[..]]).is_none());
         assert!(reply_for_osc(&[&b"8"[..], &b";;"[..], &b"https://x"[..]]).is_none());
+    }
+
+    #[test]
+    fn a_title_is_sanitised_before_it_reaches_the_border() {
+        let state = ChildState::default();
+        assert_eq!(state.title(), None);
+
+        state.set_title(b"nvim ~/uncl");
+        assert_eq!(state.title().as_deref(), Some("nvim ~/uncl"));
+
+        // A title can contain anything; the border is a frame, so control
+        // characters (which is what an escape is) never make it through.
+        state.set_title(b"bad\x1b[2Jtitle\x07");
+        assert_eq!(state.title().as_deref(), Some("bad[2Jtitle"));
+
+        // Whitespace only is the same as no title at all.
+        state.set_title(b"   ");
+        assert_eq!(state.title(), None);
+    }
+
+    #[test]
+    fn a_copy_can_be_pasted_back_within_the_session() {
+        let (callbacks, sink, _state) = ChildCallbacks::new(caps(), host().0);
+        // Stands in for the child's stdin: the sink is installed by the pty writer.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        sink.install(&tx);
+        let mut parser = vt100::Parser::new_with_callbacks(nz(4), nz(20), 0, callbacks);
+
+        // Nothing copied yet: silence, which is the truthful answer.
+        let (screen, callbacks) = parser.screen_and_callbacks_mut();
+        callbacks.paste_from_clipboard(screen, b"c");
+        assert!(rx.try_recv().is_err());
+
+        // A child copies, then asks to paste: exactly those bytes come back, in
+        // the form a terminal uses to hand over a clipboard.
+        let (screen, callbacks) = parser.screen_and_callbacks_mut();
+        callbacks.copy_to_clipboard(screen, b"c", b"aGk=");
+        let (screen, callbacks) = parser.screen_and_callbacks_mut();
+        callbacks.paste_from_clipboard(screen, b"c");
+        assert_eq!(
+            rx.try_recv().unwrap().as_ref(),
+            &b"\x1b]52;c;aGk=\x1b\\"[..]
+        );
+
+        // The primary selection was never written, so it is not invented.
+        let (screen, callbacks) = parser.screen_and_callbacks_mut();
+        callbacks.paste_from_clipboard(screen, b"p");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_audible_bell_only_reaches_the_host_from_the_focused_pane() {
+        let (host_tx, mut host_rx) = host();
+        let (mut forward, _sink, state) = ChildCallbacks::new(caps(), host_tx);
+        let mut parser = vt100::Parser::new(nz(4), nz(20), 0);
+        let mut screen = parser.screen().clone();
+
+        // Unfocused: parsed, and deliberately not heard.
+        forward.audible_bell(&mut screen);
+        assert!(host_rx.try_recv().is_err());
+
+        state.set_focused(true);
+        forward.audible_bell(&mut screen);
+        assert_eq!(host_rx.try_recv().unwrap(), b"\x07".to_vec());
+    }
+
+    #[test]
+    fn a_window_title_from_a_child_is_recorded_by_the_parser() {
+        // `vt100` routes `OSC 0`/`OSC 2` to `set_window_title` itself, so feeding
+        // the bytes is the whole path a child takes.
+        let (callbacks, _sink, state) = ChildCallbacks::new(caps(), host().0);
+        let mut parser = vt100::Parser::new_with_callbacks(nz(4), nz(20), 0, callbacks);
+        parser.process(b"\x1b]2;btop\x07");
+        assert_eq!(state.title().as_deref(), Some("btop"));
+
+        // `OSC 0` sets both the icon name and the title.
+        parser.process(b"\x1b]0;nvim\x07");
+        assert_eq!(state.title().as_deref(), Some("nvim"));
     }
 
     #[test]

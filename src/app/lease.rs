@@ -123,7 +123,8 @@ impl Lease {
     }
 }
 
-/// Build a child parser with the callbacks that answer its queries.
+/// Build a child parser with the callbacks that answer its queries, and the
+/// scrollback capacity from the environment (S3.6).
 ///
 /// `host` carries the effects that belong to the real terminal (clipboard
 /// copies); everything else is answered back into the child's own pty.
@@ -132,6 +133,13 @@ pub fn new_parser(
     host: UnboundedSender<Vec<u8>>,
 ) -> (Arc<RwLock<ChildParser>>, ReplySink, Arc<ChildState>) {
     let (callbacks, sink, state) = ChildCallbacks::new(caps, host);
-    let parser = ChildParser::new_with_callbacks(nz(DEFAULT_HEIGHT), nz(DEFAULT_WIDTH), 0, callbacks);
+    // Scrollback is inherited from the environment uncl was launched in; see
+    // `constants::scrollback_lines`. Both panes get the same capacity.
+    let parser = ChildParser::new_with_callbacks(
+        nz(DEFAULT_HEIGHT),
+        nz(DEFAULT_WIDTH),
+        scrollback_lines(),
+        callbacks,
+    );
     (Arc::new(RwLock::new(parser)), sink, state)
 }

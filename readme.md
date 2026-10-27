@@ -23,7 +23,12 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - images inside the float: kitty graphics and iTerm2 inline images are carried
   through (`chafa --format=kitty`, `wezterm imgcat`, `timg -pk`, ...)
 - clickable links inside the float (`OSC 8`): `ls --hyperlink=always`, `gh`,
-  `gcc -fdiagnostics-urls` and friends work; children see `FORCE_HYPERLINK=1`
+  `gcc -fdiagnostics-urls` and friends work; children see `FORCE_HYPERLINK=1`.
+  a plain click opens one, in the float or in the shell behind it - `http`,
+  `https`, `mailto`, `file` and `ftp` only, and only when the program that printed
+  it is not using the mouse itself
+- scrollback in both panes - the float and the shell behind it - sized by
+  `UNCL_SCROLLBACK` from the environment you launch uncl in
 
 ### images: what is, and is not, supported
 
@@ -42,3 +47,21 @@ whatever your terminal can do:
   sixel has no way to ask for a size, and uncl never re-encodes.
 - no animation, no alpha, no scaling, no re-encoding.
 - the background shell's images are not carried through - only the float's.
+
+### scrollback
+
+both panes keep history, and the size is inherited from the environment uncl was
+launched in:
+
+- `UNCL_SCROLLBACK=10000 uncl` keeps 10,000 lines per pane (the default is 2,000).
+  `UNCL_SCROLLBACK=0` turns history off. Anything that is not plain digits is
+  ignored in favour of the default - uncl does not guess at memory.
+- the wheel scrolls the pane under the pointer. while the float is scrolled back
+  its border shows how far (`s:24:80 +12`), and `Ctrl+Alt+Up/Down` scrolls a notch
+  and `Ctrl+Alt+PageUp/PageDown` a screenful for terminals without a wheel.
+- typing anything puts the view back on the live screen; the keystroke still goes
+  to the shell, exactly as in every other terminal.
+- uncl holds the mouse while it runs - that is how the float stays draggable, and
+  how a click on a link gets resolved at all - so your terminal emulator's own
+  scrollback is not available inside uncl. uncl's is. `Shift`+drag still selects
+  text in most emulators, because they take that key back locally.

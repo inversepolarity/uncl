@@ -110,6 +110,27 @@ fn local_point(content: Rect, column: u16, row: u16) -> (u16, u16) {
     )
 }
 
+/// Which pane a wheel event should scroll, if any.
+///
+/// The child has first claim: a wheel over content goes to it whenever it asked
+/// for mouse reporting (`?1000h` and friends), which is why this is decided in
+/// `ui::owner` *after* the encoder declined, not here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Wheel {
+    Up,
+    Down,
+}
+
+impl Wheel {
+    pub fn from_kind(kind: MouseEventKind) -> Option<Self> {
+        match kind {
+            MouseEventKind::ScrollUp => Some(Wheel::Up),
+            MouseEventKind::ScrollDown => Some(Wheel::Down),
+            _ => None,
+        }
+    }
+}
+
 /// Start a drag, a resize, or nothing, based on where the press landed.
 pub fn begin(overlay: &mut Overlay, m: MouseEvent) {
     if m.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -509,6 +530,20 @@ mod tests {
         let corner_y = overlay.rect.bottom() - 1;
         begin(&mut overlay, mouse(MouseEventKind::Down(MouseButton::Left), corner_x, corner_y));
         assert!(!overlay.resizing);
+    }
+
+    #[test]
+    fn only_vertical_wheels_scroll() {
+        assert_eq!(
+            Wheel::from_kind(MouseEventKind::ScrollUp),
+            Some(Wheel::Up)
+        );
+        assert_eq!(
+            Wheel::from_kind(MouseEventKind::ScrollDown),
+            Some(Wheel::Down)
+        );
+        assert_eq!(Wheel::from_kind(MouseEventKind::ScrollLeft), None);
+        assert_eq!(Wheel::from_kind(MouseEventKind::Moved), None);
     }
 
     #[test]

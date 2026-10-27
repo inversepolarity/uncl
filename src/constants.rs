@@ -15,6 +15,46 @@ pub const DEFAULT_HEIGHT: u16 = 25;
 pub const DEFAULT_X: u16 = 10;
 pub const DEFAULT_Y: u16 = 5;
 
+/// How many lines of history each pane keeps by default.
+///
+/// Both panes get the same treatment: a shell you cannot scroll back through is
+/// the most jarring thing about running one inside another terminal. The number
+/// is deliberately modest — `vt100` stores a row as a `Vec<Cell>`, so 2000 lines
+/// of an 80-column grid is a few megabytes per pane.
+///
+/// `UNCL_SCROLLBACK`, from the environment uncl was launched in, overrides it,
+/// and `0` turns scrollback off for setups that would rather have the memory.
+pub const DEFAULT_SCROLLBACK: usize = 2_000;
+
+/// How many lines one wheel notch scrolls.
+pub const SCROLL_STEP: usize = 3;
+
+/// The scrollback capacity to use, from `UNCL_SCROLLBACK` or the default.
+///
+/// Read once per pane (at parser construction), so exporting the variable in the
+/// environment uncl is launched from is all it takes.
+pub fn scrollback_lines() -> usize {
+    match std::env::var("UNCL_SCROLLBACK") {
+        Ok(spec) => parse_scrollback(&spec),
+        Err(_) => DEFAULT_SCROLLBACK,
+    }
+}
+
+/// `UNCL_SCROLLBACK`, kept separate so the parsing is testable without touching
+/// the process environment (which is global and, in edition 2024, `unsafe`).
+fn parse_scrollback(spec: &str) -> usize {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return DEFAULT_SCROLLBACK;
+    }
+    // Plain digits only: `2k` is a guess, and a guess about memory is the wrong
+    // thing to make silently.
+    if !spec.bytes().all(|byte| byte.is_ascii_digit()) {
+        return DEFAULT_SCROLLBACK;
+    }
+    spec.parse().unwrap_or(DEFAULT_SCROLLBACK)
+}
+
 /// Minimum time between frames (~120 Hz).
 ///
 /// A child flooding output raises the reader signal far more often than a
@@ -72,6 +112,25 @@ pub fn nz(value: u16) -> std::num::NonZeroU16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scrollback_spec_is_either_a_number_or_the_default() {
+        assert_eq!(parse_scrollback("0"), 0);
+        assert_eq!(parse_scrollback("500"), 500);
+        assert_eq!(parse_scrollback(" 500 "), 500);
+        // Guesses about memory are not made silently.
+        assert_eq!(parse_scrollback("2k"), DEFAULT_SCROLLBACK);
+        assert_eq!(parse_scrollback("-1"), DEFAULT_SCROLLBACK);
+        assert_eq!(parse_scrollback(""), DEFAULT_SCROLLBACK);
+        assert_eq!(parse_scrollback("lots"), DEFAULT_SCROLLBACK);
+    }
+
+    #[test]
+    fn the_default_scrollback_is_useful() {
+        // A pane that keeps no history cannot be scrolled, and one that keeps a
+        // hundred thousand lines is a memory leak with a nice name.
+        assert!((1_000..=10_000).contains(&DEFAULT_SCROLLBACK));
+    }
 
     #[test]
     fn nz_never_returns_zero() {

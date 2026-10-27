@@ -66,6 +66,12 @@ pub struct Panes<'a> {
     pub images: Option<&'a Store>,
     /// Hyperlinks both children drew, in their own coordinates.
     pub links: FrameLinks,
+    /// How many lines the float is scrolled back (0 = live). Shown in the
+    /// bottom border, so scrolling is never invisible.
+    pub scroll: usize,
+    /// Is the *focused* pane scrolled back? Then there is no cursor to place: the
+    /// child's cursor belongs to a line that is not on screen.
+    pub focused_scrolled: bool,
 }
 
 /// The hyperlinks each pane drew this frame (`OSC 8`, S3.5).
@@ -100,6 +106,8 @@ pub struct Renderer {
     /// Did we delete the images (float hidden)? Then the next show has to send
     /// the payloads again instead of re-placing by id.
     images_forgotten: bool,
+    /// The scroll offset the border was last drawn with.
+    scroll: usize,
 }
 
 impl Renderer {
@@ -117,6 +125,7 @@ impl Renderer {
             last_image_seq: 0,
             images_shown: false,
             images_forgotten: false,
+            scroll: 0,
         }
     }
 
@@ -155,11 +164,17 @@ impl Renderer {
             float_focused,
             images,
             links,
+            scroll,
+            focused_scrolled,
         } = panes;
         let float_at = float.as_ref().map(|(screen, rect)| (screen, *rect));
 
         let owner_full = self.force_full || self.owner_prev.is_none();
         let float_full = self.force_full || self.float_prev.is_none();
+
+        // The scroll offset is drawn in the border, so a change has to repaint it.
+        let scrolled = self.scroll != scroll;
+        self.scroll = scroll;
 
         let mut owner_rows = if owner_area.is_empty() {
             Vec::new()
@@ -193,6 +208,7 @@ impl Renderer {
                 // The owner painted over the float's top/bottom border rows, or
                 // the whole float is new: both borders have to be redrawn.
                 let borders = float_full
+                    || scrolled
                     || owner_rows
                         .iter()
                         .any(|row| *row == rect.y || *row == rect.bottom().saturating_sub(1));
@@ -230,6 +246,7 @@ impl Renderer {
                 &float_plan,
                 borders,
                 &links.float,
+                scroll,
             );
         }
 
@@ -241,11 +258,17 @@ impl Renderer {
         let content = float_at.map(|(_, rect)| content_rect(rect));
         self.emit_images(images, content, repainted);
 
-        let (cursor_screen, cursor_area) = match float_at {
-            Some((screen, rect)) if float_focused => (screen, content_rect(rect)),
-            _ => (&owner, owner_area),
-        };
-        self.place_cursor(cursor_screen, cursor_area);
+        if focused_scrolled {
+            // Every line on screen is history; the child's cursor is somewhere
+            // below it. Showing it would point at the wrong cell.
+            self.hide_cursor();
+        } else {
+            let (cursor_screen, cursor_area) = match float_at {
+                Some((screen, rect)) if float_focused => (screen, content_rect(rect)),
+                _ => (&owner, owner_area),
+            };
+            self.place_cursor(cursor_screen, cursor_area);
+        }
 
         // The snapshots become the reference for the next frame.
         self.owner_prev = Some(owner);
@@ -258,11 +281,15 @@ impl Renderer {
     /// Hide the cursor before painting: rows are drawn with `CUP` jumps, and a
     /// visible cursor would run along with them.
     fn begin_paint(&mut self) {
+        self.hide_cursor();
+    }
+
+    /// Hide the cursor, if the terminal thinks it is visible.
+    fn hide_cursor(&mut self) {
         if self.cursor_shown {
             self.out.extend_from_slice(HIDE_CURSOR);
             self.cursor_shown = false;
         }
-        // Painting leaves the terminal's cursor wherever the last row ended.
         self.cursor_at = None;
     }
 
@@ -279,16 +306,19 @@ impl Renderer {
     /// A still screen with a kitty image therefore costs nothing per frame, which
     /// is the whole point of putting this after the grid diff.
     fn emit_images(&mut self, store: Option<&Store>, content: Option<Rect>, repainted: bool) {
-        let Some(content) = content else {
-            // The float is gone. Its kitty images live in a layer our repaint
-            // cannot reach, so they have to be deleted explicitly, or they stay
-            // stuck on the owner's screen.
+        // Nothing to place, for either of two reasons: the float is gone, or its
+        // view is scrolled back and a scrolled frame carries no store. Both mean
+        // the same thing to the host — input is finished, so the layer has to be
+        // cleared and the payloads have to be sent again when images return:
+        // kitty images live outside the text grid, so repainting history under one
+        // would leave it hovering over cells it does not belong to.
+        let (Some(store), Some(content)) = (store, content) else {
             if self.images_shown {
                 self.out.extend_from_slice(KITTY_DELETE_ALL);
                 self.images_shown = false;
-                self.images_forgotten = true;
                 self.cursor_at = None;
             }
+            self.images_forgotten = true;
             self.image_layout = None;
             return;
         };
@@ -304,48 +334,46 @@ impl Renderer {
             emitted = true;
         }
 
-        if let Some(store) = store {
-            for image in store.images() {
-                // `vt100` reports the cursor as (row, column).
-                let (row, col) = image.anchor();
+        for image in store.images() {
+            // `vt100` reports the cursor as (row, column).
+            let (row, col) = image.anchor();
 
-                // Anything anchored outside the child's grid is not ours to draw:
-                // it would land on the border or on the owner's cells.
-                if col >= content.width || row >= content.height {
-                    self.last_image_seq = self.last_image_seq.max(image.seq());
-                    continue;
-                }
-
-                let fresh = self.images_forgotten || image.seq() > self.last_image_seq;
-                let moved = layout_changed && image.replay().is_some();
-                let erased = repainted && image.pixel_based();
-
-                // Everything from the anchor cell to the float's bottom-right
-                // corner is the room an image is allowed to take. The child's
-                // grid is the content rect (S1's geometry law), so a child that
-                // drew at its own origin lands inside the float, instead of
-                // across the border and over the owner's screen.
-                let avail = (
-                    content.width.saturating_sub(col),
-                    content.height.saturating_sub(row),
-                );
-
-                if fresh || moved || erased {
-                    // Re-placing an image the terminal already holds costs one
-                    // line; anything else is the payload, sized to `avail`.
-                    let bytes = match image.replay() {
-                        Some(_) if !fresh => image
-                            .replace(Some(avail))
-                            .unwrap_or_else(|| image.render(Some(avail))),
-                        _ => image.render(Some(avail)),
-                    };
-                    cup(&mut self.out, content.y.saturating_add(row), content.x.saturating_add(col));
-                    self.out.extend_from_slice(&bytes);
-                    emitted = true;
-                }
-
+            // Anything anchored outside the child's grid is not ours to draw:
+            // it would land on the border or on the owner's cells.
+            if col >= content.width || row >= content.height {
                 self.last_image_seq = self.last_image_seq.max(image.seq());
+                continue;
             }
+
+            let fresh = self.images_forgotten || image.seq() > self.last_image_seq;
+            let moved = layout_changed && image.replay().is_some();
+            let erased = repainted && image.pixel_based();
+
+            // Everything from the anchor cell to the float's bottom-right
+            // corner is the room an image is allowed to take. The child's
+            // grid is the content rect (S1's geometry law), so a child that
+            // drew at its own origin lands inside the float, instead of
+            // across the border and over the owner's screen.
+            let avail = (
+                content.width.saturating_sub(col),
+                content.height.saturating_sub(row),
+            );
+
+            if fresh || moved || erased {
+                // Re-placing an image the terminal already holds costs one
+                // line; anything else is the payload, sized to `avail`.
+                let bytes = match image.replay() {
+                    Some(_) if !fresh => image
+                        .replace(Some(avail))
+                        .unwrap_or_else(|| image.render(Some(avail))),
+                    _ => image.render(Some(avail)),
+                };
+                cup(&mut self.out, content.y.saturating_add(row), content.x.saturating_add(col));
+                self.out.extend_from_slice(&bytes);
+                emitted = true;
+            }
+
+            self.last_image_seq = self.last_image_seq.max(image.seq());
         }
 
         if emitted {
@@ -548,6 +576,7 @@ fn emit_float(
     plan: &[FloatRow],
     borders: bool,
     links: &Links,
+    scroll: usize,
 ) {
     let width = content.width;
 
@@ -590,7 +619,7 @@ fn emit_float(
             Corner::BottomLeft,
             Corner::BottomRight,
         );
-        emit_title(out, rect, content);
+        emit_title(out, rect, content, scroll);
     }
 }
 
@@ -788,10 +817,14 @@ fn emit_horizontal_border(
     reset(out);
 }
 
-/// The child's size, printed in the bottom border. ASCII only, so `len()` is the
-/// cell count.
-fn emit_title(out: &mut Vec<u8>, rect: Rect, content: Rect) {
-    let title = format!("s:{}:{}", content.height, content.width);
+/// The child's size, printed in the bottom border — plus how far back the view is
+/// scrolled, if it is. ASCII only, so `len()` is the cell count.
+fn emit_title(out: &mut Vec<u8>, rect: Rect, content: Rect, scroll: usize) {
+    let title = if scroll > 0 {
+        format!("s:{}:{} +{}", content.height, content.width, scroll)
+    } else {
+        format!("s:{}:{}", content.height, content.width)
+    };
     let available = usize::from(rect.width.saturating_sub(2));
     if title.len() > available {
         return;
@@ -971,6 +1004,12 @@ mod tests {
         vt100::Parser::new(nz(rows), nz(cols), 0)
     }
 
+    /// The visible text of a screen, for assertions that care about content
+    /// rather than bytes.
+    fn text_of(screen: &vt100::Screen) -> String {
+        screen.contents()
+    }
+
     fn text(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
     }
@@ -1054,6 +1093,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
 
         let frame = text(frame);
@@ -1077,6 +1118,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
 
         let second = renderer.render(Panes {
@@ -1086,6 +1129,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
         assert!(second.is_empty(), "second frame: {:?}", text(second));
     }
@@ -1104,6 +1149,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
 
         parser.process(b"\r\nchanged");
@@ -1114,6 +1161,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         assert!(frame.contains("changed"), "frame: {frame:?}");
@@ -1137,6 +1186,8 @@ mod tests {
             float_focused: true,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         assert!(frame.contains("floating"), "frame: {frame:?}");
@@ -1162,6 +1213,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
         // The float disappearing is a repaint, but the owner's cells are intact.
         let frame = text(renderer.render(Panes {
@@ -1171,6 +1224,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
         assert!(frame.is_empty(), "frame: {frame:?}");
     }
@@ -1189,6 +1244,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         assert!(frame.contains("\x1b[?25l"), "frame: {frame:?}");
@@ -1220,6 +1277,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         let el_at = frame.find("\x1b[K").expect("the float row should erase");
@@ -1249,6 +1308,8 @@ mod tests {
             float_focused: true,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         };
 
         let mut renderer = Renderer::new();
@@ -1273,6 +1334,8 @@ mod tests {
             float_focused: true,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         };
 
         let mut renderer = Renderer::new();
@@ -1302,6 +1365,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
 
         // Nothing changed, so nothing is painted…
@@ -1312,6 +1377,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
         assert!(quiet.is_empty());
 
@@ -1324,6 +1391,8 @@ mod tests {
             float_focused: false,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         assert!(frame.contains("owner"), "frame: {frame:?}");
@@ -1364,6 +1433,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         let row_at = frame.find("hi").expect("the float row is painted");
@@ -1394,6 +1465,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
 
         let second = renderer.render(Panes {
@@ -1403,6 +1476,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
         assert!(second.is_empty(), "frame: {:?}", text(second));
     }
@@ -1425,6 +1500,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
 
         // The float moved: same image, one line of placement, no payload.
@@ -1437,6 +1514,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         assert!(frame.contains("\x1b_Ga=p,i=7\x1b\\"), "frame: {frame:?}");
@@ -1461,6 +1540,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
 
         // `Home`: the kitty image lives in a layer our repaint cannot reach.
@@ -1472,6 +1553,8 @@ mod tests {
             float_focused: false,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
         assert!(hidden.contains("\x1b_Ga=d,d=A\x1b\\"), "frame: {hidden:?}");
 
@@ -1484,8 +1567,49 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
         assert!(shown.contains("QUJD"), "frame: {shown:?}");
+    }
+
+    #[test]
+    fn scrolling_back_clears_the_image_layer_and_returning_sends_it_again() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let store = store(content_rect(rect));
+        let mut renderer = Renderer::new();
+        let frame = |renderer: &mut Renderer, images: Option<&Store>, scroll: usize| {
+            text(renderer.render(Panes {
+                owner: owner.screen().clone(),
+                owner_area: Rect::new(0, 0, 40, 10),
+                float: Some((float.screen().clone(), rect)),
+                float_focused: true,
+                images,
+                links: FrameLinks::default(),
+                scroll,
+                focused_scrolled: scroll > 0,
+            }))
+        };
+
+        assert!(frame(&mut renderer, Some(&store), 0).contains("QUJD"));
+
+        // Scrolled back: the view is history, and an image anchored to a live cell
+        // would hover over cells it does not belong to.
+        let scrolled = frame(&mut renderer, None, 3);
+        assert!(
+            scrolled.contains("\x1b_Ga=d,d=A\x1b\\"),
+            "frame: {scrolled:?}"
+        );
+        assert!(!scrolled.contains("QUJD"), "frame: {scrolled:?}");
+
+        // Back to live: the layer was cleared, so the payload has to be re-sent.
+        let back = frame(&mut renderer, Some(&store), 0);
+        assert!(back.contains("QUJD"), "frame: {back:?}");
     }
 
     #[test]
@@ -1510,6 +1634,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
 
         // Text painted over sixel destroys it, so any repaint has to be followed
@@ -1522,6 +1648,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
         assert!(frame.contains("more"), "frame: {frame:?}");
         assert!(frame.contains("\x1bPq"), "frame: {frame:?}");
@@ -1550,6 +1678,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
         assert!(!frame.contains("QUJD"), "frame: {frame:?}");
     }
@@ -1611,6 +1741,8 @@ mod tests {
             float_focused: true,
             images: Some(&store),
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         assert!(frame.contains("1337;File="), "frame: {frame:?}");
@@ -1649,6 +1781,8 @@ mod tests {
                 owner: Links::new(),
                 float: float_links,
             },
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         let open = frame.find("\x1b]8;;https://example.com\x1b\\");
@@ -1681,6 +1815,8 @@ mod tests {
             float_focused: true,
             images: None,
             links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
         });
 
         // The cells do not change; only the link is added. A diff would show
@@ -1702,6 +1838,8 @@ mod tests {
                 owner: Links::new(),
                 float: links,
             },
+            scroll: 0,
+            focused_scrolled: false,
         }));
         assert!(
             frame.contains("\x1b]8;;https://example.com\x1b\\"),
@@ -1731,6 +1869,8 @@ mod tests {
                 owner: Links::new(),
                 float: float_links,
             },
+            scroll: 0,
+            focused_scrolled: false,
         }));
         assert!(!frame.contains("\x1b]8;"), "no link over the wrong words: {frame:?}");
     }
@@ -1755,12 +1895,135 @@ mod tests {
                 owner: links,
                 float: Links::new(),
             },
+            scroll: 0,
+            focused_scrolled: false,
         }));
 
         let open = frame.find("\x1b]8;;file:///tmp\x1b\\").expect("opened");
         let word = frame.find("log").expect("the word is painted");
         assert!(open < word, "frame: {frame:?}");
         assert!(frame[word..].contains("\x1b]8;;\x1b\\"), "frame: {frame:?}");
+    }
+
+    /// A parser with scrollback, so a scrolled view can be rendered.
+    fn scrolling_parser(rows: u16, cols: u16, lines: usize) -> vt100::Parser {
+        vt100::Parser::new(nz(rows), nz(cols), lines)
+    }
+
+    #[test]
+    fn a_scrolled_pane_paints_history_instead_of_the_live_screen() {
+        let mut owner = scrolling_parser(4, 20, 50);
+        for line in 0..10 {
+            owner.process(format!("line{line}\r\n").as_bytes());
+        }
+        // The live view shows the last four lines; scrolling back shows older
+        // ones instead. (`set_scrollback` is applied to the *snapshot* by the
+        // caller, which is exactly what this does.)
+        let live_text = text_of(owner.screen());
+        assert!(live_text.contains("line9"), "live: {live_text:?}");
+
+        let mut scrolled = owner.screen().clone();
+        scrolled.set_scrollback(4);
+        let scrolled_text = text_of(&scrolled);
+        assert_ne!(scrolled_text, live_text, "scrolling must change the view");
+        assert!(
+            !scrolled_text.contains("line9"),
+            "the newest line is not history: {scrolled_text:?}"
+        );
+        // Something older is, and it is what the frame has to paint.
+        let oldest = scrolled_text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(oldest.starts_with("line"), "scrolled: {scrolled_text:?}");
+
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: scrolled,
+            owner_area: Rect::new(0, 0, 20, 4),
+            float: None,
+            float_focused: false,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: true,
+        }));
+        assert!(frame.contains(&oldest), "frame: {frame:?}");
+        assert!(!frame.contains("line9"), "frame: {frame:?}");
+        // No cursor is placed while the view is scrolled back.
+        assert!(!frame.contains("\x1b[?25h"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn scrolling_back_and_forth_repaints() {
+        let mut owner = scrolling_parser(3, 20, 50);
+        for line in 0..8 {
+            owner.process(format!("line{line}\r\n").as_bytes());
+        }
+        let area = Rect::new(0, 0, 20, 3);
+        let mut renderer = Renderer::new();
+
+        let mut scrolled = owner.screen().clone();
+        scrolled.set_scrollback(3);
+        renderer.render(Panes {
+            owner: scrolled,
+            owner_area: area,
+            float: None,
+            float_focused: false,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: true,
+        });
+
+        // Returning to live is a repaint that puts the newest lines back.
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
+        }));
+        assert!(frame.contains("line7"), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn the_float_border_shows_how_far_back_the_view_is() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 10);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 12, 5);
+        let mut renderer = Renderer::new();
+        let mut frame_for = |scroll: usize| {
+            text(renderer.render(Panes {
+                owner: owner.screen().clone(),
+                owner_area: Rect::new(0, 0, 40, 10),
+                float: Some((float.screen().clone(), rect)),
+                float_focused: true,
+                images: None,
+                links: FrameLinks::default(),
+                scroll,
+                focused_scrolled: scroll > 0,
+            }))
+        };
+
+        let live = frame_for(0);
+        assert!(live.contains("s:3:10"), "frame: {live:?}");
+        assert!(!live.contains("+4"), "frame: {live:?}");
+
+        // A scroll change has to repaint the border, or the offset is invisible.
+        let scrolled = frame_for(4);
+        assert!(scrolled.contains("s:3:10 +4"), "frame: {scrolled:?}");
+        let back = frame_for(0);
+        assert!(back.contains("s:3:10"), "frame: {back:?}");
+        assert!(!back.contains("+4"), "frame: {back:?}");
     }
 
     #[test]

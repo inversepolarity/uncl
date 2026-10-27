@@ -32,7 +32,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use vt100::{CursorStyle, MouseProtocolMode, Screen};
 
 use crate::app::input::encode::{ChildModes, encode_key, encode_mouse};
-use crate::app::input::mouse::{self, MouseRoute};
+use crate::app::input::mouse::{self, MouseRoute, Wheel};
 use crate::app::lease::{Lease, new_parser};
 use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::term::callbacks::ChildState;
@@ -162,6 +162,22 @@ pub struct Container {
     host_rx: UnboundedReceiver<Vec<u8>>,
     /// The frame emitter (S2: uncl writes the ANSI stream itself).
     renderer: Renderer,
+    /// Lines scrolled up in the owner pane (0 = live).
+    owner_scroll: usize,
+    /// Lines scrolled up in the float (0 = live). Reset with its lease.
+    tenant_scroll: usize,
+    /// The cell a press landed on, in whichever pane, so a click on a hyperlink
+    /// can be told from a drag. `None` when the press was not on a link.
+    link_press: Option<LinkPress>,
+}
+
+/// A press that landed on a hyperlink, so its release can be matched to it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinkPress {
+    /// Which pane: the float, or the shell behind it.
+    tenant: bool,
+    /// The cell, pane-local.
+    cell: (u16, u16),
 }
 
 impl Container {
@@ -194,6 +210,9 @@ impl Container {
             host_tx,
             host_rx,
             renderer: Renderer::new(),
+            owner_scroll: 0,
+            tenant_scroll: 0,
+            link_press: None,
         }
     }
 
@@ -299,17 +318,43 @@ impl Container {
     /// reader thread that is not draining the child's pty. The snapshots are then
     /// handed to the renderer, which keeps them as the next frame's `prev`.
     fn draw(&mut self) -> Result<()> {
-        let owner: Screen = self.parser.read().unwrap().screen().clone();
+        let mut owner: Screen = self.parser.read().unwrap().screen().clone();
         let visible = self.lease.tenant_visible && self.tenant_running();
-        let float: Option<(Screen, Rect)> = if visible {
+        let mut float: Option<(Screen, Rect)> = if visible {
             let screen = self.lease.tenant_parser.read().unwrap().screen().clone();
             Some((screen, self.lease.tenant.rect))
         } else {
             None
         };
 
+        // Scrolling back is a property of the *view*, not of the parser, so it is
+        // applied to the snapshot: the renderer diffs view against view and
+        // notices nothing unusual. `set_scrollback` clamps, which is also how an
+        // over-scrolled offset heals itself.
+        if self.owner_scroll > 0 {
+            owner.set_scrollback(self.owner_scroll);
+            self.owner_scroll = owner.scrollback();
+        }
+        if let Some((screen, _)) = float.as_mut() {
+            if self.tenant_scroll > 0 {
+                screen.set_scrollback(self.tenant_scroll);
+                self.tenant_scroll = screen.scrollback();
+            }
+        }
+        let focused_scrolled = if visible {
+            self.tenant_scroll > 0
+        } else {
+            self.owner_scroll > 0
+        };
+
         // Bind what the frame needs before borrowing the renderer mutably.
         let owner_area = self.rect;
+
+        // Images belong to the live view: they are anchored to cells, and a
+        // scrolled view is showing older ones. Handing the renderer no store at
+        // all while scrolled is what suppresses them; the renderer clears the
+        // host's layer and re-sends the payloads when the store comes back.
+        let scrolled_away = visible && self.tenant_scroll > 0;
 
         // The image store is read under its lock for the duration of the frame.
         // It is never held while the parser runs (the reader takes the parser
@@ -328,8 +373,11 @@ impl Container {
             owner_area,
             float,
             float_focused: visible,
-            images: Some(&*images),
+            images: if scrolled_away { None } else { Some(&*images) },
             links,
+            // Shown in the float's bottom border while scrolled back.
+            scroll: self.tenant_scroll,
+            focused_scrolled,
         });
 
         if !bytes.is_empty() {
@@ -369,10 +417,14 @@ impl Container {
     ///
     /// Re-sends only on change, so the steady state costs one comparison.
     fn sync_host_mouse(&mut self) {
-        let mut desired = HostMouse::for_modes(self.focused_modes());
-        if self.float_focused() {
-            desired = desired.at_least_press();
-        }
+        // Always at least press: uncl has to see the wheel to give either pane a
+        // scrollback (a host that never reports the wheel is a host uncl cannot
+        // scroll), and while the float is up it has to see the press to drag it
+        // and to resolve its own hyperlinks. The cost is real and deliberate: the
+        // *host's* scrollback and mouse selection are unavailable unless the host
+        // overrides the grab (Shift+drag in most of them), because uncl now
+        // provides both itself.
+        let desired = HostMouse::for_modes(self.focused_modes()).at_least_press();
 
         if desired == self.host_mouse {
             return;
@@ -382,6 +434,120 @@ impl Container {
         let mut stdout = io::stdout();
         let _ = stdout.write_all(desired.sequence());
         let _ = stdout.flush();
+    }
+
+    /// Scroll one pane back or forward by `step` lines.
+    ///
+    /// Driven by the wheel (`SCROLL_STEP`, and only when the child did *not* ask
+    /// for the mouse: a TUI that wants the wheel gets it, a shell does not) and by
+    /// `Ctrl+Alt`+arrows/page keys, which need no mouse at all. The offset is
+    /// clamped to the pane's scrollback here rather than at draw time, so
+    /// scrolling up at the top does not build up phantom offset that has to be
+    /// unwound.
+    fn scroll(&mut self, tenant: bool, wheel: Wheel, step: usize) {
+        let capacity = self.scrollback_len(tenant);
+        if capacity == 0 {
+            return;
+        }
+
+        let current = if tenant {
+            self.tenant_scroll
+        } else {
+            self.owner_scroll
+        };
+        let next = match wheel {
+            Wheel::Up => current.saturating_add(step).min(capacity),
+            Wheel::Down => current.saturating_sub(step),
+        };
+        if next == current {
+            return;
+        }
+
+        if tenant {
+            self.tenant_scroll = next;
+        } else {
+            self.owner_scroll = next;
+        }
+    }
+
+    /// How far back a pane can be scrolled.
+    fn scrollback_len(&self, tenant: bool) -> usize {
+        if tenant {
+            match self.lease.tenant_parser.read() {
+                Ok(parser) => parser.screen().scrollback_len(),
+                Err(_) => 0,
+            }
+        } else {
+            match self.parser.read() {
+                Ok(parser) => parser.screen().scrollback_len(),
+                Err(_) => 0,
+            }
+        }
+    }
+
+    /// Back to the live view in both panes.
+    fn reset_scroll(&mut self) {
+        self.owner_scroll = 0;
+        self.tenant_scroll = 0;
+    }
+
+    /// Follow a click inside the float, so a press and its release on the same
+    /// hyperlinked cell open the link.
+    ///
+    /// This exists because uncl holds the mouse the whole time it runs — it has
+    /// to, to keep the float draggable, to hide it on a click outside, and to have
+    /// a scrollback at all — which means the *host* terminal never sees the click
+    /// and can never resolve a hyperlink of its own. So the click is ours to
+    /// interpret, in either pane, and only when the child did not ask for it.
+    fn link_click(&mut self, tenant: bool, kind: MouseEventKind, cell: (u16, u16)) {
+        // Link spans live in the *live* grid's coordinates. While the view is
+        // scrolled back every visible row is some other row's text, so there is
+        // nothing here to click that uncl could point at correctly.
+        if if tenant {
+            self.tenant_scroll > 0
+        } else {
+            self.owner_scroll > 0
+        } {
+            self.link_press = None;
+            return;
+        }
+
+        let press = LinkPress { tenant, cell };
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.link_press = self
+                    .link_target(tenant, cell.1, cell.0)
+                    .map(|_| press);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.link_press.take() == Some(press) {
+                    if let Some(url) = self.link_target(tenant, cell.1, cell.0) {
+                        open_url(&url);
+                    }
+                }
+            }
+            // Movement or another button: this is a drag, not a click.
+            _ => self.link_press = None,
+        }
+    }
+
+    /// The URI of a pane's link covering `(row, column)`, if there is one.
+    fn link_target(&self, tenant: bool, row: u16, col: u16) -> Option<Vec<u8>> {
+        let (state, parser) = if tenant {
+            (&self.lease.tenant_state, &self.lease.tenant_parser)
+        } else {
+            (&self.parser_state, &self.parser)
+        };
+        let links = state.links().snapshot();
+        let parser = parser.read().ok()?;
+        let link = links
+            .for_row(parser.screen(), row)
+            .into_iter()
+            .find(|link| {
+                let (start, end) = link.span();
+                col >= start && col < end
+            })?;
+        Some(link.target().to_vec())
     }
 
     /// Write everything children asked the *host* terminal for.
@@ -486,6 +652,10 @@ impl Container {
             return Flow::Continue;
         }
 
+        // Typing means "I am done reading history": every shell in every terminal
+        // behaves this way, and the key is still delivered to the child below.
+        self.reset_scroll();
+
         // Escape hatch: Ctrl+Alt+q quits uncl without having to type `exit`
         // into whichever shell happens to have focus.
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -501,12 +671,40 @@ impl Container {
             self.lease.tenant.child_grab = false;
             if self.lease.tenant_visible {
                 self.lease.sync_size();
+            } else {
+                // Hiding the float puts it back on the live view, so it does not
+                // reappear showing history nobody asked to see.
+                self.tenant_scroll = 0;
+                self.link_press = None;
             }
             // Children that asked for `?1004` must see the focus move, or every
             // TUI in the float keeps painting its "unfocused" cursor style.
             self.refocus(self.float_focused());
             self.renderer.invalidate();
             return Flow::Redraw;
+        }
+
+        // Keyboard scrollback, for terminals without a wheel and for the wheels a
+        // host swallows anyway: Ctrl+Alt+Up/Down scroll the focused pane a notch,
+        // Ctrl+Alt+PageUp/PageDown a screenful. Typing anything returns to live.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::ALT)
+        {
+            let wheel = match key.code {
+                KeyCode::Up | KeyCode::PageUp => Some(Wheel::Up),
+                KeyCode::Down | KeyCode::PageDown => Some(Wheel::Down),
+                _ => None,
+            };
+            if let Some(wheel) = wheel {
+                let page = usize::from(self.size.rows).max(1);
+                let step = match key.code {
+                    KeyCode::PageUp | KeyCode::PageDown => page,
+                    _ => SCROLL_STEP,
+                };
+                let tenant = self.float_focused();
+                self.scroll(tenant, wheel, step);
+                return Flow::Redraw;
+            }
         }
 
         let term_size = (self.size.cols, self.size.rows);
@@ -542,10 +740,22 @@ impl Container {
             MouseRoute::Child { col, row } => {
                 let content = self.lease.tenant.content_rect();
                 let modes = self.lease.modes();
-                if let Some(bytes) = encode_mouse(m.kind, m.modifiers, col, row, content, modes) {
+                let forwarded = encode_mouse(m.kind, m.modifiers, col, row, content, modes);
+
+                if let Some(bytes) = forwarded {
                     if let Some(sender) = self.lease.writer() {
                         let _ = sender.send(Bytes::from(bytes));
                     }
+                } else {
+                    // The child did not ask for this event, so it is ours:
+                    // scrollback on a wheel, and a hyperlink on a click. (A
+                    // plain `Down` lands here whenever the child has mouse
+                    // reporting off — which is every shell.)
+                    if let Some(wheel) = Wheel::from_kind(m.kind) {
+                        self.scroll(true, wheel, SCROLL_STEP);
+                        return Flow::Redraw;
+                    }
+                    self.link_click(true, m.kind, (col, row));
                 }
 
                 // Hold the gesture for the child until the button comes up, so a
@@ -560,9 +770,20 @@ impl Container {
             }
 
             MouseRoute::Local => {
+                if let Some(wheel) = Wheel::from_kind(m.kind) {
+                    // Outside the float (or on its border): the owner pane.
+                    self.scroll(false, wheel, SCROLL_STEP);
+                    return Flow::Redraw;
+                }
+
                 if m.kind == MouseEventKind::Down(MouseButton::Left) {
                     mouse::begin(&mut self.lease.tenant, m);
+                    // A press that starts a drag or a resize is not a link click.
+                    self.link_press = None;
                 } else if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) {
+                    // The release did not land on the cell the press did (it left
+                    // the float), so it is not a click on a link either.
+                    self.link_press = None;
                     if mouse::end(&mut self.lease.tenant) {
                         // A finished resize changes the child's grid size.
                         self.lease.sync_size();
@@ -597,16 +818,33 @@ impl Container {
         };
 
         // Most shells never enable mouse reporting; skip the encode entirely.
-        if !modes.wants_mouse() {
-            return Flow::Continue;
-        }
-
-        if let Some(bytes) = encode_mouse(m.kind, m.modifiers, m.column, m.row, area, modes) {
+        // Either way the child is asked first: only if it declined does the event
+        // become uncl's — the wheel scrolls its history, and a click opens a
+        // hyperlink (`Wheel` is never encoded when the child wants the mouse).
+        let forwarded = if modes.wants_mouse() {
+            encode_mouse(m.kind, m.modifiers, m.column, m.row, area, modes)
+        } else {
+            None
+        };
+        if let Some(bytes) = forwarded {
             if let Some(session) = &self.session {
                 let _ = session.writer.send(Bytes::from(bytes));
             }
+            return Flow::Continue;
         }
 
+        if let Some(wheel) = Wheel::from_kind(m.kind) {
+            self.scroll(false, wheel, SCROLL_STEP);
+            return Flow::Redraw;
+        }
+
+        // The owner's grid starts at the screen origin, but the subtraction is what
+        // keeps this honest if that ever stops being true.
+        let cell = (
+            m.column.saturating_sub(area.x),
+            m.row.saturating_sub(area.y),
+        );
+        self.link_click(false, m.kind, cell);
         Flow::Continue
     }
 
@@ -718,6 +956,8 @@ impl Container {
                     match self.init_tenant() {
                         Ok(()) => {
                             self.lease.tenant_visible = was_visible;
+                            self.tenant_scroll = 0;
+                            self.link_press = None;
                             self.tenant_retry_after = None;
                             self.renderer.invalidate();
                             // The old child's pictures belong to a process that
@@ -828,3 +1068,42 @@ fn decscusr(style: CursorStyle) -> u16 {
     }
 }
 
+/// Hand a clicked hyperlink to the system's opener.
+///
+/// uncl is a terminal multiplexer without a browser: the thing that owns "open a
+/// URL" on the machine is `xdg-open` / `open` / `start`, and that is what a
+/// terminal emulator calls internally too. The URL is filtered by
+/// [`allowed_url`] first — a child's output is untrusted input, and the scheme is
+/// what decides whether a click is allowed to launch anything.
+///
+/// The child is reaped on a thread of its own: a click should not leave a zombie
+/// behind, and uncl should not wait for a browser to start.
+fn open_url(bytes: &[u8]) {
+    let Some(url) = crate::app::term::links::allowed_url(bytes) else {
+        return;
+    };
+
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = std::process::Command::new("open");
+        command.arg(url);
+        command
+    } else if cfg!(windows) {
+        let mut command = std::process::Command::new("cmd");
+        // `start` treats its first argument as the window title, hence the "".
+        command.args(["/C", "start", "", url]);
+        command
+    } else {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    match command.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(err) => eprintln!("uncl: could not open {url}: {err}"),
+    }
+}

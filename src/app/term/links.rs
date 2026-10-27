@@ -60,6 +60,11 @@ impl Link {
         (self.start, self.end)
     }
 
+    /// The URI, as the child wrote it.
+    pub fn target(&self) -> &[u8] {
+        &self.target
+    }
+
     /// The opening sequence, ready to write before the span's cells.
     pub fn open(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.params.len() + self.target.len() + 8);
@@ -199,6 +204,39 @@ impl Links {
             .iter()
             .any(|link| link.row == row && link.start < link.end && link.matches(screen))
     }
+}
+
+/// The URI of a link, if it is one worth handing to the system's opener.
+///
+/// A child's output is untrusted: anything it prints becomes a clickable link, so
+/// the scheme decides whether a click may launch something. A terminal that
+/// resolves `OSC 8` natively has the same problem and solves it the same way.
+///
+/// Refused: anything that is not one of the schemes below (`javascript:`,
+/// `data:`, `vscode:`, a bare path…), control characters and whitespace (which
+/// have no business in a URI and are a classic way to smuggle an argument past a
+/// opener), and anything absurdly long.
+pub fn allowed_url(bytes: &[u8]) -> Option<&str> {
+    const MAX_URL: usize = 2_048;
+
+    let url = std::str::from_utf8(bytes).ok()?.trim();
+    if url.is_empty() || url.len() > MAX_URL {
+        return None;
+    }
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+
+    let (scheme, rest) = url.split_once(':')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    matches!(
+        scheme.as_str(),
+        "http" | "https" | "mailto" | "file" | "ftp"
+    )
+    .then_some(url)
 }
 
 /// A pane's links behind the lock the reader thread writes them through.
@@ -356,6 +394,50 @@ mod tests {
         }
 
         assert_eq!(links.links.len(), MAX_LINKS);
+    }
+
+    #[test]
+    fn only_opening_safe_schemes_are_allowed() {
+        for url in [
+            "https://example.com",
+            "http://example.com/a?b=1",
+            "mailto:someone@example.com",
+            "file:///tmp/x",
+            "ftp://example.com/x",
+            "HTTPS://EXAMPLE.COM",
+        ] {
+            assert_eq!(allowed_url(url.as_bytes()), Some(url), "{url}");
+        }
+
+        for url in [
+            "",
+            "javascript:alert(1)",
+            "data:text/html,<script>",
+            "vscode://file/etc/passwd",
+            "example.com",
+            "/etc/passwd",
+            "https://example.com/a b",
+            "https://example.com/\x1b[31m",
+            "https:",
+        ] {
+            assert_eq!(allowed_url(url.as_bytes()), None, "{url}");
+        }
+
+        // Not text at all.
+        assert_eq!(allowed_url(&[0xff, 0xfe]), None);
+    }
+
+    #[test]
+    fn a_link_reports_its_target_for_a_click() {
+        let mut parser = parser();
+        let mut links = links();
+        links.osc(&parser.screen().clone(), b"", b"https://example.com/x");
+        parser.process(b"docs");
+        links.osc(&parser.screen().clone(), b"", b"");
+
+        let screen = parser.screen();
+        let found = links.for_row(screen, 0);
+        assert_eq!(allowed_url(found[0].target()), Some("https://example.com/x"));
     }
 
     #[test]

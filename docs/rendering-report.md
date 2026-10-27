@@ -323,7 +323,8 @@ Sources for the ConPTY v1/v2 distinction: Windows Terminal 1.22 release notes (`
 | S1 correctness + input + capability proxy | ~5 d | ~+700 | BTOP/htop/nvim/lazygit render at the right size **and are mouse-interactive**; paste; query replies; sixel capability advertised (prerequisite for any image ever appearing) | Medium — the encoder branches per mode and per platform; mitigated by the encoder trait and a golden-sequence table. |
 | S2 own emitter — **shipped** | ~1 wk | ~+1,200/−350, −4 crates | Native-speed scan-out; a hook for out-of-band bytes; no per-cell `Style`; `ratatui`/`tui-term` gone | Medium — off-by-one/clipping bugs are visible; mitigate with the §8.1 golden-frame harness. **Load-bearing: do not defer behind S3.** |
 | S3 cheap-tier images — **shipped** | ~3 d | ~+450 | kitty images (croppable), sixel (if it fits), passthrough | Medium-low, because the quality contract is explicit (§6.4 non-goals). |
-| S3.5 hyperlinks (`OSC 8`) — **shipped** | 1 d | ~+430 | clickable links inside the float | Low; or free with S4. |
+| S3.5 hyperlinks (`OSC 8`) — **shipped** | 1 d | ~+430 | links *emitted* inside the float | Low; or free with S4. |
+| S3.6 clicks + scrollback — **shipped** | 1 d | ~+650 | links in the float actually **open**; history in both panes, sized by `UNCL_SCROLLBACK` | Low-medium: the click is uncl's because the host never sees it (§Appendix H), and the scrollback copy is a per-frame cost that `UNCL_SCROLLBACK` trades against |
 | S4 engine swap (`alacritty_terminal`) | 3–5 d | ~+600 | underline colour/styles, hyperlinks, kitty-keyboard input, sync output, `EventListener` (title/clipboard/bell) | Medium; **requires S2** (you must own the encoder before leaving `vt100`). Optional — skip unless users ask for the fidelity *inside* a float. |
 | §6.6 Windows delta | 1–2 d | ~+120 | Windows build that runs a TUI float (no images) | Medium; needs a real Windows box or CI runner to validate input modes. |
 
@@ -367,10 +368,11 @@ Still genuinely open, in the order they will bite:
 ## 10. Implementation checklist (drop-in order)
 
 Each line is a reviewable PR; the sequence is the shortest dependency-satisfying one.
-S0 (items 1–5), S1 (items 6–10), S2 (items 11–13), S3 (items 15–16) and S3.5 (item 17,
-`OSC 8` hyperlinks) are implemented — see Appendices C, D, E, F and G for the file maps and
-the verification status. Item 14 (the golden-frame corpus in CI) is the one S2 item still
-open. Only S4 (the `alacritty_terminal` swap) and the Windows delta remain.
+S0 (items 1–5), S1 (items 6–10), S2 (items 11–13), S3 (items 15–16), S3.5 (item 17,
+`OSC 8` hyperlinks) and S3.6 (item 18, clickable float links + scrollback in both panes) are
+implemented — see Appendices C, D, E, F, G and H for the file maps and the verification
+status. Item 14 (the golden-frame corpus in CI) is the one S2 item still open. Only S4 (the
+`alacritty_terminal` swap) and the Windows delta remain.
 
 ```
 S0  1. vendor adapter (src/app/ui/adapter.rs) + vt100 0.18.1 + drop tui-term        [½ d]
@@ -390,7 +392,8 @@ S2 11. src/app/render/: rows_diff → CUP+row bytes; prev screen per pane       
 S3 15. DCS/APC splitter + placement store + re-emit after grid flush             [1½ d]
    16. kitty place-by-id + source-rect crop; sixel fit-or-skip                    [1 d]
    17. (opt) OSC 8 hyperlink runs                                                 [1 d]
-W   18. Windows: ansi_support call, encoder cfg matrix, close the images gap      [1½ d]
+S3.6 18. uncl resolves the click (host never sees it) + scrollback in both panes    [1 d]
+W   19. Windows: ansi_support call, encoder cfg matrix, close the images gap      [1½ d]
 ```
 
 `~20 development days` end to end with buffer; `16` for S0–S3 alone.
@@ -1172,7 +1175,9 @@ repair the owner's tail. Wide characters, styles and wide-cell skipping stay
 - **Bounded**: 64 spans per pane, oldest first out.
 - **Not a link click handler.** uncl emits the sequence; the *host* terminal does
   the opening (with whatever modifier it requires). That is the correct division,
-  and it means nothing here can open a URL by accident.
+  and it means nothing here can open a URL by accident. *This turned out to be
+  wrong in the only case that matters — uncl holds the mouse while the float is
+  up, so the host never sees the click. See Appendix H.*
 
 ### What this buys beyond the taste of it
 
@@ -1231,3 +1236,218 @@ left is the tail the report already marked optional — `OSC 8` hyperlinks (S3.5
 the `alacritty_terminal` engine swap (S4), and the Windows delta (§6.6) — plus the
 one open S2 item (the golden-frame corpus). Images are the last thing that was
 *broken* rather than merely missing.
+
+## Appendix H — S3.6 implementation log (2026-10-27): clickable float links, scrollback in both panes
+
+Two reports, one of them a bug that S3.5 shipped with a plausible-looking frame:
+
+1. *a link in the owner pane opens in the browser when clicked; the same link in
+   the float does nothing.*
+2. *both panes need scrollback, inherited from the environment uncl is launched
+   in.*
+
+### Why the float's link did nothing
+
+Not a rendering bug, and not a `vt100` limitation. S3.5 emits `OSC 8` around the
+float's cells correctly — a hyperlink-aware host would draw it as a link. The
+sequence is never *acted on* because uncl has taken the mouse:
+
+```
+ui::owner::sync_host_mouse()  ->  HostMouse::at_least_press() while the float is up
+                              ->  CSI ? 1000 h  (and ? 1006 h)
+```
+
+That is deliberate and stays: with reporting off, uncl could not drag the float,
+could not hide it on a click outside, and could not see the button at all. The
+consequence is that **the host terminal never sees the click**, so the only entity
+in the system that could resolve the link — the emulator — is the one entity that
+is never told about it. The owner pane works precisely because uncl gives the mouse
+*back* to it (`HostMouse::Off` when the background shell wants nothing), and the
+host then does what it always does.
+
+So the click had to be interpreted inside uncl. That is the whole of "the float's
+links are clickable": `OSC 8` is still painted (cmd-click in the host keeps working
+as a bonus where the host does see it), and uncl additionally opens the target
+itself when a press and a release land on the same cell of a live span.
+
+The same reasoning then applies to the **owner** pane, which is why the fix is not
+float-only. The owner's links worked *because* uncl handed the mouse back to it; as
+soon as the grab became unconditional (it has to be, or the wheel can never reach
+uncl's scrollback — see below), the host stopped seeing those clicks too. So
+`forward_owner_mouse` resolves links in exactly the same way after the background
+child declines the event. Nothing about the owner pane's behaviour changes from the
+user's side; only the entity doing the opening does.
+
+### Why scrollback was invisible
+
+`lease::new_parser` constructed both parsers with `0` scrollback lines, so
+`Screen::scrollback_len()` was always `0` and there was nothing to scroll to. It
+was not a rendering problem either; the history did not exist.
+
+### The pieces
+
+| # | Change | File |
+|---|---|---|
+| 1 | `DEFAULT_SCROLLBACK = 2_000`, `SCROLL_STEP = 3`, `scrollback_lines()` reading `UNCL_SCROLLBACK` from the launching environment, and a private `parse_scrollback()` so the parsing is testable without touching the process environment | `src/constants.rs` (+2 tests) |
+| 2 | `new_parser` passes `scrollback_lines()` instead of `0` — both panes, same capacity | `src/app/lease.rs` |
+| 3 | `Container` gains `owner_scroll`, `tenant_scroll`, `link_press`, `images_suppressed`; `scroll/scrollback_len/reset_scroll/link_click/link_target`; the click path and `open_url()` | `src/app/ui/owner.rs` |
+| 4 | `Wheel::{Up, Down}` and `from_kind()` — the wheel is a *decision* only after the child declined it | `src/app/input/mouse.rs` (+1 test) |
+| 5 | `Panes` gains `scroll` and `focused_scrolled`; the border repaints when the offset changes; `emit_title` prints ` +N`; the cursor is hidden while the focused pane is scrolled; a missing image store now clears the host's image layer and marks the payloads forgotten | `src/app/render/mod.rs` (+4 tests) |
+| 6 | `Link::target()` (now genuinely called) and `allowed_url()` — the scheme allowlist a click has to pass | `src/app/term/links.rs` (+2 tests) |
+
+### The scrollback law: apply it to the view, not the parser
+
+`Screen::set_scrollback(n)` is applied to the **cloned snapshot** in `draw()`,
+never to the parser:
+
+- a scroll offset is a property of the *view*. The parser is the child's screen;
+  scrolling it would move the child's cursor out from under it and change what
+  `rows_formatted` means for the next frame's diff.
+- the renderer diffs view against view, so a scrolled snapshot is just another
+  screen to it. Nothing in the encoder knows or cares that the rows came from the
+  scrollback.
+- `set_scrollback` **clamps**, and the clamped value is read back
+  (`owner.scrollback()`) into the field. That is how an over-scrolled offset heals
+  itself after the pane shrinks, without a second source of truth.
+
+Consequences that follow from the law, and not from a special case:
+
+| Situation | Behaviour | Why |
+|---|---|---|
+| typing while scrolled back | view snaps to live, the key is still delivered | every terminal does this; the key is a command, not a scroll |
+| the focused pane is scrolled back | the cursor is hidden | the child's cursor sits on a line that is not on screen; painting it would point at the wrong cell |
+| the float is scrolled back | the renderer is handed no image store, so it deletes the host's image layer and marks the payloads forgotten; returning to live re-sends them | an image is anchored to a cell of the *live* grid and lives in a layer the text repaint cannot reach, so history would be painted *underneath* it |
+| a link under the pointer while scrolled | no click is resolved | spans live in the live grid's coordinates; every visible row is some other row's text |
+| the float is hidden (`Home`) | its offset resets to live | it must not come back showing history nobody asked for |
+| the child asks for `?1000`/`?1002`/`?1003` | the wheel goes to the child, not to uncl | precedence, below |
+
+The float's bottom border shows `s:H:W +N` while it is scrolled back, and the
+border is force-repainted when the offset changes — an offset the user cannot see
+is an offset they cannot trust. The owner pane has no border to write on; there the
+hidden cursor is the only signal, and any key ends it.
+
+### Precedence: the child is always asked first
+
+`encode_mouse()` returning `None` is the signal that the event is uncl's. The law
+is unchanged from S1, only extended:
+
+```
+geometry (Alt / border)  >  child mouse reporting  >  uncl (wheel, link, click-away)
+```
+
+- a wheel over the float's grid: encoded for the child when it wants the mouse
+  (`less`, `btop`, any TUI scrolls itself); otherwise `scroll()` on the float.
+- a wheel over the owner pane, or with the float hidden: the same test against the
+  owner's modes; otherwise `scroll()` on the owner.
+- a press and release on the same cell of a live span, with the child declined: a
+  link click — in the float, or in the owner pane when the float is hidden. A press
+  that begins a drag or a resize clears `link_press`, and motion clears it. A drag
+  is never a click, however far the pointer travelled, and a click while the view is
+  scrolled back is not a click on a link (spans are in live coordinates).
+- click-away, `Alt`+drag, `Alt`+arrows and border resizes are unchanged.
+
+Because the wheel now has to reach uncl in *either* pane, the host mouse grab is
+`at_least_press()` **always**, not only while the float is up. That is what makes
+`forward_owner_mouse` responsible for the owner's hyperlinks, not just its wheel. The trade-off is
+explicit: your emulator's own scrollback and click-drag selection are unavailable
+inside uncl, because uncl provides both. `Shift`+drag still selects in most
+emulators (they intercept it locally), and the keyboard chords below exist for the
+cases where the host swallows the wheel.
+
+Keyboard scrollback, for terminals without a wheel and for wheels a host eats:
+`Ctrl+Alt+Up/Down` scroll a notch, `Ctrl+Alt+PageUp/PageDown` a screenful, on
+whichever pane owns the keyboard.
+
+### Opening a URL is a security decision
+
+A child's output is untrusted input, and every word it prints becomes clickable. A
+terminal that resolves `OSC 8` has the same problem and solves it the same way:
+**the scheme decides**.
+
+`allowed_url()` accepts `http`, `https`, `mailto`, `file` and `ftp` — nothing else
+(`javascript:`, `data:`, `vscode:`, a bare path), no control characters or
+whitespace (the classic way to smuggle an argument past an opener), no non-UTF-8,
+nothing over 2,048 bytes, and no empty target. The opener is the platform's own:
+`open` / `cmd /C start ""` / `xdg-open`, spawned and reaped on a thread of its own,
+so a click never leaves a zombie and never waits for a browser. A failure is an
+`eprintln`, not a crash.
+
+### The cost of scrollback, stated plainly
+
+`vt100`'s `Cell` is 32 bytes by construction, and a `Screen` clone is a deep copy
+of every row it holds — visible rows *and* scrollback. `draw()` clones one screen
+per pane per painted frame (the previous copy is moved into the renderer as `prev`,
+so it is one copy, not two):
+
+| Width | 2,000 lines of scrollback | one clone |
+|---|---|---|
+| 80 columns | 160,000 cells | 5.1 MB |
+| 200 columns | 400,000 cells | 12.8 MB |
+
+Frames are only painted when something changed and are capped at ~120 Hz
+(`FRAME_MIN_INTERVAL`), so an idle prompt costs nothing. A sustained flood at 200
+columns does pay for it: ~1.5 GB/s of `memcpy` plus 2,000 allocations per frame,
+which is measurable and is the honest reason `UNCL_SCROLLBACK` exists in both
+directions. `UNCL_SCROLLBACK=500` is the setting for a wide terminal that scrolls
+endlessly; the S4 engine swap replaces `Screen`-against-`Screen` diffing with
+stored painted rows, which is what removes the copy rather than shrinking it.
+
+### Verification status
+
+- **150 tests** (was 141: +2 constants, +1 `Wheel`, +4 renderer, +2 links).
+- Still **no Rust toolchain here**: every file parses with `tree-sitter-rust`, and
+  the `vt100` behaviour relied on was read from the sources —
+  `Screen::set_scrollback` clamps, `scrollback()` returns the clamped offset,
+  `visible_rows()` starts at `scrollback.rows.len() - offset` (so a scrolled frame
+  walks only the visible window, not 0..N), `contents()` is built from
+  `visible_rows()` (which is what the test asserts on), and `Screen: Clone` is a
+  deep copy of `Grid` (a `Vec<Row>`, no `Rc`), so scrolling a snapshot cannot
+  disturb the parser.
+
+### Acceptance script (S3.6 exit criteria)
+
+```sh
+cargo test                                        # 150
+cargo build --release && ./target/release/uncl
+
+# 1. a link in the float, clicked with NO modifier (this is the bug):
+printf '\e]8;;https://example.com\e\\example.com\e]8;;\e\\\n'
+#    -> the browser opens. The same link in the owner pane (Home) also opens.
+
+# 2. a real one: `ls --hyperlink=always --color=always`, click a filename.
+
+# 3. nothing fires on a drag: press on the link, drag the float by 20 cells,
+#    release -> no browser. Same for Alt+drag.
+
+# 4. scrollback, float: `seq 1 500`, then wheel up -> the border reads `+3`,
+#    `+6`, ... and older numbers appear; type a character -> back to live.
+#    `Ctrl+Alt+PageUp` scrolls a page; `Ctrl+Alt+Up` a notch.
+
+# 5. scrollback, owner: Home (float hidden), `seq 1 500`, wheel up over the
+#    background -> history, and typing returns to live.
+
+# 6. inherited size: `UNCL_SCROLLBACK=10000 ./target/release/uncl` then
+#    `seq 1 20000` in a pane -> scrolls far past 2,000 lines.
+#    `UNCL_SCROLLBACK=0 ./target/release/uncl` -> the wheel does nothing.
+
+# 7. an image, then scroll the float back -> the image is gone while scrolled
+#    and returns (re-sent) when you return to live; it must not double up.
+
+# 8. hide the float while scrolled back, show it again -> it is at the live
+#    screen, not at the offset it was left at.
+```
+
+### Where the plan stands
+
+S0 → S3.6 are in the tree. The report's original claim — that the slowness was never
+`ratatui`'s fault and that the fix was to own the encoder — has now been carried
+through to the last user-visible gap: the float's links open, and both panes have
+history of the size the environment asked for. What S3.5 called "the host does the
+opening" was right about terminals in general and wrong about this one, because a
+floating window has to hold the mouse. That is the shape of the remaining risk in
+this design: every capability uncl takes from the host (mouse, scrollback, link
+dispatch) it has to implement itself, and the implementation has to respect the
+child's precedence. S4 (`alacritty_terminal`) would inherit hyperlinks, underline
+colours and kitty-keyboard input, and would let the renderer stop copying the
+scrollback every frame; the Windows delta (§6.6) and the golden-frame corpus (§10
+item 14) remain the two open items nobody has needed yet.

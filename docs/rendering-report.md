@@ -372,7 +372,8 @@ S0 (items 1–5), S1 (items 6–10), S2 (items 11–13), S3 (items 15–16), S3.
 `OSC 8` hyperlinks) and S3.6 (item 18, clickable float links + scrollback in both panes) are
 implemented — see Appendices C, D, E, F, G and H for the file maps and the verification
 status. Item 14 (the golden-frame corpus in CI) is the one S2 item still open. Only S4 (the
-`alacritty_terminal` swap) and the Windows delta remain.
+`alacritty_terminal` swap) and the Windows delta remain — **for the full, evidence-backed list
+of what is left, see Appendix I**, which supersedes this paragraph as of 2026-10-27.
 
 ```
 S0  1. vendor adapter (src/app/ui/adapter.rs) + vt100 0.18.1 + drop tui-term        [½ d]
@@ -1451,3 +1452,76 @@ child's precedence. S4 (`alacritty_terminal`) would inherit hyperlinks, underlin
 colours and kitty-keyboard input, and would let the renderer stop copying the
 scrollback every frame; the Windows delta (§6.6) and the golden-frame corpus (§10
 item 14) remain the two open items nobody has needed yet.
+
+## Appendix I — the remaining roadmap, as of 2026-10-27
+
+S0 → S3.6 are in the tree (`bb1d575`): 150 tests, all of them unit tests. This is
+what is actually left, ordered by *value per day* rather than by stage number. Each
+row says how I know it is open — a grep, an absent directory, or a comment — so the
+list can be re-derived instead of trusted.
+
+### A. Small user-visible gaps (½–1 day each, no dependency)
+
+| # | Item | Evidence it is open | Fix | Buys |
+|---|---|---|---|---|
+| A1 | **`DCS $q` (DECRQSS)** | only mentioned in comments; `callbacks::reply_for_*` never answers it | answer `m` (SGR), `r` (DECSTBM), `s` (DECSLRM), ` q` (DECSCUSR) from the live `Screen`, and answer *unknown* with `DCS 0$r ST` rather than silence | `vim`/`neovim` under `:terminal`, `tmux` interop, anything that probes "can I use this style" stops guessing |
+| A2 | **`XTGETTCAP`** | zero hits in `src/` | static table (`TN`, `Co`, `RGB`, `colors`, `Smulx` → *absent* until S4) | `kitty`-family tools, `nvim`'s `--embed` probing, and `ncurses` fallbacks stop falling back for the wrong reason |
+| A3 | **`OSC 52` *reads*** | `reply_for_osc` explicitly returns `None` for `52;c;?` | forward the query to the host and route the answer back into the child's pty (the host's reply arrives as *input*, so this needs a one-shot pending-reply slot) | "paste from system clipboard" inside the float works instead of timing out |
+| A4 | **`TERM` pass-through** (§9 item 4) | `caps::apply_child_env` hard-codes `xterm-256color` | copy the host's `TERM`/`COLORTERM`/`TERM_PROGRAM`, downgrade `TERM` under `screen`/`tmux`, and keep the capability proxy as the source of truth for sixel/kitty | a kitty host's children stop believing they are on a dumb 256-colour terminal |
+| A5 | **`BEL` from the float** | no `\x07` is ever written to the host outside image parsers | pass the bell through when the *focused* pane rings | `nvim`/`readline` bells are audible again |
+| A6 | **Child title** | `OSC 0/2` is dropped (only 20t/21t *queries* are considered) | show the child's title in the float's top border, keeping `s:H:W +N` in the bottom one | a float running `ssh`/`nvim` says what it is, which is most of what the border is for |
+
+### B. The regression net (1 day, pays for itself immediately)
+
+| # | Item | Evidence it is open | Fix |
+|---|---|---|---|
+| B1 | **Golden-frame harness + corpus** (§8.1, §10 item 14) | no `tests/` directory, no CI workflow | a `tests/` binary that feeds a recorded stream to a parser at a fixed size, renders through uncl's emitter, replays the result into a fresh `vt100`, and compares `contents_formatted()` — two engines, one assertion, no terminal. Corpus: `?1049`, mouse modes, `?2004`, wide/CJK/emoji, combining marks, `OSC 8`, a small sixel and a small kitty image |
+
+B1 is the only item that makes the other rows cheaper: S3.6's own test bug (asserting
+a word from a frame that emits a cell diff) is exactly the class this catches.
+
+### C. Fidelity — the S4 engine swap (3–5 days, the biggest single item left)
+
+| # | Gap today | What inherits it |
+|---|---|---|
+| C1 | Underline **styles and colours** (`SGR 4:x`, `58`/`59`) are dropped — `vt100` has no such attribute | `alacritty_terminal` `CellFlags`/`Color` |
+| C2 | **Kitty keyboard protocol** (`CSI > u`, `CSI = u`) is neither advertised nor encoded — decision was "do not advertise", which is honest but is a ceiling | `TermMode` + `KittyKeyboardFlags` |
+| C3 | **Synchronised output** (`?2026`) is not honoured: uncl paints when *it* decides | `TermMode::SYNC_UPDATE` + `EventListener` |
+| C4 | `OSC 8` spans are **one row** (wrapped links are dropped, §S3.5), and links die with a repaint rule rather than living on the cell | the engine's own hyperlink storage |
+| C5 | Clipboard/biDi/pointer-shape (`OSC 22`) and other `EventListener` items are all hand-rolled or missing | `EventListener` |
+| C6 | The **per-frame `Screen` clone now carries the scrollback** (Appendix H, "the cost of scrollback"): ~5–13 MB of `memcpy` per painted pane | storing *painted rows* instead of `Screen`-against-`Screen` diffs — the real fix for the last perf debt in this design |
+
+C1–C5 are the swap; C6 is the reason to do it even if no user ever asks for
+underline colours. Doing C without B is unwise: an engine swap with no golden frames
+is a rewrite with no net.
+
+### D. Decisions, not work (§9 items 1–2 and 5)
+
+| # | Question | Current behaviour |
+|---|---|---|
+| D1 | Chord policy: `Home` + `Alt` for geometry, everything else to the child | implemented; the §9 proposal is satisfied, so this is now documentation rather than code |
+| D2 | Where input goes while the float is **hidden** | to the owner shell; the alternative (always the float, `Home` to reach the owner) would change the feel of the product and needs your call |
+| D3 | Windows validation hardware | needed for any claim beyond "it builds" (§6.6) |
+
+### E. Deliberately not on the list
+
+- **Passthrough takeover** (Appendix B) — excluded by decision 1.
+- **Sixel re-encoding, cropping by source rect, animation** — excluded by decision 2.
+- **Images on Windows** — needs a bundled ConPTY v2 `conpty.dll`; excluded by §6.6.
+- **Windows port itself** (§10 item 19): 1–2 days of `cfg` work (an `ansi_support`
+  check at startup, encoder matrix validation, no images) and *zero* architectural
+  risk, but it cannot be verified here — no Windows box, and no compiler in this
+  sandbox at all. It stays last on purpose: the report's own §6.6 says it must not
+  drive the design, and nothing above depends on it.
+
+### F. Housekeeping already done
+
+`Cargo.lock` is clean: 85 entries, no `ratatui`/`tui-term` (the S0 §478 and S2 §788
+warnings are both closed — the lock was regenerated in `bb1d575`). `uncl --doctor`
+prints the capability record including the scrollback size.
+
+### Suggested order
+
+`A1 A2 A4` (one day, three real-world compatibility bugs) → `B1` (the net) →
+`A3 A5 A6` → `D2` (a decision, then maybe an afternoon) → `C` (the swap, with B1 in
+place) → `E` (Windows) whenever a box exists.

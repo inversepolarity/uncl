@@ -32,8 +32,9 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - the float's border shows the child's window title (`OSC 0/2`), so a float
   running `nvim` or `ssh` says what it is; its size and scroll offset sit in the
   bottom border
-- copy and paste (`OSC 52`) work inside a session - copy in the float, paste in
-  the float - and copies are relayed to your real clipboard
+- copy and paste (`OSC 52`): copies are relayed to your real clipboard, and a
+  paste request reads it back - from what a child copied in this session, or from
+  the desktop through `wl-paste`/`xclip`/`xsel`/`pbpaste`/`Get-Clipboard`
 - children get your terminal's `TERM` (alacritty, foot, wezterm, xterm...), and
   `xterm-256color` where uncl cannot carry what that `TERM` implies: `screen`/
   `tmux` dialects, and kitty's keyboard protocol. `uncl --doctor` prints both

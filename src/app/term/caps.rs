@@ -159,11 +159,25 @@ impl Capabilities {
         let host_sixel = is_wezterm || is_foot || is_mlterm || is_contour;
         let sixel = host_sixel && env_flag("UNCL_SIXEL");
 
+        // Windows: images are off, and not because of a bug we could fix here.
+        // The child sits under uncl's *own* ConPTY, and ConPTY v1 (the in-box
+        // implementation on Windows 10/11) parses the child's VT into a text
+        // buffer, swallows DCS payloads, and answers DA1 itself *without* the
+        // sixel attribute — so a child never even asks us, and a sixel we did
+        // forward would be destroyed one layer down. ConPTY v2 forwards bytes and
+        // would make this possible, but shipping it means bundling `conpty.dll`.
+        //
+        // Reporting `false` here is what keeps the promise in this module's header:
+        // never advertise what we cannot transport (docs/rendering-report.md §6.6).
+        let images = !cfg!(windows);
+        let sixel = sixel && images;
+        let kitty_graphics = (is_kitty || is_wezterm || is_ghostty) && images;
+
         Self {
             term,
             term_program,
             colorterm,
-            kitty_graphics: is_kitty || is_wezterm || is_ghostty,
+            kitty_graphics,
             sixel,
             kitty_keyboard: is_kitty,
             truecolor,
@@ -262,7 +276,7 @@ impl Capabilities {
     /// A few lines for `uncl doctor`.
     pub fn summary(&self) -> String {
         format!(
-            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)\n  cell size: {}x{} px ({}), reported to children as CSI 16t (UNCL_CELL_PX)\n  hyperlinks: OSC 8 carried inside the float; FORCE_HYPERLINK=1 for children\n  scrollback: {} lines per pane, in both panes (UNCL_SCROLLBACK)\n  child TERM={} ({})",
+            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)\n  cell size: {}x{} px ({}), reported to children as CSI 16t (UNCL_CELL_PX)\n  hyperlinks: OSC 8 carried inside the float; FORCE_HYPERLINK=1 for children\n  scrollback: {} lines per pane, in both panes (UNCL_SCROLLBACK)\n  child TERM={} ({})\n  images: {} ({}), over {}",
             if self.term.is_empty() { "<unset>" } else { &self.term },
             self.term_program.as_deref().unwrap_or("<unset>"),
             self.colorterm.as_deref().unwrap_or("<unset>"),
@@ -281,6 +295,19 @@ impl Capabilities {
             } else {
                 "downgraded: uncl does not carry what that TERM implies"
             },
+            if self.kitty_graphics || self.sixel {
+                "on"
+            } else {
+                "off"
+            },
+            if cfg!(windows) {
+                "ConPTY v1 swallows DCS: Windows has no images until conpty.dll v2 is bundled"
+            } else if self.kitty_graphics || self.sixel {
+                "the image tap carries kitty/iTerm2; sixel only with UNCL_SIXEL=1"
+            } else {
+                "this host advertises no image protocol"
+            },
+            std::env::consts::OS,
         )
     }
 }

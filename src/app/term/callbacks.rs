@@ -62,6 +62,9 @@ pub struct ChildState {
     /// selector. This is uncl's own in-session clipboard — see
     /// `paste_from_clipboard` for why it is not the system's.
     clipboard: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
+    /// Is a read of the *desktop's* clipboard already in flight? A child that
+    /// asks twice must not start two processes.
+    clipboard_busy: AtomicBool,
 }
 
 impl ChildState {
@@ -105,6 +108,16 @@ impl ChildState {
         if let Ok(mut slot) = self.clipboard.lock() {
             *slot = Some((ty.to_vec(), data.to_vec()));
         }
+    }
+
+    /// Claim the right to read the desktop clipboard, or report that a read is
+    /// already running.
+    fn begin_clipboard_read(&self) -> bool {
+        !self.clipboard_busy.swap(true, Ordering::AcqRel)
+    }
+
+    fn end_clipboard_read(&self) {
+        self.clipboard_busy.store(false, Ordering::Release);
     }
 
     /// The payload to hand a child that asked to paste from the clipboard.
@@ -237,24 +250,49 @@ impl Callbacks for ChildCallbacks {
 
     /// `OSC 52 ; <selector> ; ?` — the child pasting from the clipboard.
     ///
-    /// The *system* clipboard is out of reach here, and not because of a missing
-    /// feature: reading it means sending a query to the host terminal and reading
-    /// its reply out of stdin, and stdin belongs to `crossterm`, which parses it
-    /// into key events and would drop or misparse an `OSC 52` reply. Uncl would
-    /// have to take over raw input to do this (tracked in the rendering report,
-    /// Appendix I, item A3).
+    /// Two answers, in order of cheapness:
     ///
-    /// What *is* reachable, and is the case that actually breaks today, is a child
-    /// that copies and then pastes in the same session (`vim`'s `"+y` then `"+p`,
-    /// an editor's "copy path" command). Every copy goes through
-    /// [`Self::copy_to_clipboard`], so the payload is already here. Answering from
-    /// that record makes the round trip work without pretending to own the
-    /// system's clipboard, and a request for something never copied here stays
-    /// unanswered, which is the truthful reply.
+    /// 1. **What a child copied in this session.** Every copy passes through
+    ///    [`Self::copy_to_clipboard`], so `vim`'s `"+y` then `"+p` is already
+    ///    answerable with no process at all.
+    /// 2. **The desktop's clipboard**, read through `wl-paste`/`xclip`/`pbpaste`/
+    ///    `Get-Clipboard` (see [`crate::app::clipboard`]). That is a *process*, so
+    ///    it happens on a thread of its own: this callback runs on the reader that
+    ///    is feeding the parser, and a blocked reader is a frozen pane.
+    ///
+    /// If neither can answer, nothing is sent. A terminal with no clipboard says
+    /// nothing, which is what the child's timeout is for.
+    ///
+    /// The one thing this deliberately does not do is ask the *host terminal*,
+    /// which is where a native `OSC 52` read would go: that reply arrives as
+    /// input, and input belongs to `crossterm`'s event parser, which would drop or
+    /// misparse it. Reading the desktop directly gets the same clipboard without
+    /// taking over stdin.
     fn paste_from_clipboard(&mut self, _screen: &mut Screen, ty: &[u8]) {
         if let Some(data) = self.state.clipboard(ty) {
             self.sink.send(osc52(ty, &data));
+            return;
         }
+
+        // Nothing copied here. Ask the desktop, once at a time.
+        if crate::app::clipboard::selection(ty).is_none() || !self.state.begin_clipboard_read() {
+            return;
+        }
+
+        let sink = self.sink.clone();
+        let state = self.state.clone();
+        let ty = ty.to_vec();
+        std::thread::spawn(move || {
+            // A clipboard read is a few milliseconds of `wait`; doing it here keeps
+            // the parser's reader free.
+            let reply = crate::app::clipboard::read(&ty)
+                .filter(|data| !data.is_empty())
+                .map(|data| osc52(&ty, &crate::app::clipboard::base64(&data)));
+            if let Some(reply) = reply {
+                sink.send(reply);
+            }
+            state.end_clipboard_read();
+        });
     }
 }
 
@@ -595,10 +633,27 @@ mod tests {
             &b"\x1b]52;c;aGk=\x1b\\"[..]
         );
 
-        // The primary selection was never written, so it is not invented.
+        // The primary selection was never written, so it is not invented. (This
+        // falls through to the *desktop* clipboard, which on X11 may legitimately
+        // answer — so the assertion is only that nothing arrives synchronously.)
         let (screen, callbacks) = parser.screen_and_callbacks_mut();
         callbacks.paste_from_clipboard(screen, b"p");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_selector_we_do_not_serve_never_starts_a_clipboard_read() {
+        let (callbacks, sink, state) = ChildCallbacks::new(caps(), host().0);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        sink.install(&tx);
+        let mut parser = vt100::Parser::new_with_callbacks(nz(4), nz(20), 0, callbacks);
+
+        // `0` is a cut buffer, not a clipboard: refused before any process could
+        // start, so the busy flag is never even claimed.
+        let (screen, callbacks) = parser.screen_and_callbacks_mut();
+        callbacks.paste_from_clipboard(screen, b"0");
+        assert!(state.begin_clipboard_read(), "the read slot must be free");
+        state.end_clipboard_read();
     }
 
     #[test]

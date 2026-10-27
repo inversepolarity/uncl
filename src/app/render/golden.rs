@@ -276,3 +276,203 @@ fn a_resize_repaints_and_the_result_replays() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The float, links and images — the three things the owner-only corpus above
+// cannot see.
+//
+// The point of each of these is the same: whatever *else* the frame does (draw a
+// border, wrap a row in `OSC 8`, place an image), the grid a terminal ends up
+// holding must still be the grid the child drew. A link that desyncs a row, or an
+// image that lands on a cell, would pass every string-level test in `mod.rs` and
+// fail here.
+// ---------------------------------------------------------------------------
+
+/// The float's rectangle, inside the corpus grid.
+fn float_rect() -> Rect {
+    Rect::new(4, 2, 20, 7)
+}
+
+#[test]
+fn a_float_replays_over_the_owner_grid() {
+    let mut owner = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    owner.process(b"owner line one\r\nowner line two\r\n$ ");
+    let mut float = vt100::Parser::new(nz(5), nz(18), 0);
+    float.process(b"floating:\r\n\x1b[1;33myellow\x1b[0m\r\n日本語");
+
+    let rect = float_rect();
+    let content = content_rect(rect);
+
+    let mut renderer = Renderer::new();
+    let frame = renderer
+        .render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: owner_area(),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
+            float_title: None,
+        })
+        .to_vec();
+    assert!(!frame.is_empty());
+
+    let mut replayed = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    replayed.process(&frame);
+
+    // Inside the float: the child's cells, exactly.
+    for row in 0..content.height {
+        for col in 0..content.width {
+            assert_eq!(
+                float.screen().cell(row, col),
+                replayed.screen().cell(content.y + row, content.x + col),
+                "float cell ({row}, {col}) differs\n  frame: {:?}",
+                String::from_utf8_lossy(&frame)
+            );
+        }
+    }
+
+    // Outside it: the owner's cells, except where the float's border covers them.
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            if rect.contains(col, row) {
+                continue;
+            }
+            assert_eq!(
+                owner.screen().cell(row, col),
+                replayed.screen().cell(row, col),
+                "owner cell ({row}, {col}) was not preserved\n  frame: {:?}",
+                String::from_utf8_lossy(&frame)
+            );
+        }
+    }
+
+    // And the frame is a frame: the corners are there.
+    let text = String::from_utf8_lossy(&frame);
+    assert!(text.contains('┌') && text.contains('┘'), "{text:?}");
+}
+
+#[test]
+fn a_linked_row_replays_to_the_same_cells() {
+    // `OSC 8` is emitted *inside* a row, between column-ranged segments. If those
+    // segments were computed wrongly, the row would shift — the cells would still
+    // be painted, in the wrong place. Only a replay can see that.
+    let mut parser = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    parser.process(b"before ");
+    let mut links = Links::new();
+    links.osc(parser.screen(), b"", b"https://example.com/a");
+    parser.process(b"click me");
+    links.osc(parser.screen(), b"", b"");
+    parser.process(b" after\r\nsecond row");
+    links.osc(parser.screen(), b"", b"file:///tmp/log");
+    parser.process(b" tail");
+
+    let mut renderer = Renderer::new();
+    let frame = renderer
+        .render(Panes {
+            owner: parser.screen().clone(),
+            owner_area: owner_area(),
+            float: None,
+            float_focused: false,
+            images: None,
+            links: FrameLinks {
+                owner: links,
+                float: Links::new(),
+            },
+            scroll: 0,
+            focused_scrolled: false,
+            float_title: None,
+        })
+        .to_vec();
+
+    let text = String::from_utf8_lossy(&frame);
+    assert!(text.contains("\x1b]8;;https://example.com/a\x1b\\"), "{text:?}");
+
+    let mut replayed = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    replayed.process(&frame);
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            assert_eq!(
+                parser.screen().cell(row, col),
+                replayed.screen().cell(row, col),
+                "linked cell ({row}, {col}) differs — the segments shifted the row"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_image_does_not_disturb_the_grid() {
+    use crate::app::images::{Ingest, Kind, Store};
+
+    // An image can only ever be placed inside the float's content rect (that is
+    // the whole point of S3's geometry law), so this has to be a float frame — and
+    // that makes the assertion stronger: the payload must not disturb the float's
+    // cells *or* the owner's.
+    let mut owner = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    owner.process(b"owner text\r\nbehind the float");
+    let rect = float_rect();
+    let content = content_rect(rect);
+
+    let mut float = vt100::Parser::new(nz(content.height), nz(content.width), 0);
+    float.process(b"\x1b[1mcaption\x1b[0m\r\nunder the picture");
+
+    let mut store = Store::new();
+    assert!(matches!(
+        store.ingest(
+            Kind::Apc,
+            b"\x1b_Gf=24,a=T,i=7;QUJD\x1b\\",
+            (1, 2),
+            (content.width, content.height)
+        ),
+        Ingest::Stored
+    ));
+
+    let mut renderer = Renderer::new();
+    let frame = renderer
+        .render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: owner_area(),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: Some(&store),
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
+            float_title: None,
+        })
+        .to_vec();
+
+    // The payload is in the frame…
+    let text = String::from_utf8_lossy(&frame);
+    assert!(text.contains("\x1b_G"), "{text:?}");
+
+    // …and a terminal that ignores it entirely (which is what `vt100` does, and
+    // what any terminal without kitty graphics does) still shows the child's cells.
+    let mut replayed = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    replayed.process(&frame);
+
+    for row in 0..content.height {
+        for col in 0..content.width {
+            assert_eq!(
+                float.screen().cell(row, col),
+                replayed.screen().cell(content.y + row, content.x + col),
+                "float cell ({row}, {col}) was disturbed by the image"
+            );
+        }
+    }
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            if rect.contains(col, row) {
+                continue;
+            }
+            assert_eq!(
+                owner.screen().cell(row, col),
+                replayed.screen().cell(row, col),
+                "owner cell ({row}, {col}) was disturbed by the image"
+            );
+        }
+    }
+}

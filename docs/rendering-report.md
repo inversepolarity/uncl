@@ -325,6 +325,7 @@ Sources for the ConPTY v1/v2 distinction: Windows Terminal 1.22 release notes (`
 | S3 cheap-tier images — **shipped** | ~3 d | ~+450 | kitty images (croppable), sixel (if it fits), passthrough | Medium-low, because the quality contract is explicit (§6.4 non-goals). |
 | S3.5 hyperlinks (`OSC 8`) — **shipped** | 1 d | ~+430 | links *emitted* inside the float | Low; or free with S4. |
 | S3.6 clicks + scrollback — **shipped** | 1 d | ~+650 | links in the float actually **open**; history in both panes, sized by `UNCL_SCROLLBACK` | Low-medium: the click is uncl's because the host never sees it (§Appendix H), and the scrollback copy is a per-frame cost that `UNCL_SCROLLBACK` trades against |
+| S3.8 last passes (clipboard, corpus, Windows guards) — **shipped** | 1 d | ~+520 | system clipboard reads via the desktop's own tools; float/link/image coverage in the golden harness; Windows refuses legacy consoles instead of painting garbage | Low: every decision in the clipboard path is pure and unit-tested, the reads happen off the reader thread, and the Windows code cannot affect other platforms |
 | S3.7 compatibility batch — **shipped** | 1 d | ~+700 | `DECRQSS`, `XTGETTCAP`, `TERM` pass-through, the bell, the child's title in the border, in-session clipboard, and the golden-frame harness that guards all of it | Low: every answer is derived from state `vt100` already tracks, and anything it does not track is refused rather than approximated |
 | S4 engine swap (`alacritty_terminal`) | 3–5 d | ~+600 | underline colour/styles, hyperlinks, kitty-keyboard input, sync output, `EventListener` (title/clipboard/bell) | Medium; **requires S2** (you must own the encoder before leaving `vt100`). Optional — skip unless users ask for the fidelity *inside* a float. |
 | §6.6 Windows delta | 1–2 d | ~+120 | Windows build that runs a TUI float (no images) | Medium; needs a real Windows box or CI runner to validate input modes. |
@@ -1469,7 +1470,7 @@ list can be re-derived instead of trusted.
 |---|---|---|---|---|
 | A1 **shipped** | **`DCS $q` (DECRQSS)** | only mentioned in comments; `callbacks::reply_for_*` never answers it | answer `m` (SGR), `r` (DECSTBM), `s` (DECSLRM), ` q` (DECSCUSR) from the live `Screen`, and answer *unknown* with `DCS 0$r ST` rather than silence | `vim`/`neovim` under `:terminal`, `tmux` interop, anything that probes "can I use this style" stops guessing |
 | A2 **shipped** | **`XTGETTCAP`** | zero hits in `src/` | static table (`TN`, `Co`, `RGB`, `colors`, `Smulx` → *absent* until S4) | `kitty`-family tools, `nvim`'s `--embed` probing, and `ncurses` fallbacks stop falling back for the wrong reason |
-| A3 | **`OSC 52` *reads*** — **half shipped** | `paste_from_clipboard` is now answered from an in-session record; the *system* clipboard is still out of reach | forward the query to the host and route the answer back into the child's pty — the reply arrives as *input*, and stdin belongs to `crossterm`, so this needs raw input to be taken over (S3.7 explains why that was not done) | "copy here, paste here" works today (Appendix J); "paste what you copied in another window" does not |
+| A3 **shipped** | **`OSC 52` *reads*** | answered in two tiers: an in-session record first, then the desktop's clipboard through `wl-paste`/`xclip`/`xsel`/`pbpaste`/`Get-Clipboard` | — (`app::clipboard`, Appendix K). The *host terminal* is still never asked, because its reply would arrive as input, which belongs to `crossterm` | "paste what you copied in another window" works wherever a clipboard tool exists |
 | A4 **shipped** | **`TERM` pass-through** (§9 item 4) | `caps::apply_child_env` hard-codes `xterm-256color` | copy the host's `TERM`/`COLORTERM`/`TERM_PROGRAM`, downgrade `TERM` under `screen`/`tmux`, and keep the capability proxy as the source of truth for sixel/kitty | a kitty host's children stop believing they are on a dumb 256-colour terminal |
 | A5 **shipped** | **`BEL` from the float** | no `\x07` is ever written to the host outside image parsers | pass the bell through when the *focused* pane rings | `nvim`/`readline` bells are audible again |
 | A6 **shipped** | **Child title** | `OSC 0/2` is dropped (only 20t/21t *queries* are considered) | show the child's title in the float's top border, keeping `s:H:W +N` in the bottom one | a float running `ssh`/`nvim` says what it is, which is most of what the border is for |
@@ -1503,7 +1504,7 @@ is a rewrite with no net.
 | # | Question | Current behaviour |
 |---|---|---|
 | D1 | Chord policy: `Home` + `Alt` for geometry, everything else to the child | implemented; the §9 proposal is satisfied, so this is now documentation rather than code |
-| D2 | Where input goes while the float is **hidden** | to the owner shell; the alternative (always the float, `Home` to reach the owner) would change the feel of the product and needs your call |
+| D2 | Where input goes while the float is **hidden** — **decided: the owner shell** | kept as it is. Routing keys to an invisible float means keystrokes land somewhere the user cannot see, which is the one failure mode a *floating* window must not have; `Home` is the toggle, and the float keeps parsing so it is live when it comes back (Appendix K) |
 | D3 | Windows validation hardware | needed for any claim beyond "it builds" (§6.6) |
 
 ### E. Deliberately not on the list
@@ -1511,11 +1512,12 @@ is a rewrite with no net.
 - **Passthrough takeover** (Appendix B) — excluded by decision 1.
 - **Sixel re-encoding, cropping by source rect, animation** — excluded by decision 2.
 - **Images on Windows** — needs a bundled ConPTY v2 `conpty.dll`; excluded by §6.6.
-- **Windows port itself** (§10 item 19): 1–2 days of `cfg` work (an `ansi_support`
-  check at startup, encoder matrix validation, no images) and *zero* architectural
-  risk, but it cannot be verified here — no Windows box, and no compiler in this
-  sandbox at all. It stays last on purpose: the report's own §6.6 says it must not
-  drive the design, and nothing above depends on it.
+- **Windows port** (§10 item 19) — **guards shipped, unvalidated** (Appendix K): the
+  `ansi_support` startup check and "no images on Windows" are in and are `cfg`-gated,
+  so they cannot affect a Linux build. What is *not* done is the part that needs
+  hardware: validating the encoder matrix (application cursor, SGR vs X10 mouse,
+  ConPTY's own quirks) on a real console. The report's §6.6 rule stands — this must
+  not drive the design, and nothing above depends on it.
 
 ### F. Housekeeping already done
 
@@ -1523,11 +1525,15 @@ is a rewrite with no net.
 warnings are both closed — the lock was regenerated in `bb1d575`). `uncl --doctor`
 prints the capability record including the scrollback size.
 
-### Suggested order
+### Suggested order — updated
 
-`A1 A2 A4` (one day, three real-world compatibility bugs) → `B1` (the net) →
-`A3 A5 A6` → `D2` (a decision, then maybe an afternoon) → `C` (the swap, with B1 in
-place) → `E` (Windows) whenever a box exists.
+Everything except **C** and the unvalidatable half of **E** is now shipped
+(Appendices J and K):
+
+`A1 A2 A4 A5 A6 B1` ✅ → `A3` ✅ (via the desktop's clipboard tools) → `D2` ✅
+(decided, no code) → `E` guards ✅ → **`C` (the S4 swap) is the one pass left**, and
+it wants a toolchain and B1's corpus in place before it starts. Both are now true
+wherever `cargo` exists.
 
 ## Appendix J — S3.7 implementation log (2026-10-27): the compatibility batch
 
@@ -1687,3 +1693,131 @@ printf '\e]2;hello from the float\a'; the float's top border reads it.
 
 # 6. TERM: `echo $TERM` in the float. Under WezTerm/alacritty/foot it is the host's
 #    own; under kitty, screen or tmux it is `xterm-256color` and --doctor says why.
+
+## Appendix K — S3.8 implementation log (2026-10-27): the last passes
+
+The tree builds and 169 tests pass on a real toolchain, which is the first
+verification this report has been able to confirm rather than predict. This pass
+finishes everything that does not need hardware: the system clipboard, the corpus
+gap Appendix I left open, the Windows guards, and the two decisions that were
+sitting in the roadmap.
+
+### A3, properly: the desktop's clipboard
+
+`OSC 52 ; c ; ?` is a request to the terminal, so the honest answer is the
+clipboard the *user* has. uncl could not ask its host terminal — that reply arrives
+as **input**, and input is `crossterm`'s event parser, which would drop an `OSC 52`
+reply or misread it as keystrokes — so it asks the desktop instead, through the same
+programs every Wayland/X11 tool already uses.
+
+Two tiers, cheapest first:
+
+| Tier | Answers | Cost |
+|---|---|---|
+| in-session record | anything a child copied in this session (`vim`'s `"+y` → `"+p`) | one `Vec` per pane |
+| desktop helper | what the user copied anywhere else | one process, on a thread |
+
+`app::clipboard` keeps every decision pure and testable: which selector means which
+clipboard (`c` → clipboard; `p`, `s` → primary; numbered cut buffers and compound
+selectors refused *before* anything is spawned), which programs to try and in what
+order (Wayland before X11 — on a Wayland session `xclip` may exist and still fail),
+and the base64 encoding, against the RFC 4648 vectors.
+
+Three properties worth stating, because each is a way this could have gone wrong:
+
+* **off the reader thread.** `paste_from_clipboard` runs inside the parser, on the
+  thread that is draining the pty. A `wait()` there would freeze the pane for the
+  duration of a clipboard read, so the read happens on its own thread and the reply
+  goes back through the pty writer when it lands.
+* **one at a time.** A child that asks twice must not start two processes; the claim
+  is an atomic swap, released on every exit path including failure.
+* **bounded, and silent when it cannot know.** A selection over 1 MiB is refused
+  (base64 makes it 1.4 MiB of pty traffic, and it is almost certainly a copied file
+  rather than text), an empty clipboard still counts as an answer *from the program
+  that owned the selection* — falling through to the next helper would ask a
+  different clipboard — and with no helper installed the request stays unanswered,
+  which is what a child's timeout is for.
+
+macOS and Windows have one clipboard and no primary selection, so `p`/`s` are
+refused there rather than silently served from the clipboard.
+
+### The corpus gap Appendix I flagged
+
+The golden harness covered the owner pane only, with no float and no images — the
+three cases where a frame does something *besides* paint cells, and therefore the
+three where a cell-level regression could hide behind a passing string assertion.
+Now covered:
+
+* **`a_float_replays_over_the_owner_grid`** — cells inside the float's content rect
+  must be the float child's cells, and every cell *outside* the rect must still be
+  the owner's. That second half is the real test: it is what `repair_tail` exists
+  for, and it is the one part of S2 with no end-to-end check until now.
+* **`a_linked_row_replays_to_the_same_cells`** — `OSC 8` is emitted *inside* a row,
+  between column-ranged segments. A segment computed wrongly shifts the row: the
+  cells are all painted, in the wrong place, and every string-level test still
+  passes. A replay sees it immediately.
+* **`an_image_does_not_disturb_the_grid`** — an image is out-of-band, so the grid
+  after it must be exactly the grid before it, for terminals that ignore the payload
+  as well as for those that draw it.
+
+Six golden tests now, still no golden files: the expectation is always the screen
+the child drew.
+
+### D2, decided
+
+Where input goes while the float is hidden stays **the owner shell**. The argument
+that settled it: routing keys to an invisible float means keystrokes land somewhere
+the user cannot see, and a floating window's one unforgivable failure is losing
+input. `Home` is the toggle, and the hidden float keeps parsing, so it is live the
+moment it comes back. This is recorded as a decision, not a default.
+
+### E: the Windows guards, and what is still unvalidated
+
+Two things are in, both `cfg`-gated so they cannot affect a non-Windows build:
+
+* `ensure_ansi()` at startup: `crossterm::ansi_support::supports_ansi()` enables
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` and tells us whether the console can honour
+  the frames at all. A legacy console now gets one sentence instead of an alternate
+  screen full of raw escapes.
+* **no images on Windows**, enforced in the capability record rather than by a
+  comment: ConPTY v1 parses the child's VT into a text buffer, swallows `DCS`, and
+  answers `DA1` itself without the sixel attribute — so a child never asks, and
+  anything forwarded would die one layer down. `kitty_graphics` and `sixel` are
+  forced false, and `--doctor` says why on the platform where it matters.
+
+**Still unvalidated, and this pass does not pretend otherwise:** the encoder matrix
+on a real console (application cursor, SGR vs X10 mouse under ConPTY) has not been
+exercised on Windows hardware. §6.6's rule stands — this must not drive the design,
+and nothing above depends on it.
+
+### Verification status
+
+- **177 tests** (was 169: +4 `clipboard`, +1 callbacks, +3 golden).
+- The user's toolchain built `d45198b` clean with 169 passing, which retires the
+  "never compiled" caveat for everything up to S3.7. This pass is again
+  **unverified by rustc** — it is written against the same `vt100`/`crossterm`
+  sources and parses clean, but the first `cargo test` after it is the real signal.
+  The Windows-only block is not compiled on Linux at all, so it can neither break
+  this build nor be proven by it.
+
+### Acceptance script (S3.8 exit criteria)
+
+```sh
+cargo test                                        # 177
+
+# 1. the desktop clipboard, from inside the float:
+#    copy something in another window (the browser), then in the float:
+printf '\e]52;c;?\e\\'      # paste it into `cat -v` to see what came back
+#    in a program: vim's `"+p` after copying elsewhere.
+
+# 2. the in-session tier still wins: copy in the float, paste in the float — no
+#    helper process is started (pgrep -c wl-paste stays 0).
+
+# 3. a cut buffer is not served: `printf '\e]52;0;?\e\\'` answers nothing.
+
+# 4. no helper installed: `PATH=/nonexistent uncl` → paste requests stay
+#    unanswered, and the pane is not frozen while that is decided.
+
+# 5. --doctor now ends with an `images:` line naming the platform, and says
+#    ConPTY's reason on Windows.
+```

@@ -29,7 +29,35 @@ fn main() -> Result<()> {
     }
 }
 
+/// Refuse to run on a console that would mangle every frame.
+///
+/// uncl writes raw ANSI to stdout (S2 owns the emitter). A legacy Windows console
+/// needs `ENABLE_VIRTUAL_TERMINAL_PROCESSING` before it will honour any of it, and
+/// crossterm's `ansi_support` module is the thing that turns it on and reports
+/// whether the console can do it at all. Failing here with a sentence is strictly
+/// better than painting an alternate screen full of `ESC[?25l`.
+///
+/// Only compiled on Windows: everywhere else the answer is a terminal that speaks
+/// ANSI or is not worth supporting.
+#[cfg(windows)]
+fn ensure_ansi() -> Result<()> {
+    if !crossterm::ansi_support::supports_ansi() {
+        return Err(anyhow::anyhow!(
+            "uncl needs a console with ANSI/VT support (Windows 10 1511+, or Windows Terminal).\n\
+             ConPTY on this system cannot render uncl's frames."
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn ensure_ansi() -> Result<()> {
+    Ok(())
+}
+
 fn run() -> Result<()> {
+    ensure_ansi()?;
+
     // A hand-built runtime (instead of `#[tokio::main]`) so we can bound how
     // long shutdown waits for the blocking pty reader and input pump threads.
     // They end when their children die, but if one is wedged we would rather
@@ -55,8 +83,11 @@ fn doctor() {
     println!("uncl {} — terminal capabilities\n", env!("CARGO_PKG_VERSION"));
     println!("{}", caps.summary());
     println!();
-    println!("children inherit: TERM=xterm-256color COLORTERM={} TERM_PROGRAM=uncl",
-        if caps.truecolor { "truecolor" } else { "<unset>" });
+    println!(
+        "children inherit: TERM={} COLORTERM={} TERM_PROGRAM=uncl",
+        caps.child_term(),
+        if caps.truecolor { "truecolor" } else { "<unset>" }
+    );
     println!();
     println!("notes:");
     println!("  * host TERM is not passed through: a sixel/kitty TERM would make children");

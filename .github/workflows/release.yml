@@ -4,14 +4,14 @@ name: release
 #
 #   dev  -> test, bump the patch version, build every platform, replace the
 #           *draft* release. The draft is not visible until someone publishes it.
-#   master -> publish the newest draft. Publishing is the only step that creates
+# master -> publish the newest draft. Publishing is the only step that creates
 #           the tag and makes a release visible, so `master` stays the switch.
 #
 # The version lives in Cargo.toml and is bumped in a commit pushed back to the
 # branch, so the repository always says which version is being prepared.
 
-# If the release branch is called `master` rather than `master`, it is named in
-# two places: this list, and the `if:` of the publish job at the bottom.
+# The release branch is `master`: it is named here, and again in the `if:` of
+# the publish job at the bottom.
 on:
   push:
     branches: [dev, master]

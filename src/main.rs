@@ -80,13 +80,20 @@ fn doctor() {
     // actually be given rather than the fallback.
     app::term::caps::probe_cell_px();
     let caps = app::term::caps::Capabilities::from_env();
-    println!("uncl {} — terminal capabilities\n", env!("CARGO_PKG_VERSION"));
+    println!(
+        "uncl {} — terminal capabilities\n",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("{}", caps.summary());
     println!();
     println!(
         "children inherit: TERM={} COLORTERM={} TERM_PROGRAM=uncl",
         caps.child_term(),
-        if caps.truecolor { "truecolor" } else { "<unset>" }
+        if caps.truecolor {
+            "truecolor"
+        } else {
+            "<unset>"
+        }
     );
     println!();
     println!("notes:");
@@ -95,7 +102,7 @@ fn doctor() {
     println!("    enables the kitty keyboard protocol, which the encoder does not implement)");
     println!("  * sixel is advertised only with UNCL_SIXEL=1 on a host known to render it");
     println!("  * kitty keyboard protocol is never advertised");
-    println!("  * see docs/rendering-report.md for what the tap carries and why");
+    println!("  * see docs for what the tap carries and why");
 }
 
 fn help() {

@@ -4,17 +4,17 @@ name: release
 #
 #   dev  -> test, bump the patch version, build every platform, replace the
 #           *draft* release. The draft is not visible until someone publishes it.
-#   main -> publish the newest draft. Publishing is the only step that creates
-#           the tag and makes a release visible, so `main` stays the switch.
+#   master -> publish the newest draft. Publishing is the only step that creates
+#           the tag and makes a release visible, so `master` stays the switch.
 #
 # The version lives in Cargo.toml and is bumped in a commit pushed back to the
 # branch, so the repository always says which version is being prepared.
 
-# If the release branch is called `master` rather than `main`, it is named in
+# If the release branch is called `master` rather than `master`, it is named in
 # two places: this list, and the `if:` of the publish job at the bottom.
 on:
   push:
-    branches: [dev, main]
+    branches: [dev, master]
   workflow_dispatch:
     inputs:
       publish:
@@ -109,7 +109,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Test, then decide the version. The version is only bumped when the one in
-  # Cargo.toml has already been published: while a draft is waiting for main,
+  # Cargo.toml has already been published: while a draft is waiting for master,
   # further pushes to dev rebuild it under the same number instead of piling up
   # drafts of versions nobody will ever see.
   # ---------------------------------------------------------------------------
@@ -325,15 +325,15 @@ jobs:
             -q '"draft=" + (.isDraft|tostring) + " assets=" + ([.assets[].name]|join(", "))'
 
   # ---------------------------------------------------------------------------
-  # The publish half. Runs only on main (or when asked for by hand), and quits
-  # quietly when no draft is waiting: merging main with nothing pending is a
+  # The publish half. Runs only on master (or when asked for by hand), and quits
+  # quietly when no draft is waiting: merging master with nothing pending is a
   # normal thing to do, not a failure.
   # ---------------------------------------------------------------------------
   publish:
     name: publish the newest draft
     if: >-
       github.repository_owner == 'inversepolarity'
-      && ((github.event_name == 'push' && github.ref == 'refs/heads/main')
+      && ((github.event_name == 'push' && github.ref == 'refs/heads/master')
           || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
     runs-on: ubuntu-22.04
     timeout-minutes: 10

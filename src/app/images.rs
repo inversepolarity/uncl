@@ -296,6 +296,7 @@ impl Image {
     }
 
     /// The complete sequence, ready to write to the host terminal.
+    #[allow(unused)]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -396,7 +397,8 @@ impl Image {
             }
             Size::Pixels(width, height) => {
                 let (cell_w, cell_h) = cell_px();
-                let (fit_width, fit_height) = fit_pixels(width, height, cols, rows, cell_w, cell_h)?;
+                let (fit_width, fit_height) =
+                    fit_pixels(width, height, cols, rows, cell_w, cell_h)?;
                 // Back to cells for the protocols (kitty) that think in them.
                 Some((
                     u16::try_from(fit_width.div_ceil(u32::from(cell_w.max(1)))).unwrap_or(cols),
@@ -819,7 +821,19 @@ fn image_pixels(base64_body: &[u8]) -> Option<(u32, u32)> {
             Some((width, height)).filter(|(width, height)| *width > 0 && *height > 0)
         }
         // GIF: the logical screen size, little-endian, right after the signature.
-        [b'G', b'I', b'F', b'8', _, b'a', width_low, width_high, height_low, height_high, ..] => {
+        [
+            b'G',
+            b'I',
+            b'F',
+            b'8',
+            _,
+            b'a',
+            width_low,
+            width_high,
+            height_low,
+            height_high,
+            ..,
+        ] => {
             let width = u32::from(u16::from_le_bytes([*width_low, *width_high]));
             let height = u32::from(u16::from_le_bytes([*height_low, *height_high]));
             Some((width, height)).filter(|(width, height)| *width > 0 && *height > 0)
@@ -954,8 +968,18 @@ impl KittyControls {
                 b'i' => out.id = value.parse().ok(),
                 b'p' => out.placement = value.parse().ok(),
                 b'm' => out.more = value == "1",
-                b's' => out.native_px = Some((value.parse().unwrap_or(0), out.native_px.map_or(0, |px| px.1))),
-                b'v' => out.native_px = Some((out.native_px.map_or(0, |px| px.0), value.parse().unwrap_or(0))),
+                b's' => {
+                    out.native_px = Some((
+                        value.parse().unwrap_or(0),
+                        out.native_px.map_or(0, |px| px.1),
+                    ))
+                }
+                b'v' => {
+                    out.native_px = Some((
+                        out.native_px.map_or(0, |px| px.0),
+                        value.parse().unwrap_or(0),
+                    ))
+                }
                 b'c' | b'r' | b'x' | b'y' | b'w' | b'h' | b'z' | b'q' | b'C' | b'X' | b'Y' => {
                     out.replay_keys.push((key, value.to_owned()));
                 }
@@ -1124,9 +1148,8 @@ mod tests {
         for chunk in bytes.chunks(3) {
             let mut block = [0u8; 3];
             block[..chunk.len()].copy_from_slice(chunk);
-            let value = (u32::from(block[0]) << 16)
-                | (u32::from(block[1]) << 8)
-                | u32::from(block[2]);
+            let value =
+                (u32::from(block[0]) << 16) | (u32::from(block[1]) << 8) | u32::from(block[2]);
             for index in 0..4 {
                 if index <= chunk.len() {
                     let shift = 18 - index * 6;
@@ -1186,7 +1209,10 @@ mod tests {
 
         let (text, out) = pieces(&mut splitter, b"AA\x1b\\after");
         assert_eq!(text.as_slice(), b"after");
-        assert_eq!(out, vec![(Kind::Apc, b"\x1b_Gf=24,i=7;AAAA\x1b\\".to_vec())]);
+        assert_eq!(
+            out,
+            vec![(Kind::Apc, b"\x1b_Gf=24,i=7;AAAA\x1b\\".to_vec())]
+        );
     }
 
     #[test]
@@ -1251,7 +1277,10 @@ mod tests {
         assert_eq!(out, vec![(Kind::Osc, b"\x1b]52;c;aGk=\x07".to_vec())]);
 
         let mut store = Store::new();
-        assert!(matches!(ingest(&mut store, out[0].0, &out[0].1), Ingest::Passthrough));
+        assert!(matches!(
+            ingest(&mut store, out[0].0, &out[0].1),
+            Ingest::Passthrough
+        ));
     }
 
     #[test]
@@ -1292,13 +1321,13 @@ mod tests {
         // viewer leaves the cell box to the terminal.
         let pixelated = KittyControls::parse(b"a=T,f=24,i=9,s=1920,v=1080;AAAA").unwrap();
         assert_eq!(pixelated.size(), Size::Pixels(1920, 1080));
-        assert_eq!(KittyControls::parse(b"a=T,f=24,i=9;AAAA").unwrap().size(), Size::Unknown);
+        assert_eq!(
+            KittyControls::parse(b"a=T,f=24,i=9;AAAA").unwrap().size(),
+            Size::Unknown
+        );
 
         let replay = String::from_utf8(controls.replay().unwrap()).unwrap();
-        assert_eq!(
-            replay,
-            "\x1b_Ga=p,i=7,p=2,c=10,r=4,x=1,y=2,z=3,q=2\x1b\\"
-        );
+        assert_eq!(replay, "\x1b_Ga=p,i=7,p=2,c=10,r=4,x=1,y=2,z=3,q=2\x1b\\");
     }
 
     #[test]
@@ -1330,10 +1359,7 @@ mod tests {
             store.ingest(Kind::Apc, first, (1, 1), (80, 24)),
             Ingest::Stored
         ));
-        assert!(
-            store.images().is_empty(),
-            "a fragment is not an image yet"
-        );
+        assert!(store.images().is_empty(), "a fragment is not an image yet");
 
         assert!(matches!(
             store.ingest(Kind::Apc, second, (9, 9), (80, 24)),
@@ -1484,7 +1510,10 @@ mod tests {
 
     #[test]
     fn a_png_header_is_read_without_decoding_the_image() {
-        assert_eq!(image_pixels(base64(png(1920, 1080).as_slice()).as_bytes()), Some((1920, 1080)));
+        assert_eq!(
+            image_pixels(base64(png(1920, 1080).as_slice()).as_bytes()),
+            Some((1920, 1080))
+        );
 
         // GIF: little-endian, right after `GIF89a`.
         let gif = b"GIF89a\x40\x01\xf0\x00".to_vec();
@@ -1522,9 +1551,15 @@ mod tests {
         let width = (2000.0 * scale).floor() as u32;
         let height = (1000.0 * scale).floor() as u32;
 
-        assert!(out.contains(&format!("width={width}px;height={height}px")), "out: {out:?}");
+        assert!(
+            out.contains(&format!("width={width}px;height={height}px")),
+            "out: {out:?}"
+        );
         assert!(out.contains("preserveAspectRatio=1"), "out: {out:?}");
-        assert!(out.contains("inline=1"), "the sender's own args survive: {out:?}");
+        assert!(
+            out.contains("inline=1"),
+            "the sender's own args survive: {out:?}"
+        );
         assert!(out.starts_with("\x1b]1337;File="), "out: {out:?}");
         // The payload is untouched: we never re-encode.
         assert!(out.contains(&base64(&png(2000, 1000))), "out: {out:?}");
@@ -1582,7 +1617,10 @@ mod tests {
         let out = String::from_utf8(image.replace(Some((20, 10))).unwrap()).unwrap();
         assert!(out.contains("a=p"), "out: {out:?}");
         assert!(out.contains("c=20") && out.contains("r=10"), "out: {out:?}");
-        assert!(!out.contains("QUJD"), "a move must not resend the payload: {out:?}");
+        assert!(
+            !out.contains("QUJD"),
+            "a move must not resend the payload: {out:?}"
+        );
     }
 
     #[test]
@@ -1604,7 +1642,10 @@ mod tests {
         assert_eq!(store.images().len(), MAX_IMAGES);
         // The newest are the ones that survive, in order.
         let seqs: Vec<u64> = store.images().iter().map(Image::seq).collect();
-        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "seqs: {seqs:?}");
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] < pair[1]),
+            "seqs: {seqs:?}"
+        );
 
         let huge = vec![b'A'; MAX_STORE_BYTES / 2 + 1];
         let mut blob = b"\x1b_Gf=24,i=1;".to_vec();

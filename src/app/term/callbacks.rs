@@ -245,9 +245,9 @@ fn window_report(screen: &Screen, first: Option<u16>) -> Option<Vec<u8>> {
 /// `vte` splits the payload on `;`, and a URI may legitimately contain one
 /// (`?a=1;b=2`), so everything after the second field is glued back together.
 /// An empty target is the close of the previous link.
-fn osc8(params: &[&[u8]]) -> Option<(&[u8], Vec<u8>)> {
+fn osc8<'a>(params: &[&'a [u8]]) -> Option<(&'a [u8], Vec<u8>)> {
     let (first, rest) = params.split_first()?;
-    if *first != b"8" {
+    if *first != &b"8"[..] {
         return None;
     }
 
@@ -264,9 +264,9 @@ fn osc8(params: &[&[u8]]) -> Option<(&[u8], Vec<u8>)> {
             Some((*id, url))
         }
         // `OSC 8 ; url` — no parameter field at all. Rare, but unambiguous.
-        Some((only, _)) if !only.is_empty() => Some((b"", only.to_vec())),
+        Some((only, _)) if !only.is_empty() => Some((&b""[..], only.to_vec())),
         // `OSC 8 ; ;` closes the link.
-        _ => Some((b"", Vec::new())),
+        _ => Some((&b""[..], Vec::new())),
     }
 }
 

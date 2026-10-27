@@ -639,10 +639,10 @@ fn emit_float_row(
 
 /// Paint one row in segments, wrapping each hyperlinked span in `OSC 8`.
 ///
-/// The row is written as up to three pieces — plain, linked, plain — because the
-/// span's columns are known while a byte offset *inside* `vt100`'s encoded row is
-/// not. Each piece is asked for by column range, which is the same call
-/// `repair_tail` uses, so wide characters and styles stay correct.
+/// The row is written as alternating plain and linked pieces, because a span's
+/// columns are known while a byte offset *inside* `vt100`'s encoded row is not.
+/// Each piece is asked for by column range — the same call `repair_tail` uses —
+/// so wide characters, combining marks and styles stay `vt100`'s problem.
 ///
 /// Returns whether any piece ended with `EL` (which the float's caller has to
 /// repair beyond the border).

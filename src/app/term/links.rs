@@ -202,12 +202,18 @@ impl Links {
 }
 
 /// A pane's links behind the lock the reader thread writes them through.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SharedLinks(Mutex<Links>);
+
+impl Default for SharedLinks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SharedLinks {
     pub fn new() -> Self {
-        Self::default()
+        Self(Mutex::new(Links::new()))
     }
 
     /// Record one `OSC 8` from the child.
@@ -303,7 +309,7 @@ mod tests {
 
     #[test]
     fn an_empty_link_covers_nothing() {
-        let mut parser = parser();
+        let parser = parser();
         let mut links = links();
         let screen = parser.screen().clone();
         links.osc(&screen, b"", b"https://example.com");

@@ -74,3 +74,30 @@ launched in:
   how a click on a link gets resolved at all - so your terminal emulator's own
   scrollback is not available inside uncl. uncl's is. `Shift`+drag still selects
   text in most emulators, because they take that key back locally.
+
+## installing
+
+prebuilt archives are attached to the releases: `uncl-linux-x86_64.tar.gz`,
+`uncl-windows-x86_64.zip`, `uncl-macos-aarch64.tar.gz` and
+`uncl-macos-x86_64.tar.gz`. each holds the binary, `readme.md` and `LICENSE`.
+unpack it and put `uncl` somewhere on your `PATH`.
+
+- linux: built on ubuntu 22.04, so it wants glibc 2.35 or newer.
+- macos: neither signed nor notarised - the first run needs
+  `xattr -d com.apple.quarantine uncl`, or right-click -> open in finder.
+- windows: windows 10 1809 or newer, for a console that speaks ansi.
+
+or build it, with a rust toolchain (edition 2024, so rust 1.85 or newer):
+
+```sh
+git clone https://github.com/inversepolarity/uncl && cd uncl
+cargo install --path .
+```
+
+## releases
+
+`dev` is where work lands and `main` is the switch. a push to `dev` that changes
+`src/`, `Cargo.toml` or `Cargo.lock` runs the tests, bumps the patch version,
+builds every platform, and replaces the **draft** release - nothing is visible
+yet. a push to `main` publishes that draft, which is the moment the tag appears.
+a `dev` push that only touches docs or the readme does nothing.

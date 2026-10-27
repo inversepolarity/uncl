@@ -1,0 +1,363 @@
+name: release
+
+# One workflow, two halves:
+#
+#   dev  -> test, bump the patch version, build every platform, replace the
+#           *draft* release. The draft is not visible until someone publishes it.
+# master -> publish the newest draft. Publishing is the only step that creates
+#           the tag and makes a release visible, so `master` stays the switch.
+#
+# The version lives in Cargo.toml and is bumped in a commit pushed back to the
+# branch, so the repository always says which version is being prepared.
+
+# The release branch is `master`: it is named here, and again in the `if:` of
+# the publish job at the bottom.
+on:
+  push:
+    branches: [dev, master]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "publish the newest draft instead of preparing a release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# A version bump is a push to the branch that triggers this workflow again.
+# Serialising the whole workflow means two merges can never race for the same
+# version number, and a publish never overlaps a release in flight.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # `cargo build` on a hosted runner has 4 cores; the default jobs setting
+  # spends more time context-switching than building.
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decide whether this push is worth a release at all: only a change to code
+  # (src/, Cargo.toml, Cargo.lock) counts. A docs or readme push stops here, in
+  # about ten seconds, instead of spending four platform builds on nothing.
+  # ---------------------------------------------------------------------------
+  guard:
+    name: is this a code change?
+    if: >-
+      github.repository_owner == 'inversepolarity'
+      && ((github.event_name == 'push' && github.ref == 'refs/heads/dev')
+          || (github.event_name == 'workflow_dispatch' && inputs.publish != true))
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: filter
+        id: filter
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # workflow_dispatch means somebody asked for a release by hand.
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "requested by hand"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # This workflow pushes a version bump to the branch it is building.
+          # The bump commit only touches Cargo.toml, which is exactly what the
+          # filter below looks for, so it marks itself. GITHUB_TOKEN pushes do
+          # not re-trigger workflows either: this is the second of two brakes on
+          # the same loop.
+          if git log -1 --pretty=%B "$AFTER" | grep -qF '[skip release]'; then
+            echo "::notice::commit is marked [skip release]"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A brand new branch, or a force-push whose parent we never saw, has no
+          # usable diff. Releasing is the safe assumption.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "no parent commit to compare against; assuming code changed"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "$BEFORE" "$AFTER")"
+          echo "changed files:"
+          printf '%s\n' "$changed" | sed 's/^/  /'
+
+          if printf '%s\n' "$changed" | grep -qE '^(src/|Cargo\.toml$|Cargo\.lock$)'; then
+            echo "code changed"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no change under src/ or in Cargo.toml; nothing to release"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Test, then decide the version. The version is only bumped when the one in
+  # Cargo.toml has already been published: while a draft is waiting for master,
+  # further pushes to dev rebuild it under the same number instead of piling up
+  # drafts of versions nobody will ever see.
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: test and version
+    needs: guard
+    if: needs.guard.outputs.run == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+      bumped: ${{ steps.version.outputs.bumped }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Tests come first: a red tree must not get a version number.
+      - name: cargo test
+        run: cargo test --locked --all-targets
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet origin
+
+          # The only line in Cargo.toml that starts with `version` is the
+          # [package] one; dependency versions are quoted inline.
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "Cargo.toml says $version"
+
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            published=true
+          else
+            published=false
+          fi
+
+          # `gh release view` on a missing release exits non-zero; on a draft it
+          # prints `true`. A draft reserves the number but has no tag yet, which
+          # is why both are checked.
+          draft="$(gh release view "v$version" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
+          echo "published=$published draft=$draft"
+
+          bumped=false
+          if [ "$published" = true ]; then
+            previous="$version"
+            cargo set-version --bump patch
+            version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+            bumped=true
+            echo "v$previous is out; preparing v$version"
+          else
+            echo "v$version is not released yet; keeping it"
+          fi
+
+          sha="$(git rev-parse HEAD)"
+
+          if [ "$bumped" = true ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            # The marker stops this workflow from treating its own push as a
+            # code change. `cargo set-version` keeps Cargo.lock in step, so the
+            # `--locked` build below stays valid.
+            git commit -am "chore: release v$version [skip release]"
+            sha="$(git rev-parse HEAD)"
+            if ! git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "::error::could not push the version bump to ${GITHUB_REF_NAME}."
+              echo "::error::branch protection must let github-actions[bot] push, or the workflow token needs write access."
+              exit 1
+            fi
+            echo "pushed the bump commit $sha"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "bumped=$bumped" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # An ordinary release build on an ordinary runner: no cross-compilation
+  # tricks, no containers. Each target builds on the OS it runs on, so what is
+  # shipped is what the platform's own linker produced.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.slug }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # A missing platform is a broken download, not a smaller release.
+      fail-fast: true
+      matrix:
+        include:
+          # 22.04 on purpose: a binary built against a newer glibc refuses to
+          # start on every older distribution.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, slug: linux-x86_64 }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, slug: windows-x86_64 }
+          # Both macOS targets build on an arm64 runner: the SDK is universal,
+          # so the Intel slice is a cross-compile with no extra setup.
+          - { os: macos-14, target: aarch64-apple-darwin, slug: macos-aarch64 }
+          - { os: macos-14, target: x86_64-apple-darwin, slug: macos-x86_64 }
+    steps:
+      # The release commit, not the triggering one: after a bump, the version in
+      # Cargo.toml and Cargo.lock only agree on the new commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="uncl-${{ matrix.slug }}"
+          bin="target/${{ matrix.target }}/release/uncl"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          mkdir -p "dist/$name"
+          cp "$bin" "dist/$name/"
+          cp readme.md LICENSE "dist/$name/"
+          ls -l "dist/$name"
+
+      - name: package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="uncl-${{ matrix.slug }}"
+          # tar keeps the executable bit; a bare binary loses it on download.
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          tar -tzvf "dist/$name.tar.gz"
+
+      - name: package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "uncl-${{ matrix.slug }}"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uncl-${{ matrix.slug }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Replace the draft. Older drafts are removed so that "publish the newest
+  # draft" can never publish something stale.
+  # ---------------------------------------------------------------------------
+  draft:
+    name: draft release
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: replace the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          ls -l dist
+
+          while read -r old; do
+            [ -n "$old" ] || continue
+            echo "removing stale draft $old"
+            gh release delete "$old" --yes --cleanup-tag || true
+          done < <(gh release list --json tagName,isDraft --limit 100 \
+                     -q '.[] | select(.isDraft) | .tagName')
+
+          # A draft reserves the tag name but does not create the tag; it
+          # appears when the release is published.
+          gh release create "$tag" dist/* \
+            --draft \
+            --target "$SHA" \
+            --title "uncl $tag" \
+            --generate-notes
+
+          gh release view "$tag" --json isDraft,assets \
+            -q '"draft=" + (.isDraft|tostring) + " assets=" + ([.assets[].name]|join(", "))'
+
+  # ---------------------------------------------------------------------------
+  # The publish half. Runs only on master (or when asked for by hand), and quits
+  # quietly when no draft is waiting: merging master with nothing pending is a
+  # normal thing to do, not a failure.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish the newest draft
+    if: >-
+      github.repository_owner == 'inversepolarity'
+      && ((github.event_name == 'push' && github.ref == 'refs/heads/master')
+          || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # `gh release list` is newest first, so the first draft is the one to
+          # publish and the newest build is the one that ships.
+          tag="$(gh release list --json tagName,isDraft --limit 100 \
+                   -q 'first(.[] | select(.isDraft)) | .tagName // empty')"
+
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "::notice::no draft release to publish; nothing to do"
+            exit 0
+          fi
+
+          echo "publishing $tag"
+          # This is the step that creates the tag and makes the release public.
+          gh release edit "$tag" --draft=false --latest
+
+          gh release view "$tag" --json tagName,isDraft,url \
+            -q '"published " + .tagName + " (" + .url + ")"'

@@ -1,9 +1,8 @@
-# uncl 0.1a
+# uncl 0.1.0b
 
-![Rust Badge](https://img.shields.io/badge/Rust-000?logo=rust&logoColor=fff&style=flat-square) ![GNU Bash Badge](https://img.shields.io/badge/GNU%20Bash-4EAA25?logo=gnubash&logoColor=fff&style=flat-square) ![Zsh Badge](https://img.shields.io/badge/Zsh-F15A24?logo=zsh&logoColor=fff&style=flat-square) ![WezTerm Badge](https://img.shields.io/badge/WezTerm-4E49EE?logo=wezterm&logoColor=fff&style=flat-square) 
+![Rust Badge](https://img.shields.io/badge/Rust-000?logo=rust&logoColor=fff&style=flat-square) ![GNU Bash Badge](https://img.shields.io/badge/GNU%20Bash-4EAA25?logo=gnubash&logoColor=fff&style=flat-square) ![Zsh Badge](https://img.shields.io/badge/Zsh-F15A24?logo=zsh&logoColor=fff&style=flat-square) ![WezTerm Badge](https://img.shields.io/badge/WezTerm-4E49EE?logo=wezterm&logoColor=fff&style=flat-square) [![release](https://github.com/inversepolarity/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/inversepolarity/uncl/actions/workflows/release.yml)
 
-> [!WARNING]
-> Early alpha release, expect glitches and bugs.
+
 
 ## inspiration
 

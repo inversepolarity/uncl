@@ -161,11 +161,25 @@ fn assert_same_screen(name: &str, want: &vt100::Screen, got: &vt100::Screen, fra
         }
     }
 
+    // The cursor's *visibility* is always observable, so it is always compared.
     assert_eq!(
-        want.cursor_position(),
-        got.cursor_position(),
-        "{name}: the cursor landed in the wrong cell"
+        want.hide_cursor(),
+        got.hide_cursor(),
+        "{name}: the frame changed whether the cursor is shown"
     );
+
+    // Its position is only observable while it is visible. `place_cursor` refuses to
+    // move a hidden cursor (there is nothing to see), which leaves it wherever the
+    // last painted row ended — and it repositions on the frame that shows it again,
+    // because painting clears `cursor_at`. Demanding a position here would be
+    // asserting something no user can perceive.
+    if !want.hide_cursor() {
+        assert_eq!(
+            want.cursor_position(),
+            got.cursor_position(),
+            "{name}: the cursor landed in the wrong cell"
+        );
+    }
 }
 
 #[test]
@@ -244,9 +258,17 @@ fn a_resize_repaints_and_the_result_replays() {
     replayed.process(&first);
     assert_same_screen("before the resize", source.screen(), replayed.screen(), &first);
 
-    // The float grew: same parser, larger grid.
+    // The grid changed shape: same parser, narrower.
     source.set_size(nz(ROWS), nz(COLS - 10));
     let area = Rect::new(0, 0, COLS - 10, ROWS);
+
+    // A resize *must* be a full repaint, and the app makes it one (`handle_mouse`
+    // → `sync_size` + `Renderer::invalidate`, and the same on the keyboard path).
+    // Without that, this frame would legitimately be empty: the corpus writes into
+    // the first ten columns, so every cell that survives the shrink is a cell that
+    // was already on screen. That is worth stating, because it is the reason the
+    // invalidation exists rather than being belt-and-braces.
+    renderer.invalidate();
     let frame = renderer
         .render(Panes {
             owner: source.screen().clone(),
@@ -261,6 +283,11 @@ fn a_resize_repaints_and_the_result_replays() {
         })
         .to_vec();
     assert!(!frame.is_empty(), "a resize must repaint");
+    // A repaint, not just a byte or two: every row is positioned again.
+    assert!(
+        String::from_utf8_lossy(&frame).contains("\x1b[1;1H"),
+        "the resize frame did not repaint from the first cell"
+    );
 
     let mut after = vt100::Parser::new(nz(ROWS), nz(COLS - 10), 0);
     after.process(&frame);
@@ -477,4 +504,55 @@ fn an_image_does_not_disturb_the_grid() {
             );
         }
     }
+}
+
+/// What the invalidation is *for*.
+///
+/// A resize whose every surviving cell is a cell that was already painted produces
+/// an empty diff — correct, and useless on its own. `ui::owner` invalidates anyway,
+/// because what actually moves in the real thing is the float's **border**, and a
+/// cell diff cannot see a border: the corner and the title live outside the child's
+/// grid, in cells whose *contents* may not change at all.
+#[test]
+fn a_resize_that_changes_nothing_paints_nothing_until_it_is_invalidated() {
+    let mut source = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    for line in 1..=ROWS {
+        source.process(format!("row {line}\r\n").as_bytes());
+    }
+
+    let mut renderer = Renderer::new();
+    let first = frame_for(&mut renderer, source.screen());
+    assert!(!first.is_empty(), "the first frame paints everything");
+
+    // Narrower, and the content still fits in the first ten columns.
+    source.set_size(nz(ROWS), nz(COLS - 10));
+    let narrow = Rect::new(0, 0, COLS - 10, ROWS);
+    let render_narrow = |renderer: &mut Renderer| {
+        renderer
+            .render(Panes {
+                owner: source.screen().clone(),
+                owner_area: narrow,
+                float: None,
+                float_focused: false,
+                images: None,
+                links: FrameLinks::default(),
+                scroll: 0,
+                focused_scrolled: false,
+                float_title: None,
+            })
+            .to_vec()
+    };
+
+    // Nothing changed where the diff can see it.
+    assert!(
+        render_narrow(&mut renderer).is_empty(),
+        "the diff should see no change in the surviving cells"
+    );
+
+    // The app's rule: a resize is always a full repaint.
+    renderer.invalidate();
+    assert!(
+        !render_narrow(&mut renderer).is_empty(),
+        "after an invalidation the frame must repaint"
+    );
 }

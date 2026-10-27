@@ -1792,7 +1792,7 @@ and nothing above depends on it.
 
 ### Verification status
 
-- **177 tests** (was 169: +4 `clipboard`, +1 callbacks, +3 golden).
+- **178 tests** (was 169: +4 `clipboard`, +1 callbacks, +4 golden).
 - The user's toolchain built `d45198b` clean with 169 passing, which retires the
   "never compiled" caveat for everything up to S3.7. This pass is again
   **unverified by rustc** — it is written against the same `vt100`/`crossterm`
@@ -1806,10 +1806,32 @@ and nothing above depends on it.
   see, which is why every stage of this report has carried the same warning rather
   than claiming more than it can prove.
 
+### The harness's first real run found two wrong *assertions*
+
+Both were in `golden.rs`, and both are worth keeping as rules:
+
+1. **A hidden cursor has no position.** `place_cursor` refuses to move a cursor the
+   child hid — there is nothing to see, and painting clears `cursor_at` so the frame
+   that shows it again is forced to `CUP` to the right cell. The harness was
+   comparing positions unconditionally and failed on the `\x1b[?25l` corpus entry
+   (`(0, 14)` against `(11, 0)`). It now compares `hide_cursor()` always, and the
+   position only while it is visible.
+2. **`invalidate()` is what makes a resize a repaint.** The resize test rendered a
+   narrower grid *without* invalidating and got an empty frame — correctly: the
+   corpus writes into the first ten columns, so every surviving cell was one already
+   painted. The app invalidates on every resize (`handle_mouse` → `sync_size` +
+   `invalidate`, and the keyboard path), because what actually moves is the float's
+   **border**, and a cell diff cannot see a border. The test now does what the app
+   does, and a second test pins the distinction: *without* the invalidation the diff
+   is empty, *with* it the frame repaints from the first cell.
+
+That is the harness doing its job on itself rather than on the emitter — the same
+class of finding it exists to catch one layer down.
+
 ### Acceptance script (S3.8 exit criteria)
 
 ```sh
-cargo test                                        # 177
+cargo test                                        # 178
 
 # 1. the desktop clipboard, from inside the float:
 #    copy something in another window (the browser), then in the float:

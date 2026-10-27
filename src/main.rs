@@ -90,11 +90,12 @@ fn doctor() {
     );
     println!();
     println!("notes:");
-    println!("  * host TERM is not passed through: a sixel/kitty TERM would make children");
-    println!("    emit bytes this layer may not transport; UNCL_GRAPHICS says what it does");
-    println!("  * sixel is advertised only when the DCS tap is enabled (UNCL_SIXEL=1 + a");
-    println!("    host known to render it); see docs/rendering-report.md");
+    println!("  * TERM is passed through from the host, downgraded to xterm-256color for");
+    println!("    screen/tmux (a dialect uncl does not speak) and xterm-kitty (its TERM");
+    println!("    enables the kitty keyboard protocol, which the encoder does not implement)");
+    println!("  * sixel is advertised only with UNCL_SIXEL=1 on a host known to render it");
     println!("  * kitty keyboard protocol is never advertised");
+    println!("  * see docs/rendering-report.md for what the tap carries and why");
 }
 
 fn help() {

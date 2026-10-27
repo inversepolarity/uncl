@@ -168,7 +168,8 @@ impl Capabilities {
         // would make this possible, but shipping it means bundling `conpty.dll`.
         //
         // Reporting `false` here is what keeps the promise in this module's header:
-        // never advertise what we cannot transport (docs/rendering-report.md §6.6).
+        // never advertise what we cannot transport (see the "Windows and Docker"
+        // section of docs/rendering-report.md).
         let images = !cfg!(windows);
         let sixel = sixel && images;
         let kitty_graphics = (is_kitty || is_wezterm || is_ghostty) && images;

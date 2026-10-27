@@ -169,7 +169,7 @@ fn xtgettcap(caps: &Capabilities, names: &[u8]) -> Vec<u8> {
             // Bits per channel, slash separated — the form kitty-family tools read.
             b"RGB" => caps.truecolor.then(|| "8/8/8".to_string()),
             // Underline styles and colours are `alacritty_terminal`'s, not ours
-            // (docs/rendering-report.md, Appendix I, item C1).
+            // (docs/rendering-report.md, "Not yet done").
             _ => None,
         };
 

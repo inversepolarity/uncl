@@ -1,1851 +1,678 @@
-# uncl: rendering architecture review — why it is slow, why full‑screen apps break, and the shortest path to "renders everything natively"
+# uncl — rendering architecture
 
-**Scope:** `uncl` @ `ff09124` (1,286 LOC of Rust, MIT, `ratatui 0.29` + `tui-term 0.2` + `vt100 0.15.2` + `portable-pty 0.8`).
-**Method:** static review of the whole tree (`src/**`), plus source-level inspection of the candidate engines and of `zellij` as the closest sibling design. The sandbox has no Rust toolchain, so **no numbers below are measured** — every performance claim is a structural argument with a cheap way to verify it, given in §2.8.
-**v2 (2026-10-26):** the plan in §6 is revised against the recorded decisions in §0.1 (floating is non-negotiable; images are cheap-tier; mouse required; Windows/Docker nice-to-have; `vt100` upgraded via the vendored adapter).
+uncl is a terminal monoplexer: one floating terminal window over your shell,
+toggled with `Home`. Everything a child program draws has to be captured, held in
+a cell model, and repainted inside that floating rectangle, because the window can
+move or disappear at any moment and the background shell has to be restored
+underneath it.
 
----
-
-## 0. TL;DR
-
-1. **The parser is not the bottleneck.** `vt100`/`vte` parse at hundreds of MB/s; uncl parses a few KB per frame. The slowness is (a) a 10 ms tick that renders the whole screen ~100×/s unconditionally, and (b) an event loop that processes **exactly one input event per tick**, which caps input and paste throughput at ~100 events/second. Neither has anything to do with `ratatui`'s drawing speed.
-2. **`vt100 0.15.2` is the wrong pin, and it is the direct cause of the "poor sequence parsing" you are working around by hand.** `0.16`+ exposes the parser's *callbacks* (unhandled CSI/OSC/ESC) **and** first‑class terminal modes (`mouse_protocol_mode()`, `mouse_protocol_encoding()`, `application_cursor()`, `bracketed_paste()`, `hide_cursor()`, `cursor_style()`). That deletes the `String::from_utf8_lossy` + 20×`contains()` hack in `owner.rs:203–260`, which is both slow and **incorrect across read boundaries**.
-3. **BTOP doesn't render because of three stacked geometry bugs plus a mouse-routing bug, not because of the parser.** The float's PTY is sized `rect − 4`, the parser grid is sized `25×80`/`rect`, and the widget paints into `rect − 2` — for a full-screen TUI, every one of those mismatches shows up as a shifted/garbled frame. And when the float is visible, **all mouse events are consumed by drag/resize** — the child never sees a single mouse event (`owner.rs:371`). BTOP is largely mouse-driven.
-4. **"Renders everything natively" is not reachable by swapping the parser.** No Rust engine paints a *grid back to ANSI* with fidelity, and the features you are missing (`sixel`, kitty graphics, hyperlinks, `OSC 52`) are dropped **below** the grid layer: `vt100` does not implement `vte::Perform::hook/put/unhook` (DCS payloads vanish), and upstream `vte` routes `SOS/PM/APC` bytes into `anywhere()`, which discards them (kitty graphics APCs vanish for *every* `vte`-based engine).
-5. **Decided plan (§0.1 answers applied): four stages, ~2,300 net LOC, ~16 working days for S0–S3 (~20 with the Windows delta and a buffer).**
-   - **S0 — stop being slow** (~2–3 days): event-driven redraw, drain-to-empty input, bracketed paste, batching writer, `vt100 0.18.1` via the vendored 123-LOC adapter, delete the byte-sniffing.
-   - **S1 — stop lying about geometry and input** (~5 days): one source of truth for the float's size, mouse/key routing by region with mode-aware per-pane encoders, paste, and a **capability-proxying reply channel** (uncl must query the *host* terminal once and relay its answers to children — including the sixel bit, or nothing will ever emit an image).
-   - **S2 — own the emitter** (~1 week, **shipped** — Appendix E): `ratatui`+`tui-term` are gone; ~980 LOC turn the grid into ANSI bytes via `vt100`'s `rows_diff`/`rows_formatted` plus our own cursor and border emission (`state_diff` and `cursor_state_formatted` turned out to be unusable — see Appendix E). **This was load-bearing**, because floating is non-negotiable: it is the only route to both speed and pixel fidelity, and the only place out-of-band image bytes can be emitted.
-   - **S3 — cheap-tier images** (~3 days, **shipped** — Appendix F): DCS/APC/OSC-1337 tap + placement store + re-emit after the grid. kitty and iTerm2 work out of the box (kitty re-places by id, so a move costs one line); sixel is opt-in and drawn only if it can fit. No re-encoding, no scaling, no crop.
-6. **Two things are off the critical path.** *Passthrough takeover* (v1 §6.5) is incompatible with "floating is the product" — demoted to Appendix B, where it survives only as a user-invoked "maximize" and as a debugging aid. *Swapping in `alacritty_terminal`* (S4) stays optional: it buys underline colour, `OSC 8` links and kitty-keyboard input, none of which BTOP-class rendering needs.
-
-## 0.1 Decisions recorded (2026-10-26)
-
-| # | Answer | Consequence for the plan |
-|---|---|---|
-| 1 | **Floating while a TUI runs is the entire product — non-negotiable.** | Compositing is mandatory forever. No takeover shortcut. S2 becomes load-bearing rather than optional; budget for it and do not let it slip behind S3. |
-| 2 | **Inline images: good to have; quality compromises accepted; "whatever gets there cheaply".** | Scope = the cheap tier in §6.4–6.5: passthrough the child's own bytes, no decode, no scale, no re-encode, drop what doesn't fit. kitty gets real cropping for free (the terminal does it); sixel gets none. Windows: images are off (§6.6). |
-| 3 | **Mouse interaction is required.** | S1's region routing, per-pane encoding (X10/SGR/UTF-8 by the *child's* reported mode), scroll-wheel mapping and motion filtering are mandatory, not polish. `Home` can no longer be the only local chord, and the float's own drag/resize needs a non-mouse-stomping gesture. |
-| 4 | **Windows / Docker "good to have".** | Adds §6.6: raw-ANSI output needs VT output mode (crossterm already turns it on at startup), ConPTY eats child graphics ⇒ images are Unix-only, and the Windows input path is console records rather than VT sequences ⇒ isolate the input encoder behind a trait and `cfg` it. Docker needs only env/size propagation. |
-| 5 | **Upgrade `vt100` with the adapter if possible.** | Confirmed as S0: copy `tui-term`'s `src/vt100_imp.rs` (123 LOC) into `src/app/ui/adapter.rs`, adjust for the 0.18 API (`NonZeroU16` sizes, `Screen::size`), delete the `tui-term` dependency, pin `vt100 = "0.18.1"`. This unblocks deleting `owner.rs:203–260` in the same PR. |
+This document describes the rendering architecture as built. It answers the four
+questions that started the work, then documents each part of the system by name —
+what it does, the rules it follows, and the compromises it accepts. The items that
+are *not* finished are collected in one place at the end.
 
 ---
 
-## 1. What the code does today
+## The questions, and the answers
 
-```
-                 ┌──────────── stdin (raw mode, mouse capture) ────────────┐
-                 │                                                        │
-  crossterm poll/read (1 event max per 10 ms tick, owner.rs:354)          │
-                 │                                                        │
-        ┌────────▼────────┐   not visible    ┌───────────────────────┐    │
-        │  keyboard.rs    │───────────────►  │  owner PTY (self.tx)  │◄───┘
-        │  mouse.rs       │                  └───────────────────────┘
-        └────────┬────────┘   float visible
-                 └──────────────► tenant PTY (lease.tenant_tx)
+The original review asked: why is uncl slow, is `ratatui` the cause, can an ANSI
+parser be vendored, why do BTOP-class TUIs mis-render, and what is the shortest
+path to "renders everything natively". The answers shaped everything below.
 
-  reader threads (spawn_blocking, 8 KiB chunks)
-        owner  bytes ──► [20× contains() sniff] ──► vt100::Parser(rows, cols, 0)
-        tenant bytes ─────────────────────────────► vt100::Parser(25, 80, 0) → later rect
+### The parser was never the bottleneck
 
-  frame (every 10 ms tick, owner.rs:445)
-        terminal.draw ──► Container::render    (full-screen PseudoTerminal, owner.rs:308)
-                        └─► Overlay::render      (PseudoTerminal inside a Block, tenant.rs:251)
-```
+`vt100`/`vte` parse at hundreds of MB/s; uncl parses a few KB per frame. The
+slowness was in the event loop:
 
-Three things are shared between threads through `Arc<RwLock<vt100::Parser>>`: two producers (the PTY readers) and one consumer (the renderer). Everything else is synchronous inside one `run()` loop.
+- a 10 ms tick that rebuilt and diffed both full-screen buffers ~100×/s whether or
+  not a single byte had arrived, and
+- an input path that consumed **exactly one event per tick**, capping typing, mouse
+  motion and paste at ~100 events/second, with up to 10 ms of added latency each.
 
----
+Neither is `ratatui`'s drawing speed, and neither is fixed by a better parser.
 
-## 2. Why it is slow — ranked, with evidence
+### Why full-screen apps mis-rendered
 
-### 2.1 The 10 ms tick renders unconditionally (`owner.rs:341–446`)
+Not the parser either. Three stacked geometry bugs and one routing bug:
 
-```rust
-loop {
-    ...
-    tokio::time::sleep(Duration::from_millis(10)).await;   // :444
-    terminal.draw(|f| self.render(f, parser.read().unwrap().screen()))?;  // :445
-}
-```
+1. **Three different sizes for the same window.** The float's pty was sized
+   `rect − 4`, its `vt100` grid `25×80` at creation and `rect` afterwards, and the
+   widget painted into `rect − 2`. A full-screen app asks `TIOCGWINSZ`, draws for
+   the answer, and uncl displayed a different rectangle.
+2. **The float never received mouse input.** While it was visible, every mouse
+   event was consumed by drag/resize; none was encoded for the child. BTOP is
+   largely mouse-driven.
+3. **No terminal-query replies, ever.** Nothing answered `CSI c`, `CSI > c`,
+   `CSI 6n`, `DCS $q`, `OSC 10/11;?`, so every capability probe blocked until its
+   timeout and then guessed.
+4. **The child's hidden cursor was drawn anyway**, and its hidden state was never
+   consulted.
 
-There is **no dirty flag anywhere**. Every 10 ms the loop rebuilds two full-screen `ratatui` buffers (the owner screen and, when visible, the float), diffs them against the previous frame, and flushes. For an 80×25 screen that is 2 × 2,000 cells per frame, i.e. ~400,000 cell-style constructions per second at idle. `tui-term`'s adapter (`src/vt100_imp.rs`, 123 LOC) does, per cell, a `Style::reset().fg().bg().add_modifier()` plus colour enum mapping and a `set_symbol` string copy. That work happens whether or not a single byte arrived from either PTY.
+Plus a fidelity ceiling that is architectural rather than a bug: `ratatui`'s cell
+holds one character and a style, so there is no way to represent an image, a
+hyperlink, or an underline colour no matter how good the parser is.
 
-Idle CPU is therefore a pure function of the tick rate, not of activity. Expect the process to sit at several percent of a core with nothing happening, and to scale with terminal size.
+### What "renders natively" actually requires
 
-### 2.2 One input event per tick (`owner.rs:354–423`)
+Any compositing multiplexer must hold a cell model of both children — the
+background has to be repainted under and after the float, so its cells must exist
+somewhere. "Native" therefore means *the grid and the wire encoder jointly preserve
+everything the child emitted*, which takes three separable things:
 
-```rust
-if poll(Duration::from_millis(0))? {
-    match read()? { ... }     // exactly one event
-}
-```
+1. **A complete state model** — text, SGR (including underline colour and styles),
+   hyperlinks, modes (mouse, keypad, cursor, paste, focus, sync), cursor shape and
+   visibility, scrollback, alternate screen.
+2. **A state → ANSI encoder.** No off-the-shelf crate does this: `vt100` is the only
+   public one (`rows_diff`, `rows_formatted`, `contents_formatted`), and it covers
+   text, SGR, cursor and input modes. Alacritty and wezterm render to a GPU surface,
+   not to bytes.
+3. **Out-of-band passthrough** for what a grid cannot hold — sixel, kitty graphics,
+   iTerm2 inline images, tmux passthrough. These are "blit bytes at a cell" events:
+   keep a list of `(anchor, bytes)` and re-emit on repaint.
 
-`crossterm` queues every event it reads from stdin. This loop consumes **one per 10 ms**:
+uncl does (2) itself, does (1) as far as `vt100` models it, and does (3) with a
+stream tap. That is deliberately a smaller delta than swapping in a full emulator.
 
-- 100 events/second ceiling for typing, arrow keys, mouse motion, and everything else.
-- Up to 10 ms of added latency on every keystroke.
-- **Paste is unusable.** uncl never enables bracketed paste on the host terminal, so a paste arrives as N separate `KeyCode::Char` events. Pasting 500 characters takes ~5 seconds of visible character-by-character insertion, and each character is its own `write_all` + `flush` syscall pair to the PTY. `Event::Paste(_)` is explicitly discarded at `owner.rs:411`.
-- Mouse motion under a TUI drag floods the queue; the queue then lags further behind.
+### Vendoring an ANSI parser is feasible but not useful
 
-This is, I suspect, the "slow" a user actually feels. It is also ~15 lines to fix (drain `poll(0)` in a `while` loop; enable bracketed paste; batch writes).
+`vte` is ~4k LOC, two tiny dependencies, `no_std`-capable, and already in the tree
+transitively — but it is a *state machine*, not a terminal: it dispatches
+`print/execute/csi/esc/osc/hook/put/unhook` and holds no grid. Owning it changes
+nothing about fidelity. The gaps that mattered live in `vt100`'s grid and in the
+absence of a wire encoder, and the cheapest high-value copy turned out to be one
+123-line adapter that let `vt100` be upgraded at all.
 
-### 2.3 Blocking sends to the PTY inside the UI loop
-
-`handle_keyboard_input(...).await` and the mouse path `await`/`try_send` into a **bounded 32-slot** channel (`lease.rs:21`). When the channel is full — trivially during a paste or a heavy mouse-drag stream — `send().await` parks the event loop, so rendering *and* input stop entirely until the writer thread catches up. `keyboard.rs` also `unwrap()`s every send, so a closed channel panics.
-
-### 2.4 Renderer holds the parser lock; readers need it per chunk
-
-`terminal.draw(|f| ... parser.read().unwrap() ...)` holds the read lock for the entire frame. Both reader threads take `parser.write()` for every 8 KiB chunk. At 100 Hz with ~1 ms frames, the writers are blocked ~10% of wall time; with larger terminals and a busy child (BTOP redraws constantly) the PTY pipe buffer fills and the child's `write()` blocks, which the app experiences as its own slowness.
-
-### 2.5 Byte-sniffing the escape stream (`owner.rs:203–260`)
-
-Per chunk: one `String::from_utf8_lossy` (full copy, allocation) plus ~20 `contains()` scans. Two problems beyond the cost:
-
-- **Correctness:** a DECSET/DECRST sequence that straddles an 8 KiB read boundary is never matched. Mouse mode silently desynchronises — this is exactly the "poor sequence parsing" you describe.
-- It is redundant: `vt100 ≥ 0.16` already tracks mouse protocol mode and encoding, DECCKM, keypad mode, bracketed paste and cursor visibility (not DECAWM/`?7`, not focus/`?1004`). The right fix is to *delete this block*, not to make it faster.
-
-### 2.6 `crossterm::terminal::size()` syscall per event (`owner.rs:355`)
-
-`ioctl(TIOCGWINSZ)` on every input event. Trivial on its own; illustrative of the loop's shape.
-
-### 2.7 Miscellaneous hot-path friction
-
-- `render()` re-creates `Block::default()` and a `PseudoTerminal` per frame (cheap, but it also re-`Clear`s the float area every frame — `tui-term`'s `render` starts with `Clear.render(area, buf)`).
-- Owner `Screen` is `vt100::Parser::new(rows, cols, 0)` — zero scrollback — so every row the shell scrolls off is parsed and then thrown away. Fine for correctness, wasteful for a shell, and it forecloses feature #5 from your issue tracker.
-- `enable_raw_mode()` / `disable_raw_mode()` are called from inside `initialize_pty` *and* from the main loop (`tenant.rs:200`, `tenant.rs:227`, `owner.rs:124`, `owner.rs:439`), so terminal state flips several times during startup; on a slow terminal that produces a visible flash and occasional stuck modes.
-
-### 2.8 How to confirm in 15 minutes (no refactor needed)
-
-```sh
-# 1. Idle cost is tick-driven, not parser-driven:
-perf stat -e task-clock -p $(pgrep uncl) -- sleep 5      # with an idle shell
-# 2. Then comment out only the terminal.draw(...) line, rebuild, repeat: CPU should go to ~0.
-#    If it does, ratatui/tui-term are the cost, and §2.1 is confirmed.
-# 3. Byte volume per frame is already tiny; this prints syscalls per second:
-strace -c -f -e trace=write,ioctl -p $(pgrep uncl)
-# 4. Input throughput: hold a key down / paste 200 chars and watch `xev`-style
-#    char-by-char arrival in the child, or time `printf 'x%.0s' {1..200}` pasted in.
-```
+The decision that followed: do not vendor an emulator. Use `vt100` as the engine,
+own the encoder, and tap the stream for graphics — the same architecture zellij
+arrived at with ~16k LOC instead of ~2k.
 
 ---
 
-## 3. Why BTOP-class apps don't render correctly
+## The architecture, end to end
 
-Ordered by how much they matter, all verified against the source:
+```
+  stdin (raw mode)
+        │
+        ▼
+  input pump thread ──► event queue ──┐
+                                      │
+  owner pty ──► reader ──► splitter ──┼──► vt100 parser (owner)  ─┐
+                              │        │                           │  snapshots
+  float pty ──► reader ──► splitter ──┼──► vt100 parser (float)  ─┤  (one clone
+                              │        │                           │   per pane)
+                              │        └──► one event loop ────────┘
+                              │                 │
+                              │                 ▼
+                              │            Renderer::render  ──► one write_all
+                              │                 ▲
+                              └── images, DCS replies, links, clipboard
+                                  (out of band, never given to the parser)
+```
 
-| # | Defect | Evidence | Effect |
-|---|---|---|---|
-| 1 | **Three different sizes for the same window.** Float PTY = `rect − 4` (76×21 at defaults), `vt100` grid = `25×80` at lease creation then `rect`, widget paints into `Block::inner(rect)` = `rect − 2` (78×23). The title even prints `size.rows/size.cols` (80×25). | `tenant.rs:71–72`, `lease.rs:24–28`, `tenant.rs:251–271` | A full-screen app queries `TIOCGWINSZ`, gets 76×21, draws a 76×21 UI, and uncl displays 78×23 of an 80×25 grid. Guaranteed shift/clip. Resizing re-applies the same `−4` (`tenant.rs:107–108`). |
-| 2 | **The float never receives mouse input.** When `tenant_visible`, *all* mouse events go to `handle_mouse` (drag/resize) and are never encoded to the child. `handle_mouse` only implements left-button down/drag/up and doesn't forward scroll at all. | `owner.rs:370–407`, `mouse.rs:12–101` | BTOP/htop/nvim/lazygit mouse is dead inside the float. Nothing to do with parsing. |
-| 3 | **No terminal-query replies, ever.** Nothing in the process writes a response to a child's `CSI c` (DA1), `CSI > c` (DA2), `CSI 6n` (DSR/CPR), `DCS $q` (DECRQSS), `OSC 10/11;?`, `CSI ? u` (kitty kbd). The only writes to the master are user input bytes. | `owner.rs:278–292`, `tenant.rs:211–222` | Every app that probes capabilities blocks until its timeout, then guesses. Some (`nushell`, `direnv`-style scripts, some TUIs) misbehave; `CSI 6n` callers stall for seconds. `vt100 0.15.2` cannot even surface these; `0.16+` can (`Callbacks::unhandled_csi`), and `vte 0.15` gives `hook/put/unhook` for DCS if you tap it. |
-| 4 | **The cursor is drawn even when the child hid it.** The owner's widget always paints a `RAPID_BLINK` cursor when the float is hidden; the float's widget always paints one. `Screen::hide_cursor()` is never consulted. | `owner.rs:308–317`, `tenant.rs:251–262` | BTOP hides the cursor; uncl draws a blinking block over its UI. Combined with (1), it also *moves* to the wrong place. |
-| 5 | **`vt100 0.15.2` predates the fixes that matter.** `0.16`: callbacks, OSC 52, dim, CNL/CPL, resize-request handling. `0.17`: REP, HPA, HVP, DECSCUSR, `CSI 3J`, VS16 emoji width. `0.18`: **xterm-compatible `set_size`** (pulls rows from scrollback instead of trimming the bottom) — i.e. resize corruption is a *known, fixed* bug in the pinned version. | `Cargo.lock:846–849` vs. `vt100` CHANGELOG | Repeated `SIGWINCH` resizes (which resizing the float generates constantly) scramble the grid; `REP`-heavy output (progress bars, BTOP's graphs) mis-paints. |
-| 6 | **Host resize updates the parser but not the layout.** `Event::Resize` resizes the parser only; `self.rect`/`self.size` are never recomputed and the float's PTY isn't resized. | `owner.rs:412–421` (`//TODO: fix`) | After resizing the real terminal, uncl keeps rendering into the stale rect. |
-| 7 | **Structural fidelity ceiling.** `ratatui::Buffer::Cell` has exactly one char + fg/bg/modifiers. No underline colour, no hyperlinks (`OSC 8`), no images, no zero-width extra data. | `tui-term` `vt100_imp.rs`, `ratatui 0.29` | Anything beyond plain styled text cannot be represented, no matter how good the parser is. |
+Four invariants hold this together:
 
-Note that #1, #2, #4, #6 are **one afternoon of work** and are worth doing before any architectural change, because they are what you are currently attributing to "bad sequence parsing".
+- **One writer for stdout.** Frames, host effects and cursor-shape changes all go
+  through the thread that owns stdout, so a child's clipboard copy can never land
+  in the middle of a frame.
+- **The parser lock is never held across a frame.** Each pane's screen is cloned
+  under its lock, then the frame is encoded from the clones.
+- **A frame is bytes, not a toolkit.** `Renderer` is pure: bytes in, bytes out, no
+  timers, no I/O. That is what makes it testable.
+- **One rectangle type** (`Rect`) and one definition of the float's inner area
+  (`content_rect`), shared by the mouse router, the pty sizing and the painter.
 
 ---
 
-## 4. What would "renders everything natively" actually require?
+## Event-driven frames
 
-Any compositing multiplexer must hold a cell model of both children (the background has to be repainted under/after the float, so its pixels must exist somewhere). "Native" therefore means *the grid + the wire encoder jointly preserve everything the child emitted*. Three things are needed, and they are separable:
+A frame is painted when something changed, not on a timer.
 
-1. **A complete state model** — text, SGR incl. underline colour/styles, hyperlinks, modes (mouse/keypad/cursor/paste/focus/sync), cursor shape/visibility, scrollback, alt screen. *This is what a mature emulator gives you.*
-2. **A complete state → ANSI encoder** — repaint from the model by emitting SGR/CUP/... to the real terminal. **No off-the-shelf crate does this**; `vt100`'s `rows_diff`/`state_diff`/`contents_formatted` is the only public one, and it covers text+SGR+cursor+input modes only. Alacritty and wezterm both render to a GPU surface, not to bytes.
-3. **Out-of-band passthrough for things a grid can't hold** — sixel (`DCS q`), kitty graphics (`APC G`), tmux passthrough (`DCS tmux;`), shell integration (`OSC 133`). These are "blit an image at (x,y)" events. You don't model pixels; you keep a list of `(rect, bytes)` and re-emit on repaint — this is what zellij and tmux (`allow-passthrough`) do.
+- Each pty reader raises a sticky `Signal` after feeding the parser. The event loop
+  wakes on that signal, on input, or on the frame deadline — never on a fixed
+  tick.
+- Frames are coalesced to `FRAME_MIN_INTERVAL` (8 ms, ~120 Hz), so a child flooding
+  output cannot make uncl repaint more often than a terminal can use.
+- An unchanged screen produces an **empty** frame, and `draw` performs no syscall at
+  all. A still BTOP costs nothing.
+- A 100 ms housekeeping tick exists only to notice that a child exited.
+- Show, hide, move, resize, respawn and alternate-screen entry request an explicit
+  repaint (`Renderer::invalidate`).
 
-### 4.1 Where each engine stands
+Input is decoupled from frames: a dedicated blocking pump thread polls `crossterm`
+and forwards events, and the loop drains up to 512 queued events per iteration
+(`INPUT_DRAIN_BUDGET`) instead of one. Each pane has one coalescing writer: an
+unbounded channel whose contents are joined into a single `write_all` of up to
+64 KiB, so a 5 KB paste is one syscall pair rather than 5,000.
 
-| Engine | Licence / shipability | Size | Text+SGR | Underline colour / styles | `OSC 8` links | Modes + input state | DCS (sixel) visible | APC (kitty graphics) | `→ ANSI` encoder |
-|---|---|---|---|---|---|---|---|---|---|
-| `vt100 0.18.1` (crates.io) | MIT | 5.1k LOC, 2 deps (`vte`, `unicode-width`) | ✅ | ❌ | ❌ | ✅ mouse/CKM/keypad/paste/cursor, ❌ focus | ❌ (`hook/put/unhook` not implemented) | ❌ | **✅ `rows_diff`, `contents_formatted`, `state_diff`, `cursor_state_formatted`** |
-| `alacritty_terminal 0.26` (crates.io) | Apache-2.0 | 11.7k LOC; deps incl. `vte`, `parking_lot`, `regex-automata`, `polling`, `rustix`, `base64` | ✅ | ✅ | ✅ | ✅ incl. full kitty-keyboard (`TermMode`) + `EventListener` | ❌ (no sixel anywhere in the repo) | ❌ | ❌ (you write it) |
-| `wezterm-term 0.1.0` (git only) | MIT | ~large subgraph (`termwiz`, `wezterm-{cell,escape-parser,surface,bidi,dynamic}`, `image`, `terminfo`, `csscolorparser`, …) | ✅ | ✅ | ✅ | ✅ | **✅ `sixel.rs`** | **✅ `image.rs`** | ❌ |
-| `vte 0.15` (crates.io) | Apache-2.0 OR MIT | 4.1k LOC | — | — | — | — | ✅ raw `hook/put/unhook` | ❌ (`SOS/PM/APC` → `anywhere()` discards) | — |
-| `zellij-server` panes (git) | MIT | ~16k LOC (`grid.rs` 7.2k, `terminal_character` 1.4k, `hyperlink_tracker` 1.5k, `grapheme_join` 1.9k, `kitty_graphics` 2.4k, `terminal_pane` 1.9k) | ✅ | ✅ | ✅ | ✅ | ✅ (`sixel::SixelImageStore`) | ✅ | ✅ (emits `CharacterChunk`s/raw VTE) |
-| `ansi-to-tui`, `ansi-parser`, `ratatui`'s `Text` | MIT | small | parses *rendered text*, not a terminal | — | — | — | — | — | ❌ not applicable |
+**The engine.** `vt100` is pinned at 0.18.1, with its cell→buffer mapping vendored
+as a 123-line adapter so `tui-term` could be dropped. Getting there required
+`ratatui` 0.30.2: `ratatui` 0.29 pins `unicode-width == 0.2.0` while every `vt100`
+≥ 0.16 needs ≥ 0.2.1, and cargo will not keep two semver-compatible copies. The
+toolkit bump was temporary plumbing — the toolkit is gone from the tree entirely.
 
-Two consequences worth internalising:
-
-- **Nothing vendorable gives you item 2 except `vt100`.** If you move off `vt100` you inherit the job of writing the encoder — which is fine (it's ~300 LOC) but it must be scheduled.
-- **Item 3 is unreachable through `vte` for kitty graphics**, because upstream `vte` discards `APC` payload bytes (`State::SosPmApcString => anywhere()`, `vte/src/lib.rs:184`). Sixel is reachable via `hook/put/unhook`; kitty graphics requires your own byte scanner or a patched parser.
-
----
-
-## 5. Is vendoring an ANSI parser feasible? (the question as asked)
-
-**Feasible, yes. Useful, mostly no.**
-
-- `vte` is 4,159 LOC, two tiny deps (`memchr`, `arrayvec`), `Apache-2.0 OR MIT`, `no_std`-capable. Vendoring it is a copy-paste plus a `[patch.crates-io]`.
-- But it is **already in your tree** transitively, and it is a *state machine*, not a terminal: it dispatches `print/execute/csi/esc/osc/hook/put/unhook` and holds no grid. Vendoring it changes nothing about fidelity.
-- The gaps that hurt you live (a) in `vt100`'s **grid + missing DCS hooks**, and (b) in the fact that **you have no wire encoder**. Neither is fixed by owning a parser.
-
-**If you want to vendor something, vendor the small, high-value pieces:**
-
-| Candidate | LOC | Why |
-|---|---|---|
-| `tui-term`'s `vt100_imp.rs` (adapter) | 123 | Lets you drop `tui-term` and pin `vt100 0.18` — **but only together with `ratatui 0.30`**: 0.29 pins `unicode-width` exactly, which makes every `vt100` ≥ 0.16 unresolvable (Appendix C). Copy it into `src/app/ui/adapter.rs`, bump ratatui, delete `tui-term`. |
-| `vt100` patch: forward `hook/put/unhook` to `Callbacks` | ~25 | Upstreamable; unlocks sixel/tmux passthrough with the engine you already have. Otherwise use the side-tap in §6.4. |
-| alacritty's `input/keyboard.rs` (key → sequence, mode-aware) | ~600 | Only if you adopt `alacritty_terminal`. It is the best-tested implementation of application-cursor / keypad / kitty-keyboard encoding. |
-| `alacritty_terminal` itself (dependency, not vendoring) | 11.7k | Apache-2.0 is fine for an MIT project with attribution/NOTICE, but note the licence asymmetry for a "vendored" copy. |
-| `wezterm-term` (git dependency) | very large | Only if *images inside the grid* are a hard requirement. The build-time cost is real, and it is not on crates.io with these workspace deps. |
-
-**Recommendation:** do not vendor an emulator. Use `vt100 0.18` as the engine, own ~300 LOC of encoder, and tap DCS/APC for graphics. That is a smaller, more debuggable delta than any emulator swap, and it is the same architecture `zellij` arrived at (own grid → emit ANSI) with 16k LOC instead of your 2k.
+**Why the upgrade mattered.** `vt100` 0.16 added parser callbacks and first-class
+terminal modes; 0.17 added `REP`, `HPA`/`HVP`, `DECSCUSR`, `CSI 3J` and VS16 emoji
+width; 0.18 made `set_size` xterm-compatible by pulling rows out of scrollback
+instead of trimming the bottom — which is the resize bug a constantly-resized float
+hits hardest. It also deleted the old hand-rolled byte sniffing (`from_utf8_lossy`
+plus twenty `contains()` calls), which was both slow and wrong across read
+boundaries: modes are now read from the parser, so a sequence split between two
+reads cannot desynchronise anything.
 
 ---
 
-## 6. The shortest path
+## One geometry for the float
 
-Stages are ordered by *dependency*, not by size, and each one is independently shippable. Effort assumes one developer familiar with the code.
+There is exactly one answer to "how big is the float's terminal", and three
+consumers read it:
 
-### 6.1 S0 — "make it fast" — **shipped**, see Appendix C
-
-1. **Drain-to-empty input.** Replace `if poll(0) { read() }` with `while poll(0)? { handle(read()?) }`, bounded by a per-tick budget (e.g. 512 events) to stay fair to rendering. → §2.2, ~20 LOC.
-2. **Dirty-driven redraw.** Add `Arc<AtomicBool>` (or a `tokio::sync::Notify`) set by the reader threads when they process bytes; render only when dirty, or at a 60 Hz floor while an animation/`REP` is in flight, or on input. Replace `sleep(10)` with `select!` on `Notify` + a 16 ms timer. → §2.1, ~40 LOC.
-3. **Enable bracketed paste on the host** (`EnableBracketedPaste`) and forward `Event::Paste(s)` as one `\x1b[200~…\x1b[201~` write when the child has `?2004h`, or as a raw bulk write otherwise. → paste goes from ~100 chars/s to instant, ~40 LOC.
-4. **Unbounded/batched PTY writer.** Replace the 32-slot channel + `await` with an unbounded channel plus a coalescing writer task (join queued writes, one `write_all` + `flush` per wake-up); remove every `.unwrap()` on send. → §2.3, ~50 LOC.
-5. **`vt100 0.15.2 → 0.18.1`** (see §5: vendor the 123-LOC adapter, drop `tui-term`), then **delete `owner.rs:203–260`** and read the modes you need from the screen: `mouse_protocol_mode()`, `mouse_protocol_encoding()`, `application_cursor()`, `bracketed_paste()`, `hide_cursor()`, `cursor_style()`. → §2.5, §3#5, ~+40/−60 LOC, plus the 0.18 API churn (`Parser::new` takes `NonZeroU16`; `set_size` semantics changed; `set_scrollback` moved to `Screen`).
-
-**Exit criteria:** idle CPU ≈ 0 with a still screen; ≤2 ms keystroke→PTY; 5 KB paste lands in one write; `htop` inside the float responds to the mouse *offsets* correctly even if not yet fully routed (mode tracking is now real).
-
-### 6.2 S1 — "make it correct, and give the child a voice" — **shipped**, see Appendix D
-
-1. **One geometry source of truth.** Introduce `Overlay::content_rect() -> Rect` (rect minus border, and minus any off-screen part) and a single `resize_child(cols, rows)` that sets the PTY **and** `parser.screen_mut().set_size()`. Delete both `− 4`s (`tenant.rs:71–72`, `tenant.rs:107–108`) and stop printing `size.rows/cols` as if it were the child's size. On host resize, recompute `rect` and propagate. → §3#1, #6.
-2. **Region-based input routing.** Hit-test first, *then* decide policy:
-   - pointer **inside** `content_rect` → encode and forward to the float's PTY using **the float's own** `mouse_protocol_encoding()`/`mouse_protocol_mode()` (SGR / X10 / UTF-8), with coordinates translated into the child's space, and with motion filtered exactly like a real terminal does (`1003` any-motion vs `1002` button-motion). Scroll wheel → `64/65` in X10 or `CSI < 64;x;y M` in SGR.
-   - pointer **outside** → uncl's own chords (drag/resize/move), consumed locally.
-   - reserve one modifier (or `Home`, which is currently stolen and never forwardable — `keyboard.rs:18`) as the "local" escape hatch. → §3#2.
-3. **Mode-aware key encoding.** `application_cursor()` → `SS3` (`\x1bOD`) for arrows/Home/End, `CSI 1;2D`-style for modifiers, `application_keypad()` for keypad, and honour bracketed paste. Best-effort `CSI > u` (kitty keyboard) is *not* worth doing at this stage — instead, do **not** advertise it (§6.2.5). → ~100 LOC, replaces the hand-rolled table in `keyboard.rs`.
-4. **Reply channel = capability proxy.** uncl sits between the child and the real terminal, but the *real terminal's* capabilities currently never reach the child. Give both parsers a `Callbacks` impl that writes responses back into the corresponding PTY, answering from a capability record probed **once at startup from the host**:
-   ```
-   CSI c        → CSI ?64;1;2;6;9;15;18;21;22 c   (xterm-ish DA1, conservative: list only what you honour)
-   CSI > c      → CSI >0;0;0 c                    (DA2: deliberately empty -- do not claim to be a VT level)
-   CSI 6 n      → CSI row;col R                   (from screen.cursor_position())
-   CSI ? 6 n    → CSI ? row;col R
-   DCS $ q ...  → DCS 1 $ r <value> ST            (DECRQSS: only claim what you honour)
-   DCS + q ...  → terminal capabilities + "4" if the host has sixel (XTGETTCAP / XTSMGRAPHICS)
-   OSC 10/11;?  → OSC 10;rgb:…   / OSC 11;rgb:…   (host's real fg/bg, probed once and cached)
-   OSC 4 ; n ; ?→ OSC 4;n;rgb:…                   (palette, best-effort)
-   ```
-   **The sixel bit is not optional if you want images (decision 2).** Most image emitters (`chafa`, `img2sixel`, `viu`, `libsixel` apps) choose their protocol by querying the terminal; if the query goes unanswered the child assumes "no images" and never emits one — S3 would then be dead code. Same class of bug for `XTGETTCAP`/`XTGETTCAP Smulx` and `OSC 4` queries: answer conservatively but *answer*.
-   Do not advertise what you don't implement (kitty keyboard `CSI > u`, `XTGETTCAP` for unsupported caps): a conservative DA1 is far better than a lying one — a wrong "yes" produces garbage the child cannot detect.
-   Also forward `OSC 52` from child to host clipboard (`vt100 0.16+` surfaces it as `Callbacks::copy_to_clipboard`) and answer `OSC 52;c;?` from the host clipboard if you enable that.
-5. **Cursor fidelity.** `if screen.hide_cursor() { hide } else { show, and use cursor_style() to emit DECSCUSR }`. Also stop `RAPID_BLINK`-ing the owner cursor. → §3#4.
-6. **Focus/paste passthrough**: if the child enabled `?1004`, emit `CSI I`/`CSI O`. Paste: forward `\x1b[200~…\x1b[201~` when the child has `?2004h`, raw bytes otherwise — and **never** translate a paste into `KeyEvent`s (that is the current 100-events/s path in §2.2).
-7. **One encoder table, one owner.** Today `keyboard.rs` hand-rolls ~250 lines of `vec![27, 91, …]` with no mode awareness. Replace it with `fn encode_key(key, modes, host) -> Option<Vec<u8>>` per pane (child's `application_cursor`/`application_keypad`/`bracketed_paste`, plus uncl's own local-chord table), and route *every* `crossterm::Event` through: `Event::Key` → encoder, `Event::Mouse` → hit-test then encoder or local handler, `Event::Paste` → bulk, `Event::Resize` → layout, `Event::FocusGained/Lost` → `CSI I`/`CSI O`. This single function is where decision 3 (mouse) and decision 4 (Windows) both land (§6.6).
-
-**Exit criteria:** BTOP renders a stable full frame at the right size, is mouse-clickable inside the float (clicks, drags and wheel all land at the right cell *inside the child*), hides the cursor correctly, survives 20 consecutive float resizes with no smearing, and answers `CSI 6n` correctly enough that `CSI 6n`-using scripts do not stall. `nvim` + `lazygit` + `less` + `fzf` + `htop` all behave. *(This is the "everything except images" milestone: ~7 working days for S0+S1.)*
-
-### 6.3 S2 — "own the emitter" — ~1 week, ~350 LOC, −4 dependencies — **shipped**, see Appendix E
-
-Delete `ratatui`, `tui-term`, and the double-buffer. Write `src/app/render/mod.rs`:
-
-```rust
-// per frame, per pane (owner first, then float clipped to its content_rect)
-fn draw_pane(out: &mut Vec<u8>, pane: &mut PaneFrame, screen: &vt100::Screen, origin: (u16, u16)) {
-    let width = pane.rect.width;   // == the child's PTY width, enforced in S1
-    // 1. rows: emit only changed rows, each preceded by CUP to (origin.1 + row, origin.0)
-    for (row, seq) in screen.rows_diff(&pane.prev, 0, width).enumerate() {
-        if !seq.is_empty() { out.extend_from_slice(format!("\x1b[{};{}H", origin.1+1+row, origin.0+1).as_bytes());
-                              out.extend_from_slice(seq.as_bytes()); }
-    }
-    // 2. input modes (paste/mouse/CKM) must be *ours*, not the child's: uncl owns the host
-    //    terminal, so never replay state_diff() blindly -- see the note below.
-    // 3. cursor
-    if !screen.hide_cursor() && focused { out.extend_from_slice(screen.cursor_state_formatted().as_bytes()); }
-}
-```
-
-Notes that matter:
-
-- `rows_diff(prev, start, width)` gives you a **free, tested, SGR-only** row encoder; keep `prev: vt100::Screen` (it's `Clone`, ~`rows*cols*32` B ≈ 60 KiB) so the diff is O(cells) memcmp, exactly like a real multiplexer.
-- **Do not replay the child's `state_diff()`** (mouse mode, bracketed paste, DECCKM) onto the host terminal: those modes must remain uncl's own, or the host terminal starts sending SGR mouse reports that uncl then has to re-encode. Emit *our* modes only, and translate.
-- Clipping: because the child's PTY is now sized to `content_rect`, every row is exactly `width` cells wide, so no horizontal clipping is needed. Vertical clipping is "iterate only visible rows". This is why §6.2.1 is a prerequisite.
-- Paint order for a float: owner rows first (unclipped), then the float's rect (`CUP` + rows + optional background fill). No alpha, no partial overwrite — occlusion is total, which is the only case an ANSI encoder can handle anyway.
-- Frame scheduler: coalesce notifications, cap at ~120 Hz, and force a full repaint on show/hide/resize/scrollback change. Keep the `Vec<u8>` per frame and do one `write_all` (plus one `flush`).
-
-**Why this is the pivotal stage:** it removes the 100 Hz buffer diffing (§2.1), removes per-cell `Style` construction, drops the lock from the render path (clone-or-snapshot cells into your own `prev` buffer under a short lock), cuts dependencies, and — critically — gives you a place to put **out-of-band bytes after the grid flush**, which is the only way images can be drawn (§6.4).
-
-### 6.4 S3 — "images, cheap tier" — ~3 days, ~300 LOC (decision 2) — **shipped**, see Appendix F
-
-Goal: *an image the child emits shows up inside the float*. No decode, no scaling, no re-encoding, no alpha. Passthrough only.
-
-1. **Tap DCS/APC.** Wrap the parse of each chunk:
-   ```rust
-   for seg in Splitter::new(chunk) {          // ~80 LOC: ESC P…ST, ESC _…ST, ESC \
-       match seg {
-           Seg::Bytes(b) => parser.process(b),                       // feed prefix first, so the cursor is current
-           Seg::Dcs(p) | Seg::Apc(p) => graphics.on_payload(parser.screen_mut(), seg, p),
-       }
-   }
-   ```
-   For DCS, prefer patching `vt100` (~25 LOC: forward `hook/put/unhook` into `Callbacks`) — one parser, upstreamable. APC must be split by us regardless, because upstream `vte` discards it (§4.1).
-2. **Placement store.** `struct Placement { rect: Rect, payload: Vec<u8>, proto: Proto }`. Record at the cursor cell; footprint from the payload header only — kitty: `a=T,f=…,s=<px w>,v=<px h>,c=<cols>,r=<rows>`; sixel: the DCS `"` raster attributes, else 1×1 cell per 6 pixels. Re-emit without understanding the pixels.
-3. **Repaint after the grid flush** (S2 gives you the hook): re-emit every placement intersecting the frame unless a float covers it or the row scrolled away. Emit kitty placements **with the terminal's own clipping is not possible on plain xterm**, so instead use kitty's source-rect crop: `a=p,i=<id>,x=<px>,y=<px>,w=<px>,h=<px>` — the *terminal* crops, which is free and exact. Requires the original image to be transmitted once and then placed by id (`a=t` then `a=p`), which is the cheap path.
-4. **Sixel degrades on purpose.** Sixel has no crop and no place-by-id: one image = one opaque blit at the cursor. Contract: **draw only if it fits inside the float's `content_rect`; otherwise skip it and log once.** That is what tmux effectively does, it costs ~0 LOC, and it satisfies "willing to compromise on quality". Do not implement sixel re-encoding in this stage.
-5. **Hyperlinks (`OSC 8`) are a separate 1-day item, not part of S3.** `vt100` does not track them; the cheap version is state in your splitter (open/close + per-cell run id, ~60 LOC) and emitting `OSC 8` per run in the row encoder. Only worth doing if you actually want clickable links in the float — `alacritty_terminal` (S4) gives them for free, so **defer**.
-
-**Explicit non-goals** (state them in the README so nobody files bugs): no image scaling, no sixel cropping, no animation (kitty `a=a`), no alpha/blending, images not clipped by the float border on Windows (see §6.6), no `iTerm2` inline images, no sixel on non-Unix.
-
-### 6.5 What "cheap" buys, concretely
-
-| Producer | Path through uncl | Fidelity after S3 |
-|---|---|---|
-| `chafa`, `viu`, `img2sixel` (sixel) | child bytes → DCS tap → re-emit | Exact **if it fits** the float; skipped if not. No scaling. |
-| kitty-capable apps, `kitten icat` | child bytes → APC tap → re-emit + placement crop | Exact, croppable, survives occlusion by the float's own repaint order. |
-| `feh`-style direct `/dev/tty` writes | bypasses the PTY | never supported (also unsupported by tmux) |
-| anything asking for geometry in pixels (`CSI 14/15/16/18/19 t`) | answered by the capability proxy from the measured cell size (S3.1) | consistent numbers, never zero: `wezterm imgcat`, `chafa`, `timg` all size correctly |
-| `ls --hyperlink`, `gcc`, `gh`, anything emitting `OSC 8` | child bytes → span recorded by the callback → re-emitted around the cells (S3.5) | clickable inside the float; single-line links only |
-
-The dependency order that actually matters here is S1 → S3, not S2 → S3: the tap can be added to today's `vt100` reader thread in an afternoon. But **without the capability probe in §6.2.4 nothing will ever emit an image**, so that probe is the real first step of "images".
-
-### 6.6 Windows & Docker delta (decision 4)
-
-**Docker:** a non-issue for rendering. `portable-pty` opens a normal pty; `TERM` inherits; `COLORTERM`/`TERM_PROGRAM` should be passed through explicitly (today only `TERM=xterm-256color` is set, `owner.rs:135`), and `SHELL` is already read from the env. Only caveat: `TERM` is hard-coded for the owner — if the host is `xterm-kitty`, the child believes it is not kitty and loses kitty features. Fix: copy the host's `TERM`/`COLORTERM`/`TERM_PROGRAM` and downgrade `TERM` only when the host is `screen`/`tmux` (where passthrough matters).
-
-**Windows:** three separable issues, only one of which is real work.
-
-1. **Output: fine, with one call.** S2 writes raw ANSI to stdout. Windows consoles need `ENABLE_VIRTUAL_TERMINAL_PROCESSING`; crossterm flips it *lazily* through its `ansi_support` module when its command API is used, and that module is public (`pub mod ansi_support`, `supports_ansi()`, present in the 0.27 line you pin) — call it once at startup and treat `false` as "uncl cannot run here" instead of emitting raw ESC into a legacy console.
-2. **Input: the real work.** On Windows, crossterm's input backend produces `Event`s from console records rather than from VT sequences, so the child cannot simply be sent what arrives. Your `encode_key`/`encode_mouse` from §6.2.7 is already the right shape: it takes *semantic* events and produces VT sequences, so Windows needs no separate pipeline — but the mode-dependent branches (application cursor, X10 vs SGR mouse, kitty keyboard) must be exercised on Windows, because you cannot test them by accident. Put the encoder behind a small trait with a `#[cfg(test)]` fake, and keep the `cfg`-specific code to: raw-mode setup (crossterm does it), `tiocgwinsz` replacement (`crossterm::terminal::size()` already abstracts it — `owner.rs:355` uses it, `tenant.rs` uses `PtySize`), and mouse encoding tables (`1006` vs `1015` are not equally supported by ConPTY-era terminals).
-3. **Images: off, and the reason is structural.** The child sits under uncl's *own* ConPTY, so it is one layer further removed than usual. **ConPTY v1** (the in-box implementation on Windows 10/11, and Windows Terminal ≤ 1.21) parses the child's VT into a text buffer and re-renders snapshots — it drops or reorders sequences it does not model, **swallows DCS payloads, and answers `DA1` itself, without the sixel attribute**. That means the child never even asks uncl for sixel: it asks ConPTY, is told no, and falls back to blocks. **ConPTY v2** (shipped with Windows Terminal 1.22+, also redistributable as `conpty.dll`) forwards the original VT bytes through, which is what made sixel work in WT 1.22 at all. Getting images on Windows therefore requires uncl to bundle and load the v2 `conpty.dll` — a packaging change well outside "cheap". Decision: **Windows = no images**, documented, and `uncl doctor` says why. (Consequence for §6.2.4: on Windows do *not* advertise sixel in `XTSMGRAPHICS`/`DA1`, or you will advertise something your PTY layer destroys — the capability record is per-platform, not global.)
-
-Sources for the ConPTY v1/v2 distinction: Windows Terminal 1.22 release notes (`https://devblogs.microsoft.com/commandline/windows-terminal-preview-1-22-release/`), the conpty-v2 passthrough discussion (`https://github.com/microsoft/terminal/discussions/18500`), and a field report of in-box ConPTY answering DA1 without sixel and swallowing sixel DCS (`https://github.com/openwong2kim/wmux/issues/1932`).
-
-**Also worth doing while in here:** a `--check` / `uncl doctor` that prints the probed capability record (host DA1/DA2, `TERM`, `COLORTERM`, sixel yes/no, kitty yes/no). It is 30 lines, and it is the difference between "btop looks wrong" and a bug report you can reproduce.
-
-### 6.7 Sequencing summary (revised for the decisions)
-
-| Stage | Effort | Net LOC | Unlocks | Risk |
-|---|---|---|---|---|
-| S0 speed | 2–3 d | ~±200 | Idle CPU → ~0; input 1 event/tick → unbounded; paste instant; real mode tracking; `vt100 0.18.1` via the vendored adapter | Low. `vt100` 0.18 API churn is contained in the 123-LOC adapter; benchmark it against 0.15.2 (see the criterion bench in §8) and keep the pin reversible. |
-| S1 correctness + input + capability proxy | ~5 d | ~+700 | BTOP/htop/nvim/lazygit render at the right size **and are mouse-interactive**; paste; query replies; sixel capability advertised (prerequisite for any image ever appearing) | Medium — the encoder branches per mode and per platform; mitigated by the encoder trait and a golden-sequence table. |
-| S2 own emitter — **shipped** | ~1 wk | ~+1,200/−350, −4 crates | Native-speed scan-out; a hook for out-of-band bytes; no per-cell `Style`; `ratatui`/`tui-term` gone | Medium — off-by-one/clipping bugs are visible; mitigate with the §8.1 golden-frame harness. **Load-bearing: do not defer behind S3.** |
-| S3 cheap-tier images — **shipped** | ~3 d | ~+450 | kitty images (croppable), sixel (if it fits), passthrough | Medium-low, because the quality contract is explicit (§6.4 non-goals). |
-| S3.5 hyperlinks (`OSC 8`) — **shipped** | 1 d | ~+430 | links *emitted* inside the float | Low; or free with S4. |
-| S3.6 clicks + scrollback — **shipped** | 1 d | ~+650 | links in the float actually **open**; history in both panes, sized by `UNCL_SCROLLBACK` | Low-medium: the click is uncl's because the host never sees it (§Appendix H), and the scrollback copy is a per-frame cost that `UNCL_SCROLLBACK` trades against |
-| S3.8 last passes (clipboard, corpus, Windows guards) — **shipped** | 1 d | ~+520 | system clipboard reads via the desktop's own tools; float/link/image coverage in the golden harness; Windows refuses legacy consoles instead of painting garbage | Low: every decision in the clipboard path is pure and unit-tested, the reads happen off the reader thread, and the Windows code cannot affect other platforms |
-| S3.7 compatibility batch — **shipped** | 1 d | ~+700 | `DECRQSS`, `XTGETTCAP`, `TERM` pass-through, the bell, the child's title in the border, in-session clipboard, and the golden-frame harness that guards all of it | Low: every answer is derived from state `vt100` already tracks, and anything it does not track is refused rather than approximated |
-| S4 engine swap (`alacritty_terminal`) | 3–5 d | ~+600 | underline colour/styles, hyperlinks, kitty-keyboard input, sync output, `EventListener` (title/clipboard/bell) | Medium; **requires S2** (you must own the encoder before leaving `vt100`). Optional — skip unless users ask for the fidelity *inside* a float. |
-| §6.6 Windows delta | 1–2 d | ~+120 | Windows build that runs a TUI float (no images) | Medium; needs a real Windows box or CI runner to validate input modes. |
-
-**Critical path: S0 → S1 → S2 → S3** (≈16 working days, ≈2,300 net LOC, −4 crates net since `tui-term` and `ratatui` go away). S3.5/S4/Windows are independent tails that can be scheduled by demand. The single highest-risk item is **S2's clipping/repaint correctness**, not the parser or the graphics.
-
-
----
-
-## 7. Things that look like short paths and are not
-
-- **"Just write the child's bytes straight to stdout and overlay the float."** Cursor addressing, clipping, scroll regions and occlusion make this a full sequence *rewriter* (harder than a grid). Only works if the child owns the whole screen — which is Appendix B, and only there.
-- **"Vendor a big emulator and be done."** You still have no grid → ANSI encoder; `alacritty_terminal` and `wezterm-term` both render to GPU surfaces. You'd swap ~50 lines of parser code for ~1,000 lines of encoder plus a large dependency tree.
-- **"Keep `ratatui` and smuggle images/hyperlinks through".** You can put raw `OSC 8` in a cell's symbol and paint images after `flush()`, but `ratatui`'s diff engine will silently erase them on the next frame unless you poison the buffer and force full repaints. This fights the framework continuously and is *more* code than S2.
-- **"Raise the tick rate."** Makes the CPU problem worse and does nothing for input batching (§2.2).
-- **"Patch `tui-term`."** It's 1,200 LOC of `ratatui` widget plumbing for something uncl uses ~40 lines of; vendoring the 123-LOC adapter and deleting the dependency is strictly better.
-
----
-
-## 8. How to know it works (test strategy)
-
-1. **Golden-frame harness (do this first, it pays for itself in S1/S2).** A `tests/` binary that: feeds a recorded byte stream into the engine at a fixed size, renders through *uncl's* emitter into an `Vec<u8>`, then replays that output into a fresh `vt100::Parser` and compares `contents_formatted()` with a direct render of the source stream. Two engines, one assertion, no terminal needed. This is how you catch clipping/width/wide-char regressions without a human watching.
-2. **Sequence corpus**, checked into `tests/corpus/`: `?1049h/l`, `?1000/1002/1003/1006/1015`, `?2004`, `?1004`, `?1h`, `?7l`, `CSI 6n`, `CSI c`, `DCS $q`, `REP`, `DECSCUSR`, wide/CJK/emoji/VS16, combining marks, `OSC 8`, a small sixel and a small kitty image, plus `tmux`'s passthrough wrapper.
-3. **Per-app smoke list:** `btop`, `htop`, `nvim` (+ mouse drag/right-click, your issue #6), `lazygit`, `less`, `fzf`, `tig`, `ncdu`, `sixel-tools`/`chafa -f kitty`, `zsh` with a heavy prompt.
-4. **Input fuzz:** random `KeyEvent`/`MouseEvent` streams against each mode combination, asserting the emitted bytes for a table of known-good sequences.
-5. **Perf guard rails in CI:** `perf stat`-independent counters — frames drawn per second at idle (should be 0), bytes written per frame, and a criterion bench for `process(chunk) + emit_frame()` at 200×60.
-
----
-
-## 9. Decisions taken, and what is still open
-
-Recorded (see §0.1): floating is mandatory; images cheap-tier; mouse required; Windows/Docker nice-to-have; `vt100` upgrade via adapter. The plan in §6 is built on those.
-
-Still genuinely open, in the order they will bite:
-
-1. **Local chords vs. the child's input.** With mouse required and `Home` the only chord, the float will fight every full-screen app for events. Proposal: `Home` toggles visibility (keep), `Alt`+drag (or a dedicated 1-cell resize gutter drawn on the border) for float geometry, and everything inside `content_rect` goes to the child. Needs your sign-off because it is a UX rule, not a bug fix.
-2. **When the float is hidden, where does input go?** Today it goes to the owner shell and the float freezes but keeps parsing. Consider *always* routing keys to the float and requiring `Home` to reach the owner shell — a monoplexer with one toggle. Cheap to change, changes the feel.
-3. **Scrollback.** `vt100` has it, the float throws it away (`Parser::new(..., 0)`, `lease.rs:24`). Do you want wheel-scroll inside a *shell* float (mouse wheel is required by decision 3 anyway)? If yes, budget 1 day in S1 and note that `vt100 0.18` changed `set_size`/`set_scrollback` semantics.
-4. **`TERM` policy.** Copy the host's `TERM`/`COLORTERM` through (needed for kitty/sixel capability probing, §6.6) or keep the hard-coded `xterm-256color` and let the capability proxy translate? The former is more faithful, the latter is more portable. Recommendation: copy through, downgrade only under `screen`/`tmux`.
-5. **Windows validation hardware.** §6.6 needs a real Windows box (or a CI runner) for the input-mode matrix. Without one, ship Windows as "experimental, no images" and keep the encoder trait testable.
-
-## 10. Implementation checklist (drop-in order)
-
-Each line is a reviewable PR; the sequence is the shortest dependency-satisfying one.
-S0 (items 1–5), S1 (items 6–10), S2 (items 11–13), S3 (items 15–16), S3.5 (item 17,
-`OSC 8` hyperlinks) and S3.6 (item 18, clickable float links + scrollback in both panes) are
-implemented — see Appendices C, D, E, F, G and H for the file maps and the verification
-status. Item 14 (the golden-frame corpus in CI) is the one S2 item still open. Only S4 (the
-`alacritty_terminal` swap) and the Windows delta remain — **for the full, evidence-backed list
-of what is left, see Appendix I**, which supersedes this paragraph as of 2026-10-27.
-
-```
-S0  1. vendor adapter (src/app/ui/adapter.rs) + vt100 0.18.1 + drop tui-term        [½ d]
-    2. delete owner.rs:203–260; read modes from Screen                            [½ d]
-    3. drain-to-empty input loop (budget 512/tick) + Select/Dir wrapper           [½ d]
-    4. coalescing PTY writer (unbounded) + remove send().unwrap()                 [½ d]
-    5. dirty flag + select!(notify, 16ms) + forced repaint on show/hide/resize    [1 d]
-S1  6. Overlay::content_rect() as the only geometry; resize_child() sets pty+grid [½ d]
-    7. hit-test → route; mouse encoder per child mode (X10/UTF-8/SGR, motion)     [1 d]
-    8. key encoder trait + mode-aware arrows/keypad/paste; local chord table      [1 d]
-    9. Callbacks: DA1/DA2/DSR/DECRQSS/OSC 10-11/XTGETTCAP + startup probe         [1½ d]
-   10. cursor visibility + shape (DECSCUSR), focus in/out, `uncl doctor`          [1 d]
-S2 11. src/app/render/: rows_diff → CUP+row bytes; prev screen per pane          [1½ d]
-   12. clip by content_rect, paint order owner→float, full-repaint triggers        [1½ d]
-   13. delete ratatui/tui-term, drop the double buffer, one write_all per frame   [1 d]
-   14. golden-frame harness + corpus in CI                                        [1 d]
-S3 15. DCS/APC splitter + placement store + re-emit after grid flush             [1½ d]
-   16. kitty place-by-id + source-rect crop; sixel fit-or-skip                    [1 d]
-   17. (opt) OSC 8 hyperlink runs                                                 [1 d]
-S3.6 18. uncl resolves the click (host never sees it) + scrollback in both panes    [1 d]
-W   19. Windows: ansi_support call, encoder cfg matrix, close the images gap      [1½ d]
-```
-
-`~20 development days` end to end with buffer; `16` for S0–S3 alone.
-
-## Appendix A — candidate-crate facts used above
-
-| Crate | Version inspected | LOC | Key API | Note |
-|---|---|---|---|---|
-| `vt100` | 0.18.1 (2026-10-19) | 5,111 | `Screen::{rows_diff, rows_formatted, contents_diff, contents_formatted, state_diff, input_mode_formatted, cursor_state_formatted}`, `Callbacks::{unhandled_csi, unhandled_osc, unhandled_escape, copy_to_clipboard, paste_from_clipboard, set_window_title, resize, on_scroll}`, `Screen::{mouse_protocol_mode, mouse_protocol_encoding, application_cursor, bracketed_paste, hide_cursor, cursor_style}` | No `hook/put/unhook` ⇒ DCS payloads dropped. `Screen: Clone`. 0.18 requires `NonZeroU16` sizes. |
-| `vte` | 0.15.0 | 4,159 | `Perform::{print, execute, hook, put, unhook, osc_dispatch, csi_dispatch, esc_dispatch}` | `State::SosPmApcString => anywhere()` discards APC bytes (`src/lib.rs:184`) ⇒ kitty graphics invisible to every `vte` consumer. |
-| `tui-term` | 0.3.4 | 1,574 (adapter: 123) | `impl Screen for vt100::Screen`, `Cell::apply` | 0.3.4 requires `vt100 = 0.16.2`, `ratatui-core 0.1`/`ratatui-widgets 0.3` (ratatui 0.30.2, released 2026-06-19). |
-| `alacritty_terminal` | 0.26.1-dev | 11,728 | `Term::{renderable_content, grid, mode}`, `TermMode` (incl. `KITTY_KEYBOARD_PROTOCOL`), `RenderableContent{display_iter, cursor, colors, mode}` | Apache-2.0. No sixel/graphics anywhere in the repo. Key *encoding* lives in the binary (`alacritty/src/input/keyboard.rs`), not the library. |
-| `wezterm-term` | 0.1.0 | large | `Terminal` + `Image`/`ImageDataType`, `terminalstate/sixel.rs`, `image.rs` | MIT, git-only workspace crate with `termwiz`/`image`/`terminfo` in tow. |
-| `zellij` panes | HEAD | ~16k | `grid::render → (CharacterChunk, raw_vte_output, SixelImageChunk, KittyImageChunk)`, `kitty_graphics/{store,replies,grid_state}`, `sixel::SixelImageStore`, `hyperlink_tracker` | MIT reference implementation of exactly the architecture recommended here. |
-
-## Appendix B — passthrough takeover (deferred by decision 1)
-
-v1 of this report proposed promoting the float to full screen whenever its child entered the alternate screen and relaying the child's bytes verbatim. It is the cheapest possible route to byte-exact fidelity (no parser, no encoder, no fidelity ceiling, images included), and it stays on the shelf for two narrower uses:
-
-- **`uncl --maximized` / a user-invoked "maximize this pane"** for image-heavy or kitty-keyboard-heavy apps, where the user explicitly wants the float to step aside. Same code, opt-in.
-- **A debugging switch** (`UNCL_PASSTHROUGH=1`) to bisect "is this uncl's compositor or the child?" in one run.
-
-Mechanics, if it is ever picked up: detect `?1049h`/`?47h` on the child (`vt100` tracks alt-screen internally; `Screen` exposes it via the mode set), set `raw` relay for the affected pane, stop compositing it, and splice the child's bytes into the frame between a `CUP` to the origin and the exit sequence. `?1049l` restores. ~250 LOC, no emulation work — but it *removes* the float while it is active, so it cannot be the default (decision 1).
-
-## Appendix C — S0 implementation log (2026-10-26)
-
-### What landed
-
-| S0 item | Change | Where |
-|---|---|---|
-| 1 | `vt100` pinned to 0.18.1; its cell→buffer mapping vendored (123 LOC, MIT); `PseudoTerminal` reimplemented against `ratatui::Buffer`; `tui-term` removed. **This forced `ratatui` 0.29 → 0.30.2 as well** — see "the pin that blocked S0" below | `Cargo.toml`, `src/app/ui/adapter.rs`, `src/app/ui/widget.rs` |
-| 2 | The byte-sniffing block is **deleted**. Mouse gating, bracketed paste and cursor visibility are read from the parser (`mouse_protocol_mode()`, `bracketed_paste()`, `hide_cursor()`), so a sequence split across reads can no longer desynchronise anything | `owner.rs::forward_mouse`, `owner.rs::forward_paste`, `widget.rs` |
-| 3 | Input moved to a dedicated blocking pump thread; the loop drains up to 512 queued events per iteration instead of one per 10 ms | `owner.rs::spawn_input_pump`, `owner.rs::handle_event` |
-| 4 | One coalescing writer per pane: unbounded channel, up to 64 KiB joined into a single `write_all` + `flush`; every `send().await.unwrap()` is gone | `src/app/pty.rs` (new) |
-| 5 | Frames are driven by a sticky `Signal` raised by the reader threads; the old `sleep(10)+draw` pair is gone; a 100 ms housekeeping tick exists only to notice child exit; show/hide/resize/keys request an explicit repaint | `src/app/signal.rs` (new), `owner.rs::run` |
-
-Folded in because they were one-liners on the same code paths (and were on the bug list): the tenant no longer toggles raw mode or builds a throwaway `Terminal`/`Screen`; its grid is sized to the same number the PTY is told; `crossterm::terminal::size()` is no longer called per input event; the mouse resize path uses saturating arithmetic (it could panic on a tiny terminal); `KeyEventKind::Press` is enforced (Windows sent press+release, so every key fired twice); bracketed paste is enabled on the host and `Event::Paste` is forwarded as one write.
-
-Also new: a shared `pty::spawn()` used by both panes (`src/app/pty.rs`), so owner and tenant can no longer drift apart in how they wire readers, writers, resizes and exit detection.
-
-### The pin that blocked S0 (and corrects §5 of this report)
-
-The first build failed to resolve:
-
-```
-error: failed to select a version for `unicode-width`
-  required by package `vt100 v0.18.1`        (^0.2.2)
-  previously selected `unicode-width v0.2.0` by `ratatui v0.29.0` (=0.2.0)
-```
-
-`ratatui 0.29` **exactly pins** `unicode-width = "=0.2.0"` (upstream does this deliberately, see ratatui issue #1271), while every `vt100` ≥ 0.16 requires `unicode-width = "0.2.1"` (0.16.2) or `"0.2.2"` (0.17+). The two ranges are disjoint, and because 0.2.x is semver-compatible cargo will not keep both copies — it errors instead.
-
-Consequences, all of which were verified against the crates' own manifests:
-
-- The vendored adapter alone (as §5 of this report originally recommended) does **not** make `vt100 0.18` reachable; the UI toolkit has to move too.
-- No `vt100` from 0.16 to 0.18 works with `ratatui 0.29`. The only way to keep ratatui 0.29 is `vt100 0.15.2` — i.e. giving up callbacks and mode getters, which was the entire point of S0.
-- `ratatui 0.30` relaxed the pin to `unicode-width = ">=0.2.0"`, so **0.30.x + vt100 0.18.x** resolves.
-
-Fix applied: `ratatui = "0.30.2"` (and `crossterm = "0.29"` to match the version ratatui's own backend uses, avoiding two crossterm copies in the tree). The only source change 0.30 required was the block title: `title_position(Bottom)` + `title_alignment(Right)` became `title_bottom(Line::…right_aligned())`. Everything else we touch (`Buffer::{empty, cell, cell_mut, area}`, `Cell::{symbol, set_symbol, style, set_style}`, `Style::{new, reset, patch}`, `Frame::render_widget`, `Terminal::{new, clear, draw}`, `widgets::{Block, Borders, BorderType, Clear, Widget}`, `backend::CrosstermBackend`) is unchanged in path and signature.
-
-Two side effects worth recording:
-
-- **MSRV is now 1.88** (ratatui 0.30's `rust-version`); `vt100` needs 1.85 and the crate itself is edition 2024. `rustup update stable` covers it.
-- This is a bump we plan to delete: S2 removes `ratatui`/`crossterm` from the tree entirely (§6.3), which also removes the whole `unicode-width` constraint class. It is plumbing, not architecture.
-
-An alternative we did *not* take: keeping `ratatui 0.29` + `vt100 0.15.2` and running a second `vte` parser in parallel to recover mouse/paste/cursor modes (~120 LOC). It avoids the dependency bump but keeps every 0.17/0.18 parser fix out — including the xterm-compatible `set_size` that the float needs most, since it is resized constantly.
-
-### Deliberately *not* in S0 (they are S1)
-
-- One geometry source of truth (the float still gives its child `rect − 4` while painting `rect − 2`).
-- Region-based input routing (a visible float still swallows every mouse event).
-- Terminal-query replies / capability proxy.
-- Scrollback for the float.
-
-### Verification status — read this before trusting the diff
-
-There is **no Rust toolchain in the environment this was written in** (crates.io, static.rust-lang.org and the Debian/Ubuntu archives are all outside the sandbox allowlist; `apt` has no working index). So:
-
-- ✅ All 14 source files parse cleanly under tree-sitter-rust (no `ERROR`/missing nodes).
-- ✅ Every external API call was checked against the actual sources of `vt100` 0.18.1, `crossterm` 0.29.0 and `ratatui` 0.30.2 (`Buffer::{cell, cell_mut, empty}`, `Style::patch`, `Cell::{symbol, style, set_symbol, set_style}`, `Frame::render_widget`, `Terminal::try_draw`'s autoresize, `KeyEventKind`, `Event::Paste`, `MouseEvent: Copy`, `Parser::new(NonZeroU16, …)`, `Screen::{mouse_protocol_mode, bracketed_paste, hide_cursor, cursor_position, cell}`, `Callbacks`).
-- ❌ **Not compiled.** Expect a handful of borrow-checker or clippy nits on first build; the risky spots are the `select!` arm bodies (they call `&mut self` while the futures borrow only locals) and `pty::spawn`'s partial move of `PtyPair`.
-- ⚠️ `Cargo.lock` was not regenerated (no cargo here): it still lists `tui-term`, `vt100 0.15.2` and `ratatui 0.29.0`. `cargo build` rewrites it; the graph change is `−tui-term −vt100 0.15 −vte 0.11 −ratatui 0.29 (−its ratatui-crossterm/crossterm 0.28 chain)`, `+vt100 0.18.1 +vte 0.15 +ratatui 0.30.2 (+ratatui-core/widgets/crossterm)`, and `unicode-width` moves 0.2.0 → 0.2.2.
-
-First commands on a machine with a toolchain:
-
-```sh
-cargo build           # refreshes Cargo.lock, surfaces the compile nits
-cargo test            # 13 new unit tests: widget/adapter, float geometry, Signal
-cargo run             # then, in the shell: btop, nvim, lazgit, less, fzf
-```
-
-### What to measure once it runs (the §2 claims, now testable)
-
-| Claim | Check | Expected |
-|---|---|---|
-| Idle cost was tick-driven (§2.1) | leave a prompt idle, `perf stat -e task-clock -p $(pgrep uncl) -- sleep 5` | ≈ 0, not the old 100 Hz redraw |
-| Input was capped at 1 event/tick (§2.2) | paste 5 KB of text into the float | lands in one write, no character-by-character crawl |
-| Paste/queue no longer stall the loop (§2.3) | hold a key down / drag while a child floods output | typing stays responsive, no freeze |
-| Mode tracking is now real (§2.5) | `htop` in the float, then move the mouse in the *owner* area | no phantom reports when the child never enabled mouse mode |
-
-### S0.1 — cursor and shutdown fixes (reported after first run)
-
-Two regressions from S0, both fixed:
-
-**1. No cursor at all.** S0 replaced `tui-term`'s cursor painting with
-`buf_cell.set_style(buf_cell.style().patch(cursor.style))` where the style was
-`Modifier::RAPID_BLINK` and nothing else. A blink modifier on a blank cell is
-invisible, and ratatui hides the hardware cursor unless `Frame::set_cursor_position`
-is called — so the result was no visible cursor in either pane.
-
-Fix: stop painting a fake cursor entirely. The widget is now a pure grid painter
-and the owner loop calls `Frame::set_cursor_position` at the *focused* pane's
-cursor cell, so the real hardware cursor is used: it blinks with the user's own
-blink rate, takes the shape their terminal is configured for, and disappears
-when the child hides it (`hide_cursor()`, e.g. BTOP). One cursor, in the focused
-pane; the unfocused pane has none, which is what a multiplexer should do.
-`Frame::area()` guards against placing it off-screen.
-
-This also removes a whole class of "cursor looks wrong" bugs that S1 would
-otherwise inherit: shape (DECSCUSR) and visibility now come from the terminal and
-the parser, not from our painting.
-
-**2. Unclean exits / prompt not restored.** Three separate causes:
-
-- The restore block ran only on the `Ok` path of `initialize_pty`, after
-  `run()`; any `?` early return, or a panic, skipped it and left the terminal in
-  raw mode on the alternate screen.
-- Nothing ever killed the children. Their readers block in `read()` forever, so
-  the blocking pool never drained and `#[tokio::main]`'s runtime shutdown could
-  wait on them — the process hung *after* the UI was gone, with the terminal
-  still owned by uncl.
-- The blocking input pump had no stop condition: it polled every 50 ms forever.
-
-Fix: a `TerminalGuard` whose `Drop` disables raw mode, mouse capture and
-bracketed paste, leaves the alternate screen, shows the cursor and resets SGR —
-declared right after the first state change so it runs on every exit path
-including unwinding. `PtySession` now owns a `ChildKiller` and SIGHUPs its child
-on drop (also when a float is replaced), which closes the pty and unblocks the
-reader. The input pump checks an `AtomicBool`. And `main` builds its own runtime
-so it can `shutdown_timeout(250ms)` instead of waiting indefinitely.
-
-Also fixed while in there: the float's pty/parser/painted area now agree on one
-number (`Overlay::content_rect()`, border-inset only). They previously disagreed
-by two cells, and the cursor would have been placed at the wrong cell inside the
-float. The widget also clips its area to the buffer, which is the same bug class
-as the open "crash on exit fullscreen in wezterm (out of bounds)" issue.
-
-### Known behaviours kept on purpose (so the diff stays reviewable)
-
-- `Home` still toggles the float and is still not forwardable to the child (S1 gives it back and moves the toggle).
-- Backspace still sends `0x08` (not `0x7f`) — unchanged from before, tracked in S1 with the mode-aware encoder.
-- Mouse reports to the *owner* shell are still always SGR; the per-mode encoder is S1.
-- **Clicks inside a visible float still go to drag/resize, not to the child.** This is S1's region routing and it needs the local-chord decision in §9.1; until then a float running `btop`/`htop`/`nvim` is keyboard-only.
-- The float title shows the *child's* size (inside the border), which is now the size the pty was actually told.
-
-## Appendix D — S1 implementation log (2026-10-26)
-
-S1 is the "give the child a voice" stage of §6.2. The user-visible goal was narrow and
-concrete: **a TUI running in the float must receive the mouse**, and everything else in
-the float must behave like it is running in a real terminal rather than behind a wall.
-
-### The bug that started it, and why it happened
-
-Clicks and wheel events inside the float never reached the child. Two independent causes,
-both in `mouse.rs`/`owner.rs`:
-
-1. The float had no notion of *regions*. With the float visible, the old handler treated
-   every mouse event as a candidate drag/resize, so presses inside the content area were
-   consumed by uncl (`begin`/`drag`/`end`) and never encoded for the child.
-2. Even if they had been encoded, uncl only knew one encoding — crossterm's host-side
-   event — and forwarded nothing. The child's `mouse_protocol_mode()` /
-   `mouse_protocol_encoding()` were read by nothing outside `keyboard.rs`'s dead code.
-
-S1 replaces both with a single, testable decision function.
-
-### What landed
-
-| File | Change |
-| --- | --- |
-| `src/app/input/mouse.rs` | **rewritten.** `route(overlay, event) -> MouseRoute` is the whole policy: `Alt`+press → local, border → local resize, content → `Child{col,row}` (area-relative), outside → `HideFloat`. `begin/drag/end` own the drag state machine; `direction_for` picks the nearest corner/edge. 12 tests. |
-| `src/app/input/encode.rs` | **new.** `ChildModes::from_screen`, `encode_key` (chars, Ctrl→control range, Alt prefix, DECCKM-aware arrows/Home/End, SS3 F1–F4, tilde keys, xterm modifier parameter), `encode_mouse` (SGR / legacy X10 / UTF-8, mode gating per `MouseProtocolMode`, 1-based coordinates, release handling). 16 tests. |
-| `src/app/term/caps.rs` | **new.** Host capability record (`TERM`, `TERM_PROGRAM`, `COLORTERM`, kitty/sixel flags), `da1()`/`da2()`, xterm palette, `rgb_spec`, `apply_child_env`, `summary` for `uncl --doctor`. 4 tests. |
-| `src/app/term/callbacks.rs` | **new.** `vt100::Callbacks` impl: DA1, DA2, DSR 5/6, `CSI ?6n`, `CSI 18t`, `OSC 10/11/4`; tracks `?1004` (vt100 does not model it); answers through a `ReplySink` installed on the pty writer. 8 tests. |
-| `src/app/pty.rs` | `spawn` takes a `ReplySink` and installs it before the reader thread starts; new `ChildParser` alias. |
-| `src/app/lease.rs` | Owns parser + sink + session; `modes()`, `sync_size()` (the single place that resizes pty **and** grid), `clamp_to` on host resize. |
-| `src/app/ui/tenant.rs` | `content_rect` is the only geometry; `resize_to` clamps instead of bailing (a drag used to freeze when the requested size crossed `MIN_HEIGHT`); new `resize_to_corner` keeps the anchor corner fixed; `clamp_to`; `geometry_key` (Alt+arrows move, Alt+Shift+arrows resize). 14 tests. |
-| `src/app/ui/owner.rs` | Chords → `encode_key`; mouse → `route` → `encode_mouse`; paste wrapped per `?2004`; focus reports per `?1004`; `HostMouse` policy (below); `Ctrl+Alt+q` quits. |
-| `src/main.rs` | `--doctor`, `--version`, `--help`; `uncl` with no arguments still just runs. |
-| `src/app/input/keyboard.rs` | **deleted** — its hand-rolled `vec![27, 91, …]` table is what `encode_key` replaces. |
-
-66 tests by `cargo test`'s count (S0 had 18). No new dependencies.
-
-### Two policy decisions worth remembering
-
-**`HostMouse`: the host mode is not the child's mode.** crossterm's `EnableMouseCapture`
-turns on `?1000`, `?1002` *and* `?1003` — any-motion — so every pixel of pointer movement
-becomes an event, is drained, and is then thrown away by the mode filter. uncl now writes
-the DEC private modes itself: SGR encoding always (`?1006`), press always while the float
-is visible (needed for drag and click-away), button-motion/any-motion **only** when the
-focused child asked for them, and everything off when nobody wants it. That also restores
-native host text selection (with the terminal's usual Shift bypass) when the child is not
-a mouse-mode application.
-
-**`TERM` stays `xterm-256color`.** `TERM` is not inherited from the host: until the DCS/APC
-tap exists (S3), claiming `xterm-kitty` or a sixel `TERM` makes a child emit image bytes
-that uncl drops silently. `COLORTERM=truecolor` *is* inherited (24-bit colour survives our
-re-encoding), `TERM_PROGRAM=uncl` is set, and the host's program is preserved as
-`UNCL_HOST_TERM_PROGRAM`. `uncl --doctor` prints exactly what a child will see.
-
-### Closing the gaps the first run exposed
-
-Three things were still lying to the child after the first green build:
-
-**A gesture that leaves the float.** Press inside the float, drag outside: the
-`Drag`/`Up` used to fall outside `content_rect`, so uncl called it "local", the child never
-received the release, and a text selection in an editor stayed stuck. `Overlay::child_grab`
-now records that the child owns the pointer from press to release; while it is set, every
-button event routes to the child, with the coordinates **clamped to the grid** (which is
-what a real terminal reports for a pointer outside the window). `begin()` refuses to start a
-local drag during a grab, so `Alt` cannot strand a drag either. Scroll is deliberately *not*
-captured — it is an independent event, not part of the gesture.
-
-**Clipboard (`OSC 52`).** A child copying to the clipboard was silently dropped: the request
-is not for the child's terminal, it is for the *real* one. `Callbacks::copy_to_clipboard`
-(vt100 validates the selector and the base64 payload) now queues `OSC 52 ; <ty> ; <data>`
-on a host channel, and the owner thread — the only writer of stdout — emits it before the
-next frame. Reading the host clipboard (`OSC 52 ; c ; ?`) is still unanswered on purpose:
-almost no terminal allows it, and a wrong answer is worse than a child falling back.
-
-**Cursor shape (`DECSCUSR`).** Hidden/shown and position were already honoured, but not the
-shape, so nvim's insert-mode beam was a block in the float. The focused pane's
-`screen.cursor_style()` is mapped to `CSI 0..6 SP q` and re-sent only when it changes; the
-`TerminalGuard` resets it on exit, because the host's cursor shape outlives the alternate
-screen.
-
-**A crashing float no longer takes the owner with it.** The float's shell exiting (`exit` in
-the float, a crash) respawns the lease; a *failing* `exec` is now backed off by
-`TENANT_RESPAWN_BACKOFF` (2 s) instead of retried every 100 ms tick, and — the important
-part — an error there no longer propagates out of the event loop, which used to tear down
-the owner shell and exit uncl. The float also comes back **visible** if it was visible when
-it died, so `exit` in the float gives a new prompt rather than a window that has to be
-re-opened with `Home`.
-
-### Deliberately *not* in S1
-
-* **DECRQSS / XTGETTCAP / kitty keyboard (`CSI > u`) / application keypad.** Answering
-  these badly is worse than not answering: a wrong "yes" makes a child emit sequences we
-  cannot honour and the child cannot detect the failure. They belong with the S2 emitter,
-  which is where the answers become true.
-* **Cursor *shape* (`DECSCUSR`).** Hidden/shown and position are honoured; shape is not
-  relayed. Visible cursor in the right cell was the bug; shape is cosmetic.
-* **Sixel/kitty graphics.** Unchanged from S0: gated behind `UNCL_SIXEL` until the image
-  tap exists (§6.4).
-* **Owner-pane scrollback / alt-screen semantics.** Untouched.
-
-### Verification status — read this before trusting the diff
-
-There is **no Rust toolchain in this environment** (installs are blocked), so this code has
-not been compiled or run. What was done instead:
-
-* every file parses cleanly with `tree-sitter-rust`;
-* every method name called in `src/` was cross-checked against a definition in `src/` or in
-  the vendored sources of the exact dependency versions (`ratatui 0.30.2`, `crossterm 0.29`,
-  `vt100 0.18.1`);
-* the `vt100` callback signatures, `Parser<CB>` API, and *which* sequences reach
-  `unhandled_csi`/`unhandled_osc` were read out of `vt100 0.18.1`'s own `perform.rs`
-  (`?h`/`?l` with unknown modes, `c`, `>c`, `n`, and `18t` all land there; `8t` does not);
-* geometry, encoders and routing are covered by the 66 tests above.
-
-First thing to run on a machine with cargo: `cargo test`, then the manual script below.
-
-### Manual acceptance script (S1 exit criteria, §6.2)
-
-```sh
-cargo build --release
-./target/release/uncl --doctor          # TERM/COLORTERM a child will see
-# in the float (Home):
-echo $TERM; echo $COLORTERM             # xterm-256color / truecolor
-printf '\e[6n'; timeout 1 cat -v        # CPR: expect ^[[<row>;<col>R, and no stall
-btop                                    # click CPU/mem panes, wheel in the process list
-htop; nvim; lazygit; less /etc/services; fzf
-# select text in nvim/less and drag the pointer out of the float → selection keeps
-#   following the pointer and releases cleanly (no stuck selection)
-# nvim: `i` shows a beam cursor, `Esc` a block (DECSCUSR relayed to the host)
-# `echo -n hello | base64 | xargs -I{} printf '\e]52;c;{}\e\\'` → pastes from the
-#   host clipboard (terminal must allow OSC 52 writes)
-# geometry: Alt+drag to move, drag the border to resize (child must reflow live)
-# Alt+arrows move, Alt+Shift+arrows resize
-# click outside the float → it hides; Home → it comes back
-# `exit` inside the float → a fresh prompt, and the owner shell is untouched
-# mouse outside the float (float hidden) → the owner shell sees nothing, selection is native
-# drag the bottom edge up past MIN_HEIGHT → the float keeps tracking the pointer
-# (`Ctrl+Alt+q` is the escape hatch if anything wedges)
-```
-
----
-
-## Appendix E — S2 implementation log (2026-10-26)
-
-S2 is what §6.3 called "the pivotal stage". The UI toolkit is gone: a frame is now
-`vt100::Screen` → bytes, encoded by uncl, written with a single `write_all`.
-
-### What landed
-
-| # | Change | File |
-|---|---|---|
-| 1 | The frame emitter: per-pane `prev` screens, owner row diffs, float rows painted into `content_rect`, borders, title, cursor last, one buffer per frame | `src/app/render/mod.rs` (new, ~1,020 LOC incl. 17 tests) |
-| 2 | The only rectangle type in the tree (`new/right/bottom/is_empty/contains/inset`) | `src/geometry.rs` (new, ~100 LOC incl. 5 tests) |
-| 3 | One definition of the float's inner area, shared by the mouse router, the pty sizing and the painter | `src/constants.rs` (`content_rect`) |
-| 4 | `Terminal`/`Frame`/`CrosstermBackend` deleted from the paint path: `draw()` builds `Panes` and does one `write_all` + `flush`; the event loop got a frame deadline (`FRAME_MIN_INTERVAL`, 8 ms ≈ 120 Hz) instead of a 100 ms ticker; `Renderer::invalidate()` on show/hide, move, resize (keyboard and mouse), respawn, and `EnterAlternateScreen` | `src/app/ui/owner.rs` |
-| 5 | `PseudoTerminal` widget and the `vt100→ratatui` adapter deleted (`ratatui` + `tui-term` + their 40-odd transitive crates) | `src/app/ui/widget.rs`, `src/app/ui/adapter.rs` deleted; `Cargo.toml` |
-
-**83 tests** as `cargo test` counts them (S1's tree had 66: −5 with the deleted widget,
-+5 geometry, +17 renderer).
-**No new dependencies.** Net diff: **+1,205 / −346** across 13 files.
-
-### What a frame does now
-
-1. The loop wakes for a reader signal, an input event, or the frame deadline. Frames
-   are coalesced: a child flooding output cannot make uncl repaint more than ~120×/s.
-2. Both screens are cloned **under their locks** — one clone per pane, ~32 B/cell
-   (~375 KiB at 200×60, ≈0.1 ms of `memcpy`). The lock is never held while a frame is
-   encoded, which is the §2.4 fix S0 introduced and S2 keeps.
-3. The snapshots are handed to `Renderer::render(Panes { .. })` **by value**, so the
-   renderer keeps them as the next frame's `prev`. One clone per pane per frame, not two.
-4. Nothing changed → `render` returns an **empty slice** and `draw` performs no syscall.
-5. Otherwise: `?25l` → changed owner rows (`rows_diff`, or `rows_formatted` + `ECH(width)`
-   on a full repaint) → the float's rows, each preceded by a `CUP` into its content rect
-   → the float's top/bottom border and `s:rows:cols` title if the rect is new or was
-   overpainted → one `CUP` + `?25h` for the focused child's cursor → one `write_all` + `flush`.
-
-Input modes are still **never** replayed from the child's screen: `HostMouse` and
-bracketed paste remain uncl's own, as decided in S1.
-
-### Three laws that the §6.3 sketch did not have (and why it took 2× the LOC)
-
-1. **`vt100`'s row encoders are pane-local.** `rows_formatted`/`rows_diff` emit
-   `CSI r;cH` for backwards jumps within a row, addressed as if the pane were at the
-   screen origin — and for that origin itself it emits a bare `CSI H`, whose parameters
-   default to 1;1. `append_row` rewrites every absolute move (bare, empty-field or
-   explicit, `H` or `f`) to screen coordinates and leaves every other CSI alone.
-2. **`EL` inside a float is a weapon.** A styled-but-empty row tail (a coloured status
-   bar — BTOP's entire chrome) ends in `CSI K`, which on a real terminal erases to the
-   end of the *screen*: the float's right border, the owner's cells beside it, and the
-   frame gutter. So the right border is painted **after** the row, and a row that
-   emitted `EL` triggers `repair_tail`, which repaints the owner's cells from
-   `rect.right()` to the screen edge for that row.
-3. **`rows_formatted` never blanks.** It skips default cells and relies on what is
-   already on screen, so a *full* repaint must `ECH(width)` first — bounded to the
-   float's width, so it can never reach the border. That is exactly the difference
-   between `FloatRow::Full` and `FloatRow::Diff`: `rows_diff` blanks by itself, so diff
-   rows are painted without the erase and cost one `CUP` plus the changed cells.
-
-The float's dirty-row plan is therefore three-way — **skip** (unchanged), **diff**
-(changed), **full** (new, or the owner just repainted that row *under* the float).
-Occlusion is what forces the third case: the owner's row diff cannot know the float was
-sitting on top of it.
-
-### Deviations from the §6.3 sketch (each deliberate)
-
-- **`cursor_state_formatted()` is not used.** It carries no SGR state (so it corrupts
-  attribute state mid-frame) and it expresses a *shape*, not a position. The real
-  cursor is placed with `CUP` + `?25h` while painting stays cursor-hidden, and the
-  shape is relayed out of band by S1's `decscusr()` — which is also what makes nvim's
-  beam a beam instead of a painted rectangle.
-- **`state_diff()` is still not replayed** (S0/S1 policy): uncl owns the host's modes.
-- **The scheduler lives in the event loop**, not the renderer. `Renderer` is pure:
-  bytes in, bytes out, no timers, no I/O — which is what makes the 17 tests possible.
-- **The border and title are the renderer's job** now that `Block` is gone, and the
-  title shows the child's *content* size (the number the pty was given), not the rect.
-- **`Panes` owns its screens** instead of borrowing them, to keep the clone count at one.
-
-### What this removes from the hot path
-
-| Before (S1) | After (S2) |
+| Consumer | Uses it for |
 |---|---|
-| 100 Hz unconditional full-screen repaint | repaint on change only, coalesced to ≤ ~120 Hz, empty frame = 0 syscalls |
-| `vt100` grid → `Buffer` of ratatui cells (a second `w*h` copy, per frame) | direct row encoding from the parser's grid |
-| per-cell `Style` construction, then a full-buffer diff | per-**row** `memcmp` (`Cell: PartialEq` compares attributes too), then `vt100`'s tested SGR diff |
-| one `write` per changed cell run (crossterm backend) | one `write_all` per frame |
-| cursor emulated as a styled cell | real cursor, hidden during paint, placed once, child's hide honoured |
+| the pty | `TIOCSWINSZ`, so the child draws for the right size |
+| the parser | the grid the child's output is parsed into |
+| the renderer | the rectangle the rows are painted into |
+| the mouse router | converting a screen position into a child-relative cell |
 
-### Deliberately *not* in S2
+All four derive from `Overlay::content_rect()` = the float's rect inset by one cell
+on each side. Resizing clamps instead of bailing (a drag that crossed `MIN_HEIGHT`
+used to freeze), keeps the anchor corner fixed for a corner drag, and re-applies the
+same one number to pty and grid together.
 
-- **The golden-frame corpus** (§10 item 14). The 17 renderer tests assert byte-level
-  properties (CUP targets, `EL` repair ordering, diff-vs-full, cursor placement) against
-  parsers fed real escape sequences, but there is no recorded corpus of child streams
-  replayed in CI yet.
-- **A rect-scoped invalidation.** A move/resize invalidates the whole screen: correct,
-  but it repaints all rows instead of the union of the old and new rects.
-- **Owner scrollback and alt-screen semantics** — untouched, as in S1.
-- **`Cargo.lock`.** The committed lock is stale (it still says `crossterm 0.27`,
-  `vt100 0.15.2`, `ratatui`, `tui-term` — it was not regenerated in S0/S1 either, and
-  cannot be here without cargo). The first `cargo build`/`cargo test` rewrites it;
-  commit that refresh on its own so the code change stays reviewable.
-
-### Verification status — read this before trusting the diff
-
-Still **no Rust toolchain in this environment**, so S2 has not been compiled or run:
-
-* every file parses cleanly with `tree-sitter-rust` (checked after every edit);
-* every method called on `vt100`, `crossterm` and `portable-pty` exists in the vendored
-  source of the exact pinned version — in particular `Screen::cell`/`rows_diff`/
-  `rows_formatted`/`cursor_position`/`hide_cursor`, and `Cell: PartialEq` (which compares
-  attributes, not just text — the row diff depends on that);
-* the pane-local `CUP` and `EL` behaviours above were read out of `vt100 0.18.1`'s
-  `row.rs`/`screen.rs`, not assumed;
-* 83 tests: geometry (5), renderer (17), routing/encoders (32), callbacks (10),
-  capabilities (4), float geometry/keyboard (11), signals (3), constants (1) — the
-  whole S0/S1 suite plus the emitter.
-
-First thing to run on a machine with cargo: `cargo test`, then the script below.
-
-### Manual acceptance script (S2 exit criteria)
-
-```sh
-cargo test                                  # 83 tests, no warnings expected
-cargo build --release && ./target/release/uncl
-
-# 1. idle cost: leave the float hidden and the owner idle → `top -p $(pgrep uncl)`
-#    must show ~0% CPU with a still screen (this was the §2.1 bug)
-# 2. btop in the float, Home to hide it → the owner must repaint with no float ghosts
-#    (no border remnants, no half-drawn panes)
-# 3. Home → the float appears with its `│ ┌ ┐ └ ┘` border and `s:rows:cols` title, and
-#    the title must match what `stty size` says inside the float
-# 4. drag the float by its border, and Alt+arrows / Alt+Shift+arrows → the vacated area
-#    is repainted; no smearing, no leftover fragments at the old position
-# 5. a *still* btop must cost nothing: `strace -e trace=write -c -p $(pgrep uncl)`
-#    for 5 s → a handful of writes, not thousands (empty frames write nothing)
-# 6. `seq 1 200000` in the float → no tearing, input stays responsive, bounded CPU
-# 7. wheel-scroll a btop process list and a `less /etc/services`: rows scroll smoothly
-#    and the float's border survives the scroll (the `EL` repair)
-# 8. nvim inside the float: cursor blinks in the right cell; `i` = beam, `Esc` = block
-# 9. resize the host window while btop runs → both panes reflow live, nothing smears
-# 10. click outside the float → it hides; Home → it comes back; `exit` in the float →
-#     a fresh prompt, owner shell untouched (`Ctrl+Alt+q` if anything wedges)
-```
-
-### Where S2 leaves the plan
-
-§6.3's claim that this is the pivotal stage holds up: the encoder is now uncl's own, so
-`state_diff`, the mode table and — crucially — **out-of-band bytes after the grid flush**
-now have a place to live. That is the prerequisite for S3 (kitty/sixel passthrough) and
-for S4 (an `alacritty_terminal` swap) without touching the event loop again.
+The float's border carries the state that is otherwise invisible: the child's **size**
+and, while the view is scrolled back, the offset (`s:24:80 +12`) in the bottom
+border; the child's **window title** (`OSC 0/2`) in the top one.
 
 ---
 
-## Appendix F — S3 implementation log (2026-10-26)
+## Input: routing, encoders, and who owns the mouse
 
-S3 is "images, cheap tier" (§6.4): **an image the child emits shows up inside the
-float**, with no decode, no scale and no re-encode. It does now — for the two
-protocols that matter on a terminal that is not a sixel terminal.
+Every mouse event is decided by one pure function, `mouse::route(overlay, event)`:
 
-### What landed
+```
+Alt+drag / border press  >  child (if a gesture is in progress)  >  child (content)  >  uncl
+```
 
-| # | Change | File |
+| Landing | Route | Why |
 |---|---|---|
-| 1 | The tap: a streaming splitter that removes `DCS`/`APC`/`OSC` strings from a child's output *before* `vt100` sees it, across chunk boundaries, and hands everything else back | `src/app/images.rs` (new, ~700 LOC incl. 19 tests) |
-| 2 | The store: classification (kitty / sixel / iTerm2), kitty control-block parsing, chunk joining (`m=1`…`m=0`), a placement-only replay by image id, bounds on count and bytes | `src/app/images.rs` |
-| 3 | The reader thread feeds the splitter, passes graphics to the store anchored at the child's cursor, and answers kitty's `a=q` capability query from the child's own pty | `src/app/pty.rs` |
-| 4 | `Lease` owns the float's store (a restarted child gets a fresh one) | `src/app/lease.rs`, `src/app/ui/tenant.rs` |
-| 5 | Emission **after the grid flush**: new images, re-placement on a move, re-blit after a repaint, and `a=d,d=A` when the float hides | `src/app/render/mod.rs` (6 new tests) |
-| 6 | `TERM`-level advertising: `UNCL_GRAPHICS=kitty,iterm2` for children, `--doctor` says what the tap carries | `src/app/term/caps.rs` |
-| 7 | Non-goals written down where users will find them | `readme.md` |
+| `Alt` held, on the float | `Local` | move the float |
+| the one-cell border | `Local` | resize from that edge/corner |
+| inside the content rect | `Child { col, row }` | the child's coordinates, encoded for the child's protocol |
+| outside the float | `HideFloat` | click away to hide |
 
-**125 tests** (S2 shipped 83: +30 tap/store, +7 renderer, +5 window reports and
-cell size). No new dependencies.
+A gesture that *starts* in the child's grid belongs to the child until the button
+comes up, even if the pointer leaves the float — `Overlay::child_grab` records that,
+and out-of-grid coordinates are clamped to the nearest cell, which is what a real
+terminal reports. Losing that release is what used to leave a selection stuck in the
+middle of a drag.
 
-### The five laws this stage is made of
+**Encoders are per pane and mode-aware.** `ChildModes::from_screen` reads the
+parser; `encode_key` handles characters, Ctrl→control range, Alt prefix,
+`DECCKM`-aware arrows and Home/End, SS3 for F1–F4, tilde keys, xterm modifier
+parameters and application keypad. `encode_mouse` emits SGR, legacy X10 or UTF-8 by
+the mode the *child* reported, gated on whether the child asked for mouse reporting
+at all, with 1-based coordinates and proper release handling. Bracketed paste is
+wrapped only when the child enabled it.
 
-1. **`vte` cannot tell us about pixels.** `vt100` does not implement
-   `hook/put/unhook`, so a DCS payload is consumed and dropped *inside* the parser,
-   and APC bytes go to `anywhere()`, which discards them. §6.4 offered patching
-   `vt100` for DCS; splitting the stream ourselves instead handles DCS **and** APC
-   **and** OSC 1337 in one place, with no fork of a dependency. The splitter is
-   ~150 lines and has no version coupling.
-2. **The splitter is protocol-agnostic, the store is not.** Out-of-band sequences
-   are reported as `(kind, bytes)`; anything the store does not recognise comes
-   straight back and is fed to the parser, so `OSC 52`, colour queries and `DECRQSS`
-   behave exactly as they did in S1. That is what keeps this stage invisible to the
-   rest of the terminal.
-3. **A terminator can be split.** `ESC` at the end of one read and `\` at the start
-   of the next is the normal case for a 4 KiB image on a pty, and treating the lone
-   `ESC` as ordinary payload swallows the rest of the stream. `feed` checks the
-   boundary explicitly (and a test covers it).
-4. **A transmission is not an image.** kitty senders chunk payloads (`m=1`…`m=0`,
-   4 KiB each), so a 100 KiB PNG arrives as ~25 sequences. Storing each as an image
-   would both break the image and evict its first fragments, so chunks are joined
-   into one entry anchored where the *first* one arrived.
-5. **Two kinds of image, two kinds of lifetime.** kitty images live in the
-   terminal's own image layer: painting text over them does not erase them, so a
-   still frame costs nothing — but they have to be **deleted** (`a=d,d=A`) when the
-   float hides, or they stay stuck over the owner's screen. sixel and iTerm2 draw
-   into the same plane as text, so *any* repaint of their rows erases them and they
-   have to be blitted again. The renderer's emission rule is exactly those three
-   triggers: **new**, **moved**, **erased**.
+**The host's mouse mode is not the child's.** `HostMouse` writes the DEC private
+modes itself instead of using crossterm's capture-all: SGR encoding always,
+button-press always (uncl needs it to move the float, hide it on a click outside,
+and resolve hyperlinks), motion only when the focused child asked for it, and
+everything off when nobody wants it. The trade-off is explicit: the host's own
+scrollback and click-drag selection are unavailable inside uncl, because uncl
+provides both. `Shift`+drag still selects in most emulators, which take that key
+back locally.
 
-### Emission rules (the whole policy)
+**Focus and cursor shape are relayed.** `?1004` is tracked (the parser does not model
+it) and focus in/out is sent to whichever pane gains or loses the keyboard. The
+focused pane's `DECSCUSR` shape is relayed to the host and reset on exit, so nvim's
+insert-mode beam is a beam.
 
-| Trigger | What is sent |
-|---|---|
-| a new sequence | the payload, verbatim, at its translated anchor |
-| the content rect changed (show, drag, resize) | `a=p,i=<id>…` for kitty (never the payload), the payload for the rest |
-| a pixel-based image's rows were repainted | the payload again |
-| the float hides | `ESC _ G a=d,d=A ESC \` — once |
-| nothing changed | nothing at all |
+**The chords.** `Home` toggles the float. `Alt`+arrows move it, `Alt`+Shift+arrows
+resize it. `Ctrl+Alt+q` quits. `Ctrl+Alt+Up/Down` and `Ctrl+Alt+PageUp/PageDown`
+scroll the focused pane. Everything else is delivered to whichever pane owns the
+keyboard.
 
-### Deviations from §6.4
+**A crashing float cannot take the owner down.** The float's shell exiting respawns
+it (visible again if it was visible); a failing `exec` is backed off rather than
+retried every tick, and a failure there never propagates out of the event loop.
 
-- **`vt100` is not patched** (law 1): one splitter for all three protocols instead
-  of a DCS hook plus a separate APC splitter.
-- **iTerm2 inline images are in scope**, though §6.4 listed them as a non-goal.
-  Cost: ~40 lines on top of the same store. Reason: the terminals most likely to be
-  hosting uncl (WezTerm, iTerm2, kitty) implement it, the review machine's terminal
-  has **no sixel at all** (`uncl --doctor`: `sixel=false kitty_graphics=true`), and
-  `wezterm imgcat` is the shortest path to a user seeing an image today.
-- **No source-rect cropping.** §6.4's kitty crop (`x,y,w,h` in *pixels*) cuts a
-  window out of the image instead of showing all of it. Scaling (S3.2, below) is
-  the better answer for a float — the whole picture, just smaller — so cropping
-  stays unbuilt. A sender's own crop parameters are still passed through.
-- **The "does it fit" test is an estimate, not a measurement.** sixel only states
-  its size in pixels, so the cell size has to be assumed: measured from the host
-  tty at startup (`TIOCGWINSZ`), overridable with `UNCL_CELL_PX`, falling back to
-  `10x20`. It only ever decides *skip*: the terminal does the drawing. Kitty's
-  `c=`/`r=` are used when the sender provides them, and unknown footprints are
-  drawn.
-- **The capability probe is a reply, not a query.** Rather than interrogating the
-  host at startup, the tap answers kitty's `a=q` from the child's own pty (that is
-  the probe graphics-aware senders actually use) and advertises
-  `UNCL_GRAPHICS=kitty,iterm2` in the child's environment. Sending sixel remains
-  gated on `UNCL_SIXEL`, because a sixel the host cannot draw is garbage on screen,
-  whereas an unknown APC/OSC is ignored by every terminal.
+---
 
-### Deliberately *not* in S3
+## The emitter: painting a frame ourselves
 
-- **Owner-pane images.** The background shell's graphics are stripped like every
-  other child's, and never drawn. Claiming otherwise would be a lie: the owner pane
-  is painted by the same row encoder as everything else.
-- **Animation** (`a=a`), **frame edits** (`a=f`) beyond passthrough, **alpha**,
-  **scaling**, **`OSC 8` hyperlinks** (that is S3.5, unchanged).
-- **Scroll-aware placement.** An image is anchored to the cell it was emitted at
-  and re-placed there; if the child scrolls its grid, the image stays put instead
-  of travelling with the text. Doing it properly means tracking the grid's scroll
-  deltas, which `vt100` does not expose — that is an S4 (`alacritty_terminal`)
-  feature, not a cheap one.
-- **Real cropping** (above). The cell size itself *is* probed now — see the S3.1
-  section at the end of this appendix — but only for reporting and for the
-  fit test.
-- **A `--doctor` self-test** that emits a sample image; the acceptance script below
-  does that in three lines instead.
+`ratatui` and `tui-term` are gone. A frame is a `vt100::Screen` turned into ANSI
+bytes by `src/app/render/`, written once.
 
-### Verification status — read this before trusting the diff
+1. Both screens are cloned under their locks (one clone per pane, ~32 B/cell).
+2. The clones are handed to `Renderer::render(Panes { .. })` **by value**, so the
+   renderer keeps them as the next frame's `prev` — one clone per pane, not two.
+3. Nothing changed → an empty slice, no syscall.
+4. Otherwise: `?25l` → changed owner rows → the float's rows, each preceded by a
+   `CUP` into its content rect → borders and titles if the rect is new or was
+   overpainted → one `CUP` + `?25h` for the focused child's cursor → one `write_all`.
 
-Still **no Rust toolchain here**; S3 has not been compiled or run.
+Three rules make that correct, and each was discovered the hard way:
 
-* every file parses with `tree-sitter-rust`;
-* the `vt100`/`vte` behaviour the tap relies on was read from the vendored sources
-  (`perform.rs`: `hook/put/unhook` unimplemented; `anywhere()` for APC);
-* the kitty control-block grammar, `a=q` reply and `a=d,d=A` deletion were taken
-  from kitty's own protocol description, and sixel's raster attributes from the
-  `DECSDM`/sixel spec as implemented by `libsixel`/`chafa`;
-* 125 tests, 42 of which are new here: splitter ordering, chunk boundaries, split
-  terminators, C1 forms, classification per protocol, chunk joining, deletion,
-  bounds, anchor translation, and the renderer's three emission triggers.
+**`vt100`'s row encoders are pane-local.** `rows_formatted`/`rows_diff` address the
+row as if the pane sat at the screen origin, and emit a bare `CSI H` for that origin
+— whose defaults are 1;1. `append_row` rewrites every absolute move (bare, partial or
+explicit, `H` or `f`) into screen coordinates and leaves every other sequence alone.
 
-### Manual acceptance script (S3 exit criteria)
+**`EL` inside a float is a weapon.** A styled-but-empty row tail — BTOP's entire
+chrome — ends in `CSI K`, which erases to the end of the *screen*: the float's right
+border, the owner's cells beside it, and the frame gutter. So the right border is
+painted *after* the row, and a row that emitted `EL` triggers `repair_tail`, which
+repaints the owner's cells from the border to the screen edge.
 
-```sh
-cargo test                       # 125 tests
-cargo build --release && ./target/release/uncl
+**`rows_formatted` never blanks.** It skips default cells and relies on what is
+already on screen, so a full repaint must `ECH(width)` first — bounded to the
+float's width, so it cannot reach the border. `rows_diff` blanks by itself, so diff
+rows cost one `CUP` plus the changed cells and no erase.
 
-# 1. kitty graphics, no external tools needed: an 8x8 dark-red block, 8 cells wide.
-#    Inside the float, paste this; a red rectangle must appear at the prompt cell.
-python3 - <<'PY'
-import base64, sys
-w = h = 8
-data = base64.b64encode(bytes([0x80, 0, 0]) * (w * h)).decode()
-sys.stdout.write(f"\x1b_Gi=1,a=T,f=24,s={w},v={h},c=8,r=4;{data}\x1b\\")
-PY
-# 2. with real tools (whichever you have):
-chafa --format=kitty -s 30x15 some.png      # kitty path
-timg -pk some.png                           # kitty path
-wezterm imgcat some.png                     # iTerm2 path
-chafa --format=sixel -s 30x15 some.png      # sixel path (needs UNCL_SIXEL=1)
+The float's dirty-row plan is therefore three-way: **skip** (unchanged), **diff**
+(changed), **full** (new, or the owner repainted that row *under* the float — a cell
+diff on the owner cannot know the float was sitting on top of it).
 
-# 3. move the float (Alt+arrows, or drag the border) → the image follows the cell
-#    it belongs to, and comes back unchanged. It must not be re-transmitted
-#    (strace -e write -s 200 -p $(pgrep uncl) shows `a=p,i=…`, not the payload).
-# 4. Home twice → the image disappears with the float and returns with it.
-# 5. run the image command again in a scrolling TUI (e.g. `less some.png` via
-#    chafa's sixel/kitty output) → no stale image left behind on the owner screen.
-# 6. `uncl --doctor` → "image tap: kitty + iTerm2 always, sixel not advertised"
-#    and a `cell size: WxH px (measured|assumed|UNCL_CELL_PX)` line.
-# 7. `UNCL_SIXEL=1 uncl --doctor` → sixel advertised, and a full-screen sixel is
-#    skipped once with "uncl: sixel image is larger than the float; skipping".
-```
+The cursor is not painted as a cell. Painting stays cursor-hidden, then one `CUP` +
+`?25h` places the real cursor in the focused pane, honouring the child's own
+`hide_cursor()`. A hidden cursor has no observable position, which is also why the
+frame does not try to move one.
 
-### S3.1 — `wezterm imgcat` panicked: the bug the first real image found
+`state_diff` is deliberately never replayed: uncl owns the host's modes. Replaying a
+child's input-mode state would make the host start reporting in a protocol the child
+never asked for.
 
-Reported from a WezTerm host, immediately after S3 shipped:
+---
 
-```
-$ wezterm imgcat uncl.png
-ERROR env_bootstrap > panic at wezterm/src/main.rs:383:10
-attempt to divide by zero
-  7: wezterm::ImgCatCommand::compute_image_cell_dimensions
-```
+## Images
 
-S3 had made the *bytes* survive; it had not made the child believe it could draw
-them. `imgcat` builds the iTerm2 sequence by measuring the terminal first
-(`wezterm/src/main.rs` → `compute_image_cell_dimensions`):
+The tap sits between the pty reader and the parser: `DCS`, `APC` and `OSC` strings
+are lifted out of the byte stream, across chunk boundaries, and everything else is
+handed to `vt100` unchanged. This is necessary rather than convenient — `vt100` does
+not implement `hook/put/unhook`, so a DCS payload is consumed and dropped inside the
+parser, and `vte` routes `APC` bytes into `anywhere()`, which discards them.
 
-1. `probe.screen_size()` writes `CSI 18 t` (text area in **cells**) and `CSI 16 t`
-   (one cell in **pixels**), then `CSI c` (primary DA) to end the read;
-2. it divides the image's pixel size by `term_size.xpixel` / `ypixel` to get a
-   cell footprint — `(width / cell_pixel_width, height / cell_pixel_height)`;
-3. it bails out with `no size information available` only if **rows and cols are
-   both zero**.
+The splitter is protocol-agnostic; the store is not. Anything the store does not
+recognise goes straight back to the parser, so `OSC 52`, colour queries and `DCS`
+queries behave exactly as they would without a tap.
 
-We answered `18 t` (it is in S1's reply table) and nothing else. So termwiz saw a
-usable size in cells, believed the probe had succeeded, and left the cell pixel
-size at its initialised `0` — one division later, the child panicked. The panic
-is in the child, but the missing reply is ours: **a terminal that answers half of
-a compound query is worse than one that answers none**, because the half it
-answers is what convinces the caller it has everything.
+The rules the store follows:
 
-Fixes, in the order that matters:
+- **A terminator can be split.** `ESC` at the end of one read and `\` at the start
+  of the next is the normal case for an image on a pty; a lone `ESC` is held back
+  rather than treated as payload.
+- **A transmission is not an image.** Kitty senders chunk payloads (`m=1`…`m=0`), so
+  a 100 KiB PNG arrives as ~25 sequences. Chunks are joined into one entry anchored
+  where the first arrived, or storing each fragment would both break the image and
+  evict its own beginning.
+- **Two image lifetimes.** Kitty images live in the terminal's own layer: painting
+  text over them does not erase them, so a still frame costs nothing — but they must
+  be deleted (`a=d,d=A`) when the float hides or they stay stuck over the owner's
+  screen. sixel and iTerm2 draw into the text plane, so any repaint of their rows
+  erases them and they must be blitted again. Emission is exactly those three
+  triggers: **new**, **moved**, **erased**.
 
-| # | Change |
-|---|---|
-| 1 | `CSI 16 t` is answered — the cell size in pixels, `CSI 6 ; <height> ; <width> t`. This is the one that stops the panic. |
-| 2 | `CSI 14 t` / `15 t` (text area / screen in pixels) and `CSI 19 t` (screen in cells) are answered too, all derived from the same pair of numbers, so a tool that cross-checks them gets a consistent story. |
-| 3 | The cell size is **measured** at startup instead of assumed: `caps::probe_cell_px()` reads the host tty's `TIOCGWINSZ` (via `crossterm::terminal::window_size()`, which is what `wezterm imgcat`'s own producer reports) and divides pixels by cells. `UNCL_CELL_PX=WxH` still overrides, and `DEFAULT_CELL_PX` (10x20) is the last resort. One `ioctl`, no protocol round-trip, no blocking read. |
-| 4 | `--doctor` says where the number came from: `cell size: 10x20 px (measured)`, so a wrong image size is one command away from being explained. |
+Emission happens *after* the grid, because any text painted over a pixel-based image
+destroys it. Nothing is ever decoded, scaled or re-encoded: the child's bytes are
+carried through and re-emitted, so what you get is whatever your terminal can draw.
+An image too large for the float is scaled down by the terminal itself (the request
+is edited, not the payload); sixel has no way to ask for a size, so an oversized
+sixel is skipped once with a note. Kitty images are re-placed by id on a move, which
+is one line rather than a payload.
 
-Three invariants are now tests, because "some number" is not the requirement:
+---
 
-* no window report may contain a zero in any field (`no_window_report_is_ever_zero`);
-* cells × cell size == the pixel report for the same area
-  (`window_reports_are_internally_consistent`);
-* a cell-size spec is either usable or ignored — `0x20` is *not* a cell size
-  (`a_cell_size_spec_is_either_usable_or_ignored`).
+## Hyperlinks
 
-**One more bug fell out of the first `cargo test` run** — and it is worth writing
-down, because the test that caught it was written from the wrong idea of the
-format. `a_sixel_too_large_for_the_float_is_skipped` failed: a 1000x1000 sixel
-inside an 80x24 float was stored instead of skipped. The cause was in
-`raster_attributes`: real sixel writes `"1;1;640;480#0;2;0;0;0`, where the
-fourth number runs *straight into* the first `#` colour command with no `;`
-between them. Splitting on `;` glued `480#0` together, `parse_u32` rejected it,
-the height was lost, the footprint came back `Unknown`, and an unsized image was
-always assumed to fit. So the "too large" test was passing for the wrong reason
-on a fixture I had written in the same wrong shape. The parser now reads four
-numbers and stops at the first non-digit, a `sixel_raster_attributes_end_at_the_first_command`
-test pins the real header shape, and the fixture was corrected — which is the
-only way a fix like this stays fixed.
+`OSC 8` is a property of a run of cells, not an event, and the emitter paints rows by
+re-encoding cells. So a link has to be re-established around the run at paint time,
+inside a row `vt100` handed over as one string.
 
-The general lesson, worth carrying into S4: **every query we answer creates an
-obligation to answer its siblings.** The reply table in `callbacks.rs` is a
-contract with every terminal application in existence, and the failure mode of a
-partial table is not "the app degrades", it is "the app trusts the half-answer and
-divides by zero". §6.5's fidelity table should eventually be read the same way: a
-capability we claim is a promise about the ones next to it.
+`vt100` does not model hyperlinks at all, so the span is recorded where the cursor
+still knows it: `Callbacks::unhandled_osc`, at open *and* at close. The store keeps
+`(row, start, end, params, target, text)`; the text it covered is re-checked when the
+row is painted, so a link whose cells have since changed is simply not drawn — a
+clickable region over the wrong words is worse than none.
 
-### S3.2 — the image drew *at* the float instead of *inside* it
+The row is emitted in **column-ranged segments** (`rows_formatted(start, len)`),
+with `OSC 8` between them. Splicing into `vt100`'s encoded row at a byte offset is
+not honestly computable: the string contains SGR runs, wide characters occupy two
+cells, and combining marks attach to the preceding cell. Asking by column range
+leaves wide-character handling, styles and wide-cell skipping to `vt100`.
 
-The second thing the first real image found. `wezterm imgcat uncl.png` inside the
-float no longer panicked (S3.1), and the picture appeared — at its native pixel
-size, drawn from the prompt cell **over the border, over the owner's screen**, a
-600px image inside a 78-column window:
-
-```
-┌─ float ────────────────────────┐
-│ ▲ ~ wezterm imgcat uncl.png    │
-│ ┌─────────────────────────┐    │   <- the image, native size,
-│ │                         │    │      ignoring the border entirely
-└─┼─────────────────────────┼────┘
-  └─────────────────────────┘
-```
-
-Nothing was *broken* — we had simply never told the terminal how big to make the
-image, so it made the only choice it could. This is the same shape of bug as S3.1:
-**a child asks for geometry, and we answer by staying silent.**
-
-The fix has one rule — *the terminal does the scaling; we only state the box* —
-because the alternative (decode, resample, re-encode) is exactly what §6.4 ruled
+Known limits, each a deliberate trade: **one row per link** (a wrapped link is
+dropped, because `vt100` does not report where the grid wrapped); **a link does not
+dirty its row** (links are not part of a cell, so rows carrying one are repainted in
+full — more bytes on those rows, nothing on the rest); **64 spans per pane**, oldest
 out.
 
-| Protocol | How it is asked to fit | What it costs |
-|---|---|---|
-| kitty | `c=`/`r=` rewritten to the fitted cell box (`C=` dropped so the terminal preserves the aspect ratio) | one line; the payload is untouched |
-| iTerm2 inline | `width=<W>px;height=<H>px;preserveAspectRatio=1` | one line; the payload is untouched |
-| sixel | nothing — draw or skip, as before | — |
-
-The box is *everything from the anchor cell to the float's bottom-right corner*,
-which S1's geometry law makes the child's own grid, so a child drawing at its own
-origin lands inside the float by construction.
-
-**The one decode.** The iTerm2 sequence does not carry the image's own size:
-`wezterm imgcat` sends `File=inline=1:…` and nothing else. So the payload's header
-is read — signature check plus two integers for PNG, two more for GIF, a marker
-walk for JPEG (`image_pixels`). It decodes at most 6 KiB of the base64 and never
-the pixels; a format it does not recognise is left at native size rather than
-guessed at. This is the only place in uncl that looks inside an image, and it
-exists purely to answer "how much space does this want?".
-
-Deliberate limits, all tested:
-
-* **down, never up.** An image smaller than the box is sent byte-for-byte
-  unchanged (`an_image_that_fits_is_sent_exactly_as_it_arrived`); upscaling would
-  be a quality lie, and it costs bytes on every frame.
-* **aspect ratio is preserved by construction**, and the sender's own `C=1` /
-  `preserveAspectRatio=0` is dropped when we resize — an image squashed to fit is
-  not a fix.
-* **sixel stays draw-or-skip**, because there is no "please scale" in DCS.
-* **chunked kitty transmissions are drawn as asked**, because a sequence split
-  over twenty-five APCs cannot be rewritten as one (`Placement::Native`).
-* a move still costs one line: the fitted `a=p` replay is `_Ga=p,i=…,c=…,r=…`
-  with no payload (`a_fitted_kitty_move_is_still_one_line`).
+Children see `FORCE_HYPERLINK=1`, which is the convention programs check before
+emitting links at all. That follows the same rule as every capability uncl
+advertises: *advertise only what you carry, but do carry what you advertise.*
 
 ---
 
-## Appendix G — S3.5 implementation log (2026-10-27): `OSC 8` hyperlinks
+## Clicks and scrollback
 
-A child that prints `ls --hyperlink` gets its words through the float today, and
-its links through nothing at all. §6 called this "1 day, ~+60 LOC, or free with
-S4". It came in at ~430 lines because the honest version needs the encoder, not
-just the tap.
+**uncl resolves the click itself.** While the float is up uncl holds the mouse
+(`?1000h`), because it has to: that is how the float is draggable, how a click
+outside hides it, and how the wheel can reach uncl's scrollback at all. The
+consequence is that the *host* terminal never sees the click, so a hyperlink in the
+float could never be opened by the emulator — it has no idea the click happened.
 
-### Why the tap alone cannot do it
+So uncl opens it: a press and a release on the same cell of a live span, in the
+float or in the owner pane, only after the child declined the event. A press that
+begins a drag or a resize clears the pending press, motion clears it, and a click
+while the view is scrolled back resolves nothing (spans live in live-grid
+coordinates). `OSC 8` is still painted, so cmd-click in the host keeps working where
+the host does see it.
 
-Every other out-of-band sequence S3 handles can be lifted out of the byte stream
-and put back verbatim: an image is a rectangle at a cell. A hyperlink is a
-*property of a run of cells*, and S2 paints rows by re-encoding cells — so the
-sequence has to be re-established around the run, at paint time, in the middle of
-a row that `vt100` handed us as one string.
+**Opening a URL is a security decision.** A child's output is untrusted, and every
+word it prints becomes clickable. `allowed_url` accepts only `http`, `https`,
+`mailto`, `file` and `ftp`; no control characters or whitespace (the classic way to
+smuggle an argument past an opener), no non-UTF-8, nothing over 2,048 bytes. The
+opener is the platform's own — `open`, `cmd /C start ""`, `xdg-open` — spawned and
+reaped on a thread, so a click never leaves a zombie and never waits for a browser.
 
-`vt100` does not model hyperlinks at all (`Cell` is contents + attrs), so:
+**Scrollback applies to the view, never to the parser.** `draw()` clones each pane's
+screen and calls `set_scrollback(n)` on the *clone*:
 
-| Question | Where it is answered |
-|---|---|
-| where does the link start and end? | `Callbacks::unhandled_osc` — the only place where the cursor still knows, at open *and* at close |
-| which cells does it still belong to? | the stored span plus the text it covered, re-checked at paint time |
-| how are the cells painted with a link around them? | the row is emitted in column-ranged segments, `OSC 8` between them |
+- a scroll offset is a property of the view. Scrolling the parser would move the
+  child's cursor out from under it and change what the next frame's diff means.
+- the renderer diffs view against view, so a scrolled snapshot is just another screen
+  to it.
+- `set_scrollback` clamps, and the clamped value is read back, so an over-scrolled
+  offset heals itself when the pane shrinks.
 
-### The pieces
+Everything else follows from that law: typing returns the view to live **and still
+delivers the key**; the cursor is hidden while the focused pane is scrolled (its
+cursor sits on a line that is not on screen); images are suppressed while scrolled,
+because they anchor to live cells and live in a layer the text repaint cannot reach;
+a link under the pointer resolves nothing; hiding the float resets its offset.
 
-| # | Change | File |
-|---|---|---|
-| 1 | `Link` / `Links`: spans per row, the `OSC 8` splitter (a URI may contain `;`, which `vte` splits on), open/close tracking, staleness check, `MAX_LINKS = 64` | `src/app/term/links.rs` (new, 8 tests) |
-| 2 | `unhandled_osc` records `OSC 8` into the pane's `ChildState` and returns early, so a hyperlink is never mistaken for a query and answered | `src/app/term/callbacks.rs` (+3 tests) |
-| 3 | `new_parser` hands back the `ChildState`, so the UI can read both panes' links (the float's dies with its child: it is recreated with the parser) | `src/app/lease.rs`, `src/app/ui/owner.rs` |
-| 4 | `FrameLinks` in `Panes`; linked rows are painted **whole** (a diff is a sparse set of cells and has no span to wrap); `emit_row_segments` wraps each span in `OSC 8` … `OSC 8 ;;` | `src/app/render/mod.rs` (+5 tests) |
-| 5 | `FORCE_HYPERLINK=1` for children — the convention tools check — and a `--doctor` line | `src/app/term/caps.rs` |
+Capacity is inherited from the launching environment: `UNCL_SCROLLBACK` (default
+2,000, `0` disables), read once per parser. One wheel notch is
+`SCROLL_STEP` lines; `Ctrl+Alt` chords scroll without a mouse.
 
-### Why segments, not byte offsets
-
-The obvious implementation is to splice `OSC 8` into `vt100`'s encoded row at the
-right byte offset. There is no honest way to compute that offset: the string
-contains SGR runs, wide characters occupy two cells, and combining marks attach to
-the preceding cell. Instead each piece is asked for **by column range** —
-`rows_formatted(start, len)` — which is the same call the float already uses to
-repair the owner's tail. Wide characters, styles and wide-cell skipping stay
-`vt100`'s problem, exactly as before.
-
-### Compromises (the cheap tier's contract)
-
-- **One row per link.** A link the child wraps across a line break is dropped: the
-  span would have to be split, and `vt100` does not report where the grid wrapped.
-  (S4 gets this for free.)
-- **A link does not dirty its row.** Links are not part of a cell, so a cell diff
-  cannot see one appear. Rows that carry a link are therefore repainted in full —
-  for the float in `plan_float`, for the owner by merging the linked rows into
-  `owner_rows`. That is more bytes than a diff, on rows that have links, and
-  nothing at all on rows that do not.
-- **Stale spans are not drawn.** The covered text is stored with the span and
-  re-checked when the row is painted; if the cells no longer say the same thing,
-  the link is dead. A clickable region over the wrong words is worse than none.
-- **Bounded**: 64 spans per pane, oldest first out.
-- **Not a link click handler.** uncl emits the sequence; the *host* terminal does
-  the opening (with whatever modifier it requires). That is the correct division,
-  and it means nothing here can open a URL by accident. *This turned out to be
-  wrong in the only case that matters — uncl holds the mouse while the float is
-  up, so the host never sees the click. See Appendix H.*
-
-### What this buys beyond the taste of it
-
-`FORCE_HYPERLINK=1` is the whole reason a user will see this at all: without it,
-most programs decide "no hyperlinks" and print plain text. Since S3.5 makes the
-claim true, the environment now says so — the same rule as DA1 and sixel, in the
-other direction: *advertise only what you carry, but do carry what you advertise.*
-
-### Verification status
-
-- **141 tests** (was 125: +8 links, +3 callbacks, +5 renderer).
-- Every file parses with `tree-sitter-rust`; still **no Rust toolchain here**, so
-  this has not been compiled. The `vte` behaviour relied on (`osc_dispatch` →
-  `unhandled_osc`, params split on `;`) was read from the vendored sources, and
-  `rows_formatted(start, width)`'s "pane-local, forward-only moves within a
-  sub-range" was checked against `row.rs::write_contents_formatted` and
-  `term.rs::MoveFromTo` (forward moves are `CSI n C`, which is relative, so the
-  segment's `CUP` is enough).
-
-### Acceptance script (S3.5 exit criteria)
-
-```sh
-cargo test                                        # 141
-cargo build --release && ./target/release/uncl
-
-# 1. an explicit link: cmd-click (or ctrl-click) it in the float.
-printf '\e]8;;https://example.com\e\\example.com\e]8;;\e\\\n'
-
-# 2. a real one, from a real program:
-ls --hyperlink=always --color=always
-
-# 3. `uncl --doctor` now prints "hyperlinks: OSC 8 carried inside the float;
-#    FORCE_HYPERLINK=1 for children", and a child can check it:
-printf '%s\n' "$FORCE_HYPERLINK"
-
-# 4. drag the float: the link follows its cells and is still clickable.
-# 5. Home twice: the link comes and goes with the float. Nothing sticks to the
-#    owner's screen (links are part of the row, so they are repainted with it).
-# 6. repaint over the linked words (`ls` again with different output): the link
-#    must be gone, not attached to whatever is there now.
-```
-
-### Where the plan stands
-
-S0 → S3.5 are in the tree: fast, correct, self-owned emitter, images, links.
-S4 (`alacritty_terminal`) would replace the span bookkeeping with the engine's own
-hyperlinks — plus underline colours, kitty keyboard input and sync output — but
-it is an engine swap and the current behaviour is right for the single-line case
-that covers virtually every real link. The Windows delta (§6.6) is the other
-untouched item.
-
-### Where S3 leaves the plan
-
-S0–S3 of §6 are now in the tree: fast, correct, self-owned emitter, images. What is
-left is the tail the report already marked optional — `OSC 8` hyperlinks (S3.5),
-the `alacritty_terminal` engine swap (S4), and the Windows delta (§6.6) — plus the
-one open S2 item (the golden-frame corpus). Images are the last thing that was
-*broken* rather than merely missing.
-
-## Appendix H — S3.6 implementation log (2026-10-27): clickable links in both panes, scrollback in both panes
-
-Two reports, one of them a bug that S3.5 shipped with a plausible-looking frame:
-
-1. *a link in the owner pane opens in the browser when clicked; the same link in
-   the float does nothing.*
-2. *both panes need scrollback, inherited from the environment uncl is launched
-   in.*
-
-### Why the float's link did nothing
-
-Not a rendering bug, and not a `vt100` limitation. S3.5 emits `OSC 8` around the
-float's cells correctly — a hyperlink-aware host would draw it as a link. The
-sequence is never *acted on* because uncl has taken the mouse:
-
-```
-ui::owner::sync_host_mouse()  ->  HostMouse::at_least_press()
-                              ->  CSI ? 1000 h  (and ? 1006 h)
-```
-
-That is deliberate and stays: with reporting off, uncl could not drag the float,
-could not hide it on a click outside, and could not see the button at all. The
-consequence is that **the host terminal never sees the click**, so the only entity
-in the system that could resolve the link — the emulator — is the one entity that
-is never told about it. The owner pane *used to* work precisely because uncl gave
-the mouse back to it (`HostMouse::Off` when the background shell asked for
-nothing), and the host then did what it always does.
-
-So the click had to be interpreted inside uncl. That is the whole of "the float's
-links are clickable": `OSC 8` is still painted (cmd-click in the host keeps working
-as a bonus where the host does see it), and uncl additionally opens the target
-itself when a press and a release land on the same cell of a live span.
-
-The same reasoning then applies to the **owner** pane, which is why the fix is not
-float-only. The owner's links worked *because* uncl handed the mouse back to it; as
-soon as the grab became unconditional (it has to be, or the wheel can never reach
-uncl's scrollback — see below), the host stopped seeing those clicks too. So
-`forward_owner_mouse` resolves links in exactly the same way after the background
-child declines the event. Nothing about the owner pane's behaviour changes from the
-user's side; only the entity doing the opening does.
-
-### Why scrollback was invisible
-
-`lease::new_parser` constructed both parsers with `0` scrollback lines, so
-`Screen::scrollback_len()` was always `0` and there was nothing to scroll to. It
-was not a rendering problem either; the history did not exist.
-
-### The pieces
-
-| # | Change | File |
-|---|---|---|
-| 1 | `DEFAULT_SCROLLBACK = 2_000`, `SCROLL_STEP = 3`, `scrollback_lines()` reading `UNCL_SCROLLBACK` from the launching environment, and a private `parse_scrollback()` so the parsing is testable without touching the process environment | `src/constants.rs` (+2 tests) |
-| 2 | `new_parser` passes `scrollback_lines()` instead of `0` — both panes, same capacity | `src/app/lease.rs` |
-| 3 | `Container` gains `owner_scroll`, `tenant_scroll` and `link_press: Option<LinkPress>` (which pane, which cell); `scroll/scrollback_len/reset_scroll/link_click/link_target`; the click path in both routes and `open_url()` | `src/app/ui/owner.rs` |
-| 4 | `Wheel::{Up, Down}` and `from_kind()` — the wheel is a *decision* only after the child declined it | `src/app/input/mouse.rs` (+1 test) |
-| 5 | `Panes` gains `scroll` and `focused_scrolled`; the border repaints when the offset changes; `emit_title` prints ` +N`; the cursor is hidden while the focused pane is scrolled; a missing image store now clears the host's image layer and marks the payloads forgotten | `src/app/render/mod.rs` (+4 tests) |
-| 6 | `Link::target()` (now genuinely called) and `allowed_url()` — the scheme allowlist a click has to pass | `src/app/term/links.rs` (+2 tests) |
-
-### The scrollback law: apply it to the view, not the parser
-
-`Screen::set_scrollback(n)` is applied to the **cloned snapshot** in `draw()`,
-never to the parser:
-
-- a scroll offset is a property of the *view*. The parser is the child's screen;
-  scrolling it would move the child's cursor out from under it and change what
-  `rows_formatted` means for the next frame's diff.
-- the renderer diffs view against view, so a scrolled snapshot is just another
-  screen to it. Nothing in the encoder knows or cares that the rows came from the
-  scrollback.
-- `set_scrollback` **clamps**, and the clamped value is read back
-  (`owner.scrollback()`) into the field. That is how an over-scrolled offset heals
-  itself after the pane shrinks, without a second source of truth.
-
-Consequences that follow from the law, and not from a special case:
-
-| Situation | Behaviour | Why |
-|---|---|---|
-| typing while scrolled back | view snaps to live, the key is still delivered | every terminal does this; the key is a command, not a scroll |
-| the focused pane is scrolled back | the cursor is hidden | the child's cursor sits on a line that is not on screen; painting it would point at the wrong cell |
-| the float is scrolled back | the renderer is handed no image store, so it deletes the host's image layer and marks the payloads forgotten; returning to live re-sends them | an image is anchored to a cell of the *live* grid and lives in a layer the text repaint cannot reach, so history would be painted *underneath* it |
-| a link under the pointer while scrolled | no click is resolved | spans live in the live grid's coordinates; every visible row is some other row's text |
-| the float is hidden (`Home`) | its offset resets to live | it must not come back showing history nobody asked for |
-| the child asks for `?1000`/`?1002`/`?1003` | the wheel goes to the child, not to uncl | precedence, below |
-
-The float's bottom border shows `s:H:W +N` while it is scrolled back, and the
-border is force-repainted when the offset changes — an offset the user cannot see
-is an offset they cannot trust. The owner pane has no border to write on; there the
-hidden cursor is the only signal, and any key ends it.
-
-### Precedence: the child is always asked first
-
-`encode_mouse()` returning `None` is the signal that the event is uncl's. The law
-is unchanged from S1, only extended:
-
-```
-geometry (Alt / border)  >  child mouse reporting  >  uncl (wheel, link, click-away)
-```
-
-- a wheel over the float's grid: encoded for the child when it wants the mouse
-  (`less`, `btop`, any TUI scrolls itself); otherwise `scroll()` on the float.
-- a wheel over the owner pane, or with the float hidden: the same test against the
-  owner's modes; otherwise `scroll()` on the owner.
-- a press and release on the same cell of a live span, with the child declined: a
-  link click — in the float, or in the owner pane when the float is hidden. A press
-  that begins a drag or a resize clears `link_press`, and motion clears it. A drag
-  is never a click, however far the pointer travelled, and a click while the view is
-  scrolled back is not a click on a link (spans are in live coordinates).
-- click-away, `Alt`+drag, `Alt`+arrows and border resizes are unchanged.
-
-Because the wheel now has to reach uncl in *either* pane, the host mouse grab is
-`at_least_press()` **always**, not only while the float is up. That is what makes
-`forward_owner_mouse` responsible for the owner's hyperlinks as well as its wheel.
-The trade-off is explicit: your emulator's own scrollback and click-drag selection
-are unavailable inside uncl, because uncl provides both. `Shift`+drag still selects
-in most emulators (they intercept it locally), and the keyboard chords below exist
-for the cases where the host swallows the wheel.
-
-Keyboard scrollback, for terminals without a wheel and for wheels a host eats:
-`Ctrl+Alt+Up/Down` scroll a notch, `Ctrl+Alt+PageUp/PageDown` a screenful, on
-whichever pane owns the keyboard.
-
-### Opening a URL is a security decision
-
-A child's output is untrusted input, and every word it prints becomes clickable. A
-terminal that resolves `OSC 8` has the same problem and solves it the same way:
-**the scheme decides**.
-
-`allowed_url()` accepts `http`, `https`, `mailto`, `file` and `ftp` — nothing else
-(`javascript:`, `data:`, `vscode:`, a bare path), no control characters or
-whitespace (the classic way to smuggle an argument past an opener), no non-UTF-8,
-nothing over 2,048 bytes, and no empty target. The opener is the platform's own:
-`open` / `cmd /C start ""` / `xdg-open`, spawned and reaped on a thread of its own,
-so a click never leaves a zombie and never waits for a browser. A failure is an
-`eprintln`, not a crash.
-
-### The cost of scrollback, stated plainly
-
-`vt100`'s `Cell` is 32 bytes by construction, and a `Screen` clone is a deep copy
-of every row it holds — visible rows *and* scrollback. `draw()` clones one screen
-per pane per painted frame (the previous copy is moved into the renderer as `prev`,
-so it is one copy, not two):
+That capacity has a cost worth stating plainly: a `Screen` clone is a deep copy of
+every row it holds, including scrollback (32 bytes per cell).
 
 | Width | 2,000 lines of scrollback | one clone |
 |---|---|---|
 | 80 columns | 160,000 cells | 5.1 MB |
 | 200 columns | 400,000 cells | 12.8 MB |
 
-Frames are only painted when something changed and are capped at ~120 Hz
-(`FRAME_MIN_INTERVAL`), so an idle prompt costs nothing. A sustained flood at 200
-columns does pay for it: ~1.5 GB/s of `memcpy` plus 2,000 allocations per frame,
-which is measurable and is the honest reason `UNCL_SCROLLBACK` exists in both
-directions. `UNCL_SCROLLBACK=500` is the setting for a wide terminal that scrolls
-endlessly; the S4 engine swap replaces `Screen`-against-`Screen` diffing with
-stored painted rows, which is what removes the copy rather than shrinking it.
+An idle prompt costs nothing because nothing is painted; a sustained flood at 200
+columns pays ~1.5 GB/s of `memcpy` plus 2,000 allocations per frame, which is why
+`UNCL_SCROLLBACK` exists in both directions. A stored-painted-rows renderer would
+remove the copy rather than shrink it; that is one of the reasons to consider the
+engine swap listed at the end.
 
-### Verification status
+---
 
-- **150 tests** (was 141: +2 constants, +1 `Wheel`, +4 renderer, +2 links).
-- Still **no Rust toolchain here**: every file parses with `tree-sitter-rust`, and
-  the `vt100` behaviour relied on was read from the sources —
-  `Screen::set_scrollback` clamps, `scrollback()` returns the clamped offset,
-  `visible_rows()` starts at `scrollback.rows.len() - offset` (so a scrolled frame
-  walks only the visible window, not 0..N), `contents()` is built from
-  `visible_rows()` (which is what the test asserts on), and `Screen: Clone` is a
-  deep copy of `Grid` (a `Vec<Row>`, no `Rc`), so scrolling a snapshot cannot
-  disturb the parser.
+## Answering the child's questions
 
-### Acceptance script (S3.6 exit criteria)
+A child cannot talk to the real terminal — it talks to uncl, which therefore has to
+answer everything a terminal would. `src/app/term/caps.rs` builds one capability
+record at startup and answers from it; `src/app/term/callbacks.rs` answers through
+`vt100`'s callbacks; `src/app/term/dcs.rs` answers the family `vt100` has no hook
+for at all.
+
+| The child asks | Answered by | Notes |
+|---|---|---|
+| `CSI c` / `CSI > c` | `caps::da1`/`da2` | sixel attribute only when the tap will carry it |
+| `CSI 6n`, `CSI ?6n` | `callbacks` | 1-based, from the live screen |
+| `CSI 14/15/16/18/19 t` | `callbacks` | consistent pixel and cell numbers; never zero |
+| `OSC 10/11/4 ; ?` | `callbacks` | xterm defaults, so callers stop hanging |
+| `DCS $ q` (DECRQSS) | `dcs` | real pen (`SGR`), real cursor shape; everything else refused, not guessed |
+| `DCS + q` (XTGETTCAP) | `dcs` | `TN`, `Co`, `RGB` when truecolor is real; `Smulx` refused |
+| `?1004` focus reporting | `callbacks` | tracked, because the parser does not model it |
+| kitty `a=q` | the image tap | answered from the child's own pty |
+
+The general rule, learned twice: **`vt100`'s `Callbacks` trait is a list of things
+the engine refuses to be responsible for**, and every unimplemented method on it is
+a sequence a child sends and uncl silently drops. That is what `DECRQSS`,
+`XTGETTCAP`, the bell and the window title all were.
+
+Two of those answers are derived from state the engine already tracks rather than
+from convention: `DECRQSS` reports the pen the child actually set, and a setting this
+engine does not track is answered *invalid* (`DCS 0 $ r …`), which is legal and tells
+the caller to stop asking. A wrong number would be believed.
+
+**`TERM` is passed through, carefully.** The host's terminal family reaches children,
+because the tap and `OSC 8` make that claim true. Three families are downgraded to
+`xterm-256color`: `screen*`/`tmux*` (a multiplexer's own dialect, which uncl does not
+speak), `xterm-kitty` (that `TERM` is what makes applications enable the kitty
+*keyboard* protocol, which the encoder does not implement — its graphics half is
+advertised separately), and consoles. `uncl --doctor` prints both the host's `TERM`
+and the child's, with the reason when they differ.
+
+**The bell** is forwarded to the host, but only from the pane that owns the keyboard:
+a hidden float that is still parsing must not interrupt what you are doing in the
+shell behind it.
+
+**The title** (`OSC 0/2`) is recorded per pane, sanitised (control characters
+stripped, bounded), and drawn in the float's top border. A rename forces a border
+repaint, because a title that never appears is worse than none.
+
+---
+
+## The clipboard
+
+`OSC 52` copies are relayed to the real terminal — that request is not about the
+child's terminal, it is for the one the user is looking at. Reads are answered in two
+tiers:
+
+1. **what a child copied in this session** — `vim`'s `"+y` then `"+p` costs nothing
+   and never leaves the process;
+2. **the desktop's clipboard**, through `wl-paste`, `xclip`, `xsel`, `pbpaste` or
+   PowerShell's `Get-Clipboard`.
+
+The host terminal is deliberately not asked: its reply arrives as *input*, and
+input belongs to crossterm's event parser, which would drop or misparse an `OSC 52`
+reply. Reading the desktop directly gets the same clipboard without taking over
+stdin.
+
+The read runs on its own thread — it happens inside the callback that runs on the
+reader feeding the parser, and a blocked reader is a frozen pane — one at a time,
+bounded at 1 MiB (base64 makes that ~1.4 MiB of pty traffic, and anything bigger is
+almost certainly a copied file). An empty clipboard is still an answer from the
+program that owned the selection; with no helper installed the request stays
+unanswered, which is what a child's timeout is for. Selectors `c`, `p` and `s` are
+served; cut buffers and compound selectors are refused before anything is spawned.
+
+---
+
+## Windows and Docker
+
+Docker needs nothing architectural: `portable-pty` opens a normal pty, `TERM` and
+`COLORTERM` propagate, and the shell comes from `SHELL`.
+
+Windows is guarded rather than ported:
+
+- **Output needs one check.** uncl writes raw ANSI, so `crossterm::ansi_support::
+  supports_ansi()` runs at startup — it enables
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` and reports whether the console can honour a
+  frame at all. A legacy console gets one sentence instead of an alternate screen
+  full of raw escapes.
+- **Images are off, in the capability record rather than in a comment.** The child
+  sits under uncl's own ConPTY, and ConPTY v1 parses the child's VT into a text
+  buffer, swallows `DCS`, and answers `DA1` itself *without* the sixel attribute — so
+  a child never asks, and anything forwarded would be destroyed one layer down.
+  Advertising it would be a lie of exactly the kind the capability record exists to
+  prevent. ConPTY v2 forwards bytes and would make this possible, but shipping it
+  means bundling `conpty.dll`.
+- **Input is the same encoder.** crossterm's Windows backend produces the same
+  semantic events, and `encode_key`/`encode_mouse` already turn semantic events into
+  VT sequences, so Windows needs no separate pipeline — only validation on real
+  hardware.
+
+---
+
+## Knowing it works
+
+Two layers of testing, and one of them is unusual.
+
+**Unit tests** cover the pieces that can be asserted directly: geometry, routing,
+encoders, the splitter, the image store, the link spans, the DCS table, the
+clipboard's pure half, and the renderer's byte-level properties (CUP targets, `EL`
+repair ordering, diff-versus-full, cursor placement). The suite is 178 tests.
+
+**The golden-frame harness** (`src/app/render/golden.rs`) covers the claim the pieces
+exist to support: that a frame uncl writes, replayed into a real terminal, leaves the
+terminal showing what the child drew. One stream, two engines, one assertion:
+
+1. feed a recorded byte stream to a `vt100` parser (the source screen);
+2. render it through uncl's emitter into bytes (the frame);
+3. feed *the frame* to a second, fresh `vt100` (the replayed screen);
+4. require every cell — contents **and** attributes — plus cursor visibility to
+   match.
+
+There are no golden files to re-bless: the expectation is the source screen, so the
+corpus can grow without anyone blessing new output. Fifteen recorded streams cover
+plain text, 16/256/truecolor SGR, inverse bars, wide CJK, combining marks,
+erase/delete/insert, cursor moves, autowrap off, carriage-return progress
+overwrites, tabs and backspace, `REP`, an alternate-screen round trip, an `OSC 8`
+span, and a hidden cursor with a `DECSCUSR` style. Three further tests cover what a
+frame does *besides* paint cells:
+
+- **a float over the owner's grid** — cells inside the content rect must be the
+  float's, and every cell outside it must still be the owner's (this is the only
+  end-to-end test of `repair_tail`);
+- **a linked row** — `OSC 8` is emitted between column-ranged segments, and a segment
+  computed wrongly shifts the row while every string-level assertion still passes;
+- **an image** — a payload placed in the float must not disturb a single cell of
+  either pane.
+
+Plus the diff path (a corpus grown one frame at a time against a terminal that has
+already seen the previous frames) and a resize.
+
+The harness earned its keep on its first run, by finding two wrong *assertions*:
+
+- **A hidden cursor has no position.** `place_cursor` refuses to move a cursor the
+  child hid — there is nothing to see — and painting clears the remembered position,
+  so the frame that shows it again is forced to `CUP` to the right cell. Comparing
+  positions unconditionally was asserting something no user can perceive.
+- **`invalidate()` is what makes a resize a repaint.** A resize whose surviving cells
+  are all cells that were already painted produces an empty diff. That is correct and
+  useless on its own: what actually moves is the float's **border**, which lives in
+  cells whose contents may not change at all, and a cell diff cannot see a border.
+  One test now pins the distinction — empty without the invalidation, a full repaint
+  with it.
+
+---
+
+## Reference: candidate engines
+
+| Engine | Licence | Size | Text+SGR | Underline colour/styles | `OSC 8` | Modes + input state | DCS (sixel) | APC (kitty) | `→ ANSI` encoder |
+|---|---|---|---|---|---|---|---|---|---|
+| `vt100 0.18.1` **in use** | MIT | 5.1k LOC, 2 deps | ✅ | ❌ | ❌ | ✅ mouse/CKM/keypad/paste/cursor, ❌ focus | ❌ | ❌ | **✅ `rows_diff`, `rows_formatted`** |
+| `alacritty_terminal 0.26` | Apache-2.0 | 11.7k LOC, heavy deps | ✅ | ✅ | ✅ | ✅ incl. kitty keyboard + `EventListener` | ❌ | ❌ | ❌ (you write it) |
+| `wezterm-term 0.1.0` | MIT | very large git subgraph | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `vte 0.15` | Apache-2.0 OR MIT | 4.1k LOC | — | — | — | — | ✅ raw `hook/put/unhook` | ❌ (`SOS/PM/APC` discarded) | — |
+| `zellij-server` panes | MIT | ~16k LOC | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ansi-to-tui`, `ansi-parser` | MIT | small | parses rendered text, not a terminal | — | — | — | — | — | ❌ |
+
+Two facts from that table drove the design: **nothing vendorable gives you a state →
+ANSI encoder except `vt100`**, and **`APC` is unreachable through `vte`**, which is
+why the graphics tap is a byte scanner of uncl's own rather than a parser hook.
+
+---
+
+## Not yet done
+
+Two items, both optional by decision rather than by omission.
+
+### The engine swap (`alacritty_terminal`)
+
+`vt100` models text, SGR, cursor and input modes, and nothing else. Everything it
+does not model, uncl works around — with a link store, a DCS answerer, a graphics
+tap, and a scrollback-sized clone per frame. `alacritty_terminal` would replace those
+workarounds with the engine's own state:
+
+| Gap today | What would close it |
+|---|---|
+| Underline **styles and colours** (`SGR 4:x`, `58`/`59`) are dropped | `CellFlags` / `Color` |
+| **Kitty keyboard** (`CSI > u`) is neither advertised nor encoded — `TERM=xterm-kitty` is therefore downgraded | `TermMode` + `KittyKeyboardFlags` |
+| **Synchronised output** (`?2026`) is not honoured: uncl paints when it decides | `TermMode::SYNC_UPDATE` + `EventListener` |
+| Hyperlink spans are **one row**, and die on repaint rather than living on the cell | the engine's own hyperlink storage |
+| Pointer shape (`OSC 22`) and the rest of `EventListener` are hand-rolled or absent | `EventListener` |
+| A **`Screen` clone carries the scrollback** every painted frame (~5–13 MB at 2,000 lines) | storing painted rows instead of diffing screens |
+
+It is an engine swap, not a feature: it needs its own encoder (which uncl already
+has), and it should not be attempted without the golden-frame corpus in place to
+catch the cells it moves. The corpus is now in place, which is what makes the swap
+safe to start whenever it is wanted.
+
+### The Windows encoder matrix
+
+The guards are in and `cfg`-gated, so they cannot affect a non-Windows build. What
+has not been done is the part that needs hardware: validating the encoder matrix
+(application cursor, SGR versus X10 mouse, ConPTY's own input quirks) on a real
+console. Until then Windows is "builds and refuses gracefully", not "supported".
+
+### Out of scope by design
+
+Three things are deliberately *not* on the list above, and will not be done:
+
+- **Passthrough takeover** (giving the child the real screen instead of compositing).
+  Floating while a TUI runs is the product; takeover is the one thing that cannot be
+  reconciled with it.
+- **Re-encoding images** — decode, scale or crop in uncl. The bytes are carried
+  through and the terminal does the scaling; that is the whole quality contract.
+- **Images on Windows** — see above: they need a bundled ConPTY v2.
+
+---
+
+## Verifying by hand
+
+The unit tests and the harness cover what can be asserted without a terminal. These
+are the behaviours that need a person looking at a screen:
 
 ```sh
-cargo test                                        # 150
-cargo build --release && ./target/release/uncl
-
-# 1. a link in the float, clicked with NO modifier (this is the bug):
-printf '\e]8;;https://example.com\e\\example.com\e]8;;\e\\\n'
-#    -> the browser opens. The same link in the owner pane (Home) also opens.
-
-# 2. a real one: `ls --hyperlink=always --color=always`, click a filename.
-
-# 3. nothing fires on a drag: press on the link, drag the float by 20 cells,
-#    release -> no browser. Same for Alt+drag.
-
-# 4. scrollback, float: `seq 1 500`, then wheel up -> the border reads `+3`,
-#    `+6`, ... and older numbers appear; type a character -> back to live.
-#    `Ctrl+Alt+PageUp` scrolls a page; `Ctrl+Alt+Up` a notch.
-
-# 5. scrollback, owner: Home (float hidden), `seq 1 500`, wheel up over the
-#    background -> history, and typing returns to live.
-
-# 6. inherited size: `UNCL_SCROLLBACK=10000 ./target/release/uncl` then
-#    `seq 1 20000` in a pane -> scrolls far past 2,000 lines.
-#    `UNCL_SCROLLBACK=0 ./target/release/uncl` -> the wheel does nothing.
-
-# 7. an image, then scroll the float back -> the image is gone while scrolled
-#    and returns (re-sent) when you return to live; it must not double up.
-
-# 8. hide the float while scrolled back, show it again -> it is at the live
-#    screen, not at the offset it was left at.
+cargo test                        # 178 tests, including the golden frames
+cargo build --release && ./target/release/uncl --doctor
 ```
 
-### Where the plan stands
-
-S0 → S3.6 are in the tree. The report's original claim — that the slowness was never
-`ratatui`'s fault and that the fix was to own the encoder — has now been carried
-through to the last user-visible gap: the float's links open, and both panes have
-history of the size the environment asked for. What S3.5 called "the host does the
-opening" was right about terminals in general and wrong about this one, because a
-floating window has to hold the mouse. That is the shape of the remaining risk in
-this design: every capability uncl takes from the host (mouse, scrollback, link
-dispatch) it has to implement itself, and the implementation has to respect the
-child's precedence. S4 (`alacritty_terminal`) would inherit hyperlinks, underline
-colours and kitty-keyboard input, and would let the renderer stop copying the
-scrollback every frame; the Windows delta (§6.6) and the golden-frame corpus (§10
-item 14) remain the two open items nobody has needed yet.
-
-## Appendix I — the remaining roadmap, as of 2026-10-27
-
-S0 → S3.6 are in the tree (`bb1d575`): 150 tests, all of them unit tests. This is
-what is actually left, ordered by *value per day* rather than by stage number.
-**S3.7 (Appendix J) has since closed A1, A2, A4, A5, A6 and B1, and half of A3**;
-the rows below are kept as they were written, with a note on each one that moved. Each
-row says how I know it is open — a grep, an absent directory, or a comment — so the
-list can be re-derived instead of trusted.
-
-### A. Small user-visible gaps (½–1 day each, no dependency) — **all closed in S3.7 except A3's system clipboard**
-
-| # | Item | Evidence it is open | Fix | Buys |
-|---|---|---|---|---|
-| A1 **shipped** | **`DCS $q` (DECRQSS)** | only mentioned in comments; `callbacks::reply_for_*` never answers it | answer `m` (SGR), `r` (DECSTBM), `s` (DECSLRM), ` q` (DECSCUSR) from the live `Screen`, and answer *unknown* with `DCS 0$r ST` rather than silence | `vim`/`neovim` under `:terminal`, `tmux` interop, anything that probes "can I use this style" stops guessing |
-| A2 **shipped** | **`XTGETTCAP`** | zero hits in `src/` | static table (`TN`, `Co`, `RGB`, `colors`, `Smulx` → *absent* until S4) | `kitty`-family tools, `nvim`'s `--embed` probing, and `ncurses` fallbacks stop falling back for the wrong reason |
-| A3 **shipped** | **`OSC 52` *reads*** | answered in two tiers: an in-session record first, then the desktop's clipboard through `wl-paste`/`xclip`/`xsel`/`pbpaste`/`Get-Clipboard` | — (`app::clipboard`, Appendix K). The *host terminal* is still never asked, because its reply would arrive as input, which belongs to `crossterm` | "paste what you copied in another window" works wherever a clipboard tool exists |
-| A4 **shipped** | **`TERM` pass-through** (§9 item 4) | `caps::apply_child_env` hard-codes `xterm-256color` | copy the host's `TERM`/`COLORTERM`/`TERM_PROGRAM`, downgrade `TERM` under `screen`/`tmux`, and keep the capability proxy as the source of truth for sixel/kitty | a kitty host's children stop believing they are on a dumb 256-colour terminal |
-| A5 **shipped** | **`BEL` from the float** | no `\x07` is ever written to the host outside image parsers | pass the bell through when the *focused* pane rings | `nvim`/`readline` bells are audible again |
-| A6 **shipped** | **Child title** | `OSC 0/2` is dropped (only 20t/21t *queries* are considered) | show the child's title in the float's top border, keeping `s:H:W +N` in the bottom one | a float running `ssh`/`nvim` says what it is, which is most of what the border is for |
-
-### B. The regression net (1 day, pays for itself immediately) — **closed in S3.7**
-
-| # | Item | Evidence it is open | Fix |
-|---|---|---|---|
-| B1 **shipped** | **Golden-frame harness + corpus** (§8.1, §10 item 14) | no `tests/` directory, no CI workflow | a `tests/` binary that feeds a recorded stream to a parser at a fixed size, renders through uncl's emitter, replays the result into a fresh `vt100`, and compares `contents_formatted()` — two engines, one assertion, no terminal. Corpus: `?1049`, mouse modes, `?2004`, wide/CJK/emoji, combining marks, `OSC 8`, a small sixel and a small kitty image |
-
-B1 is the only item that makes the other rows cheaper: S3.6's own test bug (asserting
-a word from a frame that emits a cell diff) is exactly the class this catches.
-
-### C. Fidelity — the S4 engine swap (3–5 days, the biggest single item left)
-
-| # | Gap today | What inherits it |
-|---|---|---|
-| C1 | Underline **styles and colours** (`SGR 4:x`, `58`/`59`) are dropped — `vt100` has no such attribute | `alacritty_terminal` `CellFlags`/`Color` |
-| C2 | **Kitty keyboard protocol** (`CSI > u`, `CSI = u`) is neither advertised nor encoded — decision was "do not advertise", which is honest but is a ceiling | `TermMode` + `KittyKeyboardFlags` |
-| C3 | **Synchronised output** (`?2026`) is not honoured: uncl paints when *it* decides | `TermMode::SYNC_UPDATE` + `EventListener` |
-| C4 | `OSC 8` spans are **one row** (wrapped links are dropped, §S3.5), and links die with a repaint rule rather than living on the cell | the engine's own hyperlink storage |
-| C5 | Clipboard/biDi/pointer-shape (`OSC 22`) and other `EventListener` items are all hand-rolled or missing | `EventListener` |
-| C6 | The **per-frame `Screen` clone now carries the scrollback** (Appendix H, "the cost of scrollback"): ~5–13 MB of `memcpy` per painted pane | storing *painted rows* instead of `Screen`-against-`Screen` diffs — the real fix for the last perf debt in this design |
-
-C1–C5 are the swap; C6 is the reason to do it even if no user ever asks for
-underline colours. Doing C without B is unwise: an engine swap with no golden frames
-is a rewrite with no net.
-
-### D. Decisions, not work (§9 items 1–2 and 5)
-
-| # | Question | Current behaviour |
-|---|---|---|
-| D1 | Chord policy: `Home` + `Alt` for geometry, everything else to the child | implemented; the §9 proposal is satisfied, so this is now documentation rather than code |
-| D2 | Where input goes while the float is **hidden** — **decided: the owner shell** | kept as it is. Routing keys to an invisible float means keystrokes land somewhere the user cannot see, which is the one failure mode a *floating* window must not have; `Home` is the toggle, and the float keeps parsing so it is live when it comes back (Appendix K) |
-| D3 | Windows validation hardware | needed for any claim beyond "it builds" (§6.6) |
-
-### E. Deliberately not on the list
-
-- **Passthrough takeover** (Appendix B) — excluded by decision 1.
-- **Sixel re-encoding, cropping by source rect, animation** — excluded by decision 2.
-- **Images on Windows** — needs a bundled ConPTY v2 `conpty.dll`; excluded by §6.6.
-- **Windows port** (§10 item 19) — **guards shipped, unvalidated** (Appendix K): the
-  `ansi_support` startup check and "no images on Windows" are in and are `cfg`-gated,
-  so they cannot affect a Linux build. What is *not* done is the part that needs
-  hardware: validating the encoder matrix (application cursor, SGR vs X10 mouse,
-  ConPTY's own quirks) on a real console. The report's §6.6 rule stands — this must
-  not drive the design, and nothing above depends on it.
-
-### F. Housekeeping already done
-
-`Cargo.lock` is clean: 85 entries, no `ratatui`/`tui-term` (the S0 §478 and S2 §788
-warnings are both closed — the lock was regenerated in `bb1d575`). `uncl --doctor`
-prints the capability record including the scrollback size.
-
-### Suggested order — updated
-
-Everything except **C** and the unvalidatable half of **E** is now shipped
-(Appendices J and K):
-
-`A1 A2 A4 A5 A6 B1` ✅ → `A3` ✅ (via the desktop's clipboard tools) → `D2` ✅
-(decided, no code) → `E` guards ✅ → **`C` (the S4 swap) is the one pass left**, and
-it wants a toolchain and B1's corpus in place before it starts. Both are now true
-wherever `cargo` exists.
-
-## Appendix J — S3.7 implementation log (2026-10-27): the compatibility batch
-
-Appendix I sorted the remaining work by value per day and put six small gaps first,
-because each one is a program deciding uncl cannot do something and falling back to
-a worse path. This is that batch. Nothing here is a new capability: it is uncl
-answering questions about capabilities it already had, plus three things `vt100`
-parses and nobody was listening to.
-
-### The shape of the bug, five times over
-
-Every item below is the same failure: **the child asked, and nothing answered.**
-
-| What the child asked | What `vt100` does with it | What happened before |
-|---|---|---|
-| `DCS $ q m ST` (DECRQSS: what is your SGR?) | nothing at all — `vte`'s `hook`/`put`/`unhook` reach no callback | the child waited out its timeout and assumed defaults |
-| `DCS + q 544e ST` (XTGETTCAP: what *are* you?) | nothing at all | "not kitty, then: no truecolor, no underline styles" — a guess, sometimes the right one by luck |
-| `OSC 2 ; title` (name yourself) | stores it, calls `set_window_title` — which was unimplemented | the float's border never said what was running in it |
-| `^G` | calls `audible_bell` — which was unimplemented | a bell nobody could hear |
-| `OSC 52 ; c ; ?` (paste) | calls `paste_from_clipboard` — which was unimplemented | copy-then-paste inside the float silently did nothing |
-
-The general law, now written down because it has bitten twice: **`vt100`'s
-`Callbacks` trait is a list of things the engine refuses to be responsible for.**
-Every unimplemented method on it is a sequence the child sends and uncl drops.
-
-### What landed
-
-| # | Change | File |
-|---|---|---|
-| 1 | `dcs::reply()` — `DECRQSS` and `XTGETTCAP` answered from the live `Screen`; `DECRQSS` reports the pen (`SGR m`) and the cursor shape (` q`), and refuses (`DCS 0 $ r`) anything this engine does not track: scroll margins, `DECSLRM`, `DECSCL`. `XTGETTCAP` answers `TN`, `Co`/`colors`, `RGB` (only when truecolor is real), and refuses `Smulx`/`Setulc` until S4 | `src/app/term/dcs.rs` (new, 10 tests) |
-| 2 | the answer is produced in the pty reader, where the image tap already separates `DCS` from the stream — `vt100` drops `DCS` wholesale, so this is the only place it can happen | `src/app/pty.rs` |
-| 3 | `decscusr()` moved here from `ui::owner`, so the host's cursor and a `DECRQSS` answer come from one table | `src/app/term/dcs.rs`, `src/app/ui/owner.rs` |
-| 4 | `caps::child_term()` — the host's `TERM` family passed through, downgraded for `screen*`/`tmux*` (a dialect we do not speak), `xterm-kitty` (its `TERM` enables the kitty *keyboard* protocol, which we do not implement — the graphics half is advertised through `UNCL_GRAPHICS`), and consoles | `src/app/term/caps.rs` (+2 tests, one `--doctor` line) |
-| 5 | `audible_bell` forwarded to the host, but only from the pane that owns the keyboard (`ChildState::focused`, set by `refocus`) | `src/app/term/callbacks.rs` |
-| 6 | `set_window_title` recorded per pane, sanitised (control characters stripped, 256 bytes max) | `src/app/term/callbacks.rs` |
-| 7 | `Panes::float_title` + `emit_top_title`: the title in the float's **top** border, clipped to the border, with the size and scroll offset left in the bottom one; a rename forces a border repaint (a title that never appears is worse than none) | `src/app/render/mod.rs` (+1 test) |
-| 8 | `paste_from_clipboard` answered from an in-session record of what a child copied, matched by selector; a request for something never copied here stays unanswered | `src/app/term/callbacks.rs` (+1 test) |
-
-### Why the clipboard is in-session only
-
-`OSC 52 ; c ; ?` is a *request to the terminal*, so answering it properly means
-asking the host and reading its reply. That reply arrives as **input**, and
-uncl's input is `crossterm`'s event stream: it parses stdin into key events, and an
-`OSC 52` reply is not a key event — it would be dropped, or worse, misparsed into
-stray keystrokes. Doing this properly means taking over raw stdin and demultiplexing
-it ourselves, which is a real change to the input path (§6.2.7's encoder work), not
-a callback.
-
-What *is* cheap and fixes the case people actually hit is the round trip: a child
-that copies and then pastes. `copy_to_clipboard` already relays every copy to the
-host, so the payload passes through uncl; remembering it costs one `Vec` per pane.
-`vim`'s `"+y` / `"+p` now works inside the float. Pasting what you copied in
-*another* window still does not, and Appendix I keeps that half open rather than
-pretending otherwise.
-
-### Why `TERM` is now passed through (carefully)
-
-`xterm-256color` was honest when uncl could transport nothing but text. It is no
-longer: the image tap carries kitty and iTerm2 payloads byte for byte, `OSC 8`
-arrives at the host, and 24-bit colour survives the re-encode. Refusing the host's
-`TERM` made every child take the degraded path for no reason — the same
-"advertise only what you carry, but *do* carry what you advertise" rule that
-`FORCE_HYPERLINK` and DA1 follow, in the other direction.
-
-Three families are still downgraded, and the reason is input rather than output:
-
-* `screen*`, `tmux*` — their `TERM` describes a multiplexer's own escape dialect.
-* `xterm-kitty` — kitty's `TERM` is what makes applications turn **on the kitty
-  keyboard protocol**, and uncl's encoder speaks the legacy key encodings
-  (Appendix I, item C2). Claiming it would make the claim false about *keys*, which
-  is the one direction uncl cannot fake. Kitty's graphics are advertised where they
-  belong: `UNCL_GRAPHICS` and the tap.
-* `dumb`, `linux`, unset — nothing to pass through.
-
-`uncl --doctor` prints both the host's `TERM` and the child's, with the reason when
-they differ, so this mapping is never a mystery in a bug report.
-
-### The golden-frame harness (§8.1, the last open S2 item)
-
-`src/app/render/golden.rs` — a `#[cfg(test)]` module rather than a `tests/` binary,
-because uncl is a binary crate with no library target to import; keeping it inside
-the module tree is what lets it use the real `Renderer` with no visibility changes,
-and it runs under the same `cargo test`.
-
-Three tests, one idea:
-
-1. **`every_corpus_stream_replays_to_the_screen_it_drew`** — 15 recorded streams
-   (plain text, 16/256/truecolor SGR, inverse bars, wide CJK, combining marks,
-   erase/delete/insert, cursor moves, autowrap off, `\r` progress overwrites, tabs
-   and backspace, `REP`, an alt-screen round trip, an `OSC 8` span, hidden cursor +
-   `DECSCUSR`, and a bottom-of-grid scroll) are each written into a `vt100` parser,
-   rendered through uncl's emitter, and fed to a **second** `vt100`. Every cell —
-   contents *and* attributes — plus the cursor position must match.
-2. **`a_growing_corpus_replays_frame_by_frame`** — the same corpus grown one frame
-   at a time against a terminal that has already seen the previous frames, which is
-   the **diff** path and where clipping bugs live. Plus: an unchanged screen must
-   paint nothing.
-3. **`a_resize_repaints_and_the_result_replays`** — a painted grid, resized, painted
-   again; nothing else in the suite covered that transition end to end.
-
-Why this is not a tautology — it feeds uncl's *output* to a fresh parser and
-compares against the *input's* screen, so it fails for exactly the bugs that matter
-(clipping, a lost attribute, a mis-shifted row) and for nothing else. Why it has no
-golden files: the expectation is the source screen, so the corpus can grow without
-anyone re-blessing fixtures.
-
-The one subtlety worth recording, because it was checked against the source before
-writing the harness: `Screen::rows_diff` positions *each row* from its own start
-(`prev_pos: Pos { row: i, col: start }`), so the only move a diff row can begin with
-is a relative `CSI n C` from column `start` — never `\r\n`, never an absolute
-`CUP`. That is exactly what uncl's `cup(row, start)` + `append_row` assumes. Had it
-used the crate-level `write_contents_diff` instead, rows would have begun with
-`\r\n` and every diffed row would have landed one line low; the harness would have
-caught that on its first run, which is the point of having it.
-
-### Verification status
-
-- **169 tests** (was 150: +10 `dcs`, +4 callbacks, +2 caps, +1 renderer, +3 golden —
-  minus the two `owner` tests that moved with `decscusr`, which had none).
-- Still **no Rust toolchain here**: every file parses with `tree-sitter-rust`, and
-  the `vt100` facts relied on were read from the sources — `Callbacks` has
-  `audible_bell`, `set_window_title`, `copy_to_clipboard` and `paste_from_clipboard`
-  and **no** `DCS` hook; `PasteFromClipboard`/`OSC 52` with `?` reaches the callback
-  (`perform.rs` `oscd`ispatch); `Screen` exposes the pen (`bold`/`dim`/`italic`/
-  `underline`/`inverse`/`fgcolor`/`bgcolor`) and `cursor_style()`, which is what makes
-  the `DECRQSS` answers true rather than conventional.
-- The golden harness has never been run. It is the one thing in this batch that could
-  legitimately fail on first run, and if it does, the frame it prints is the bug
-  report: the failure message carries the cell, both values, the whole screen text
-  and the frame bytes.
-
-### Acceptance script (S3.7 exit criteria)
-
-```sh
-cargo test                                        # 169
-cargo build --release && ./target/release/uncl --doctor   # TERM, child TERM, scrollback
-
-# 1. DECRQSS: a program that asks what the pen is now gets a true answer.
-printf '\eP$qm\e\\'                 # expect  \eP1$r0m\e\\   (and the same after \e[1;31m)
-printf '\eP$q q\e\\'                # expect  \eP1$r0 q\e\\
-
-# 2. XTGETTCAP: what the terminal claims.
-printf '\eP+q544e\e\\'              # TN  -> hex of the child's TERM
-printf '\eP+q436f\e\\'              # Co  -> 323536 (256)
-printf '\eP+q536d756c78\e\\'        # Smulx -> refused (0+r) until S4
-
-# 3. the child's title in the top border:
-printf '\e]2;hello from the float\a'; the float's top border reads it.
-#    `nvim` / `ssh` set it themselves; a rename updates the border immediately.
-
-# 4. the bell: `printf '\a'` in the float is audible; in the owner shell while the
-#    float is *visible* it is not (only the focused pane rings).
-
-# 5. clipboard round trip inside the float: `printf '\e]52;c;aGk=\e\\'` (copy "hi"),
-#    then `printf '\e]52;c;?\e\\'` (paste) -> the same base64 comes back.
-#    In a program: vim's `"+y` then `"+p`.
-
-# 6. TERM: `echo $TERM` in the float. Under WezTerm/alacritty/foot it is the host's
-#    own; under kitty, screen or tmux it is `xterm-256color` and --doctor says why.
-
-## Appendix K — S3.8 implementation log (2026-10-27): the last passes
-
-The tree builds and 169 tests pass on a real toolchain, which is the first
-verification this report has been able to confirm rather than predict. This pass
-finishes everything that does not need hardware: the system clipboard, the corpus
-gap Appendix I left open, the Windows guards, and the two decisions that were
-sitting in the roadmap.
-
-### A3, properly: the desktop's clipboard
-
-`OSC 52 ; c ; ?` is a request to the terminal, so the honest answer is the
-clipboard the *user* has. uncl could not ask its host terminal — that reply arrives
-as **input**, and input is `crossterm`'s event parser, which would drop an `OSC 52`
-reply or misread it as keystrokes — so it asks the desktop instead, through the same
-programs every Wayland/X11 tool already uses.
-
-Two tiers, cheapest first:
-
-| Tier | Answers | Cost |
-|---|---|---|
-| in-session record | anything a child copied in this session (`vim`'s `"+y` → `"+p`) | one `Vec` per pane |
-| desktop helper | what the user copied anywhere else | one process, on a thread |
-
-`app::clipboard` keeps every decision pure and testable: which selector means which
-clipboard (`c` → clipboard; `p`, `s` → primary; numbered cut buffers and compound
-selectors refused *before* anything is spawned), which programs to try and in what
-order (Wayland before X11 — on a Wayland session `xclip` may exist and still fail),
-and the base64 encoding, against the RFC 4648 vectors.
-
-Three properties worth stating, because each is a way this could have gone wrong:
-
-* **off the reader thread.** `paste_from_clipboard` runs inside the parser, on the
-  thread that is draining the pty. A `wait()` there would freeze the pane for the
-  duration of a clipboard read, so the read happens on its own thread and the reply
-  goes back through the pty writer when it lands.
-* **one at a time.** A child that asks twice must not start two processes; the claim
-  is an atomic swap, released on every exit path including failure.
-* **bounded, and silent when it cannot know.** A selection over 1 MiB is refused
-  (base64 makes it 1.4 MiB of pty traffic, and it is almost certainly a copied file
-  rather than text), an empty clipboard still counts as an answer *from the program
-  that owned the selection* — falling through to the next helper would ask a
-  different clipboard — and with no helper installed the request stays unanswered,
-  which is what a child's timeout is for.
-
-macOS and Windows have one clipboard and no primary selection, so `p`/`s` are
-refused there rather than silently served from the clipboard.
-
-### The corpus gap Appendix I flagged
-
-The golden harness covered the owner pane only, with no float and no images — the
-three cases where a frame does something *besides* paint cells, and therefore the
-three where a cell-level regression could hide behind a passing string assertion.
-Now covered:
-
-* **`a_float_replays_over_the_owner_grid`** — cells inside the float's content rect
-  must be the float child's cells, and every cell *outside* the rect must still be
-  the owner's. That second half is the real test: it is what `repair_tail` exists
-  for, and it is the one part of S2 with no end-to-end check until now.
-* **`a_linked_row_replays_to_the_same_cells`** — `OSC 8` is emitted *inside* a row,
-  between column-ranged segments. A segment computed wrongly shifts the row: the
-  cells are all painted, in the wrong place, and every string-level test still
-  passes. A replay sees it immediately.
-* **`an_image_does_not_disturb_the_grid`** — an image is out-of-band, so the grid
-  after it must be exactly the grid before it, for terminals that ignore the payload
-  as well as for those that draw it.
-
-Six golden tests now, still no golden files: the expectation is always the screen
-the child drew.
-
-### D2, decided
-
-Where input goes while the float is hidden stays **the owner shell**. The argument
-that settled it: routing keys to an invisible float means keystrokes land somewhere
-the user cannot see, and a floating window's one unforgivable failure is losing
-input. `Home` is the toggle, and the hidden float keeps parsing, so it is live the
-moment it comes back. This is recorded as a decision, not a default.
-
-### E: the Windows guards, and what is still unvalidated
-
-Two things are in, both `cfg`-gated so they cannot affect a non-Windows build:
-
-* `ensure_ansi()` at startup: `crossterm::ansi_support::supports_ansi()` enables
-  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` and tells us whether the console can honour
-  the frames at all. A legacy console now gets one sentence instead of an alternate
-  screen full of raw escapes.
-* **no images on Windows**, enforced in the capability record rather than by a
-  comment: ConPTY v1 parses the child's VT into a text buffer, swallows `DCS`, and
-  answers `DA1` itself without the sixel attribute — so a child never asks, and
-  anything forwarded would die one layer down. `kitty_graphics` and `sixel` are
-  forced false, and `--doctor` says why on the platform where it matters.
-
-**Still unvalidated, and this pass does not pretend otherwise:** the encoder matrix
-on a real console (application cursor, SGR vs X10 mouse under ConPTY) has not been
-exercised on Windows hardware. §6.6's rule stands — this must not drive the design,
-and nothing above depends on it.
-
-### Verification status
-
-- **178 tests** (was 169: +4 `clipboard`, +1 callbacks, +4 golden).
-- The user's toolchain built `d45198b` clean with 169 passing, which retires the
-  "never compiled" caveat for everything up to S3.7. This pass is again
-  **unverified by rustc** — it is written against the same `vt100`/`crossterm`
-  sources and parses clean, but the first `cargo test` after it is the real signal.
-  The Windows-only block is not compiled on Linux at all, so it can neither break
-  this build nor be proven by it.
-- That caveat earned its keep immediately: the first build of this pass found three
-  errors — a `b"…"` byte-string literal containing UTF-8 (`byte string literal`
-  must be ASCII; a `&str` and `.as_bytes()` is the fix) and one `let mut` on a
-  parser that was only read. Both are exactly the class a parser-only check cannot
-  see, which is why every stage of this report has carried the same warning rather
-  than claiming more than it can prove.
-
-### The harness's first real run found two wrong *assertions*
-
-Both were in `golden.rs`, and both are worth keeping as rules:
-
-1. **A hidden cursor has no position.** `place_cursor` refuses to move a cursor the
-   child hid — there is nothing to see, and painting clears `cursor_at` so the frame
-   that shows it again is forced to `CUP` to the right cell. The harness was
-   comparing positions unconditionally and failed on the `\x1b[?25l` corpus entry
-   (`(0, 14)` against `(11, 0)`). It now compares `hide_cursor()` always, and the
-   position only while it is visible.
-2. **`invalidate()` is what makes a resize a repaint.** The resize test rendered a
-   narrower grid *without* invalidating and got an empty frame — correctly: the
-   corpus writes into the first ten columns, so every surviving cell was one already
-   painted. The app invalidates on every resize (`handle_mouse` → `sync_size` +
-   `invalidate`, and the keyboard path), because what actually moves is the float's
-   **border**, and a cell diff cannot see a border. The test now does what the app
-   does, and a second test pins the distinction: *without* the invalidation the diff
-   is empty, *with* it the frame repaints from the first cell.
-
-That is the harness doing its job on itself rather than on the emitter — the same
-class of finding it exists to catch one layer down.
-
-### Acceptance script (S3.8 exit criteria)
-
-```sh
-cargo test                                        # 178
-
-# 1. the desktop clipboard, from inside the float:
-#    copy something in another window (the browser), then in the float:
-printf '\e]52;c;?\e\\'      # paste it into `cat -v` to see what came back
-#    in a program: vim's `"+p` after copying elsewhere.
-
-# 2. the in-session tier still wins: copy in the float, paste in the float — no
-#    helper process is started (pgrep -c wl-paste stays 0).
-
-# 3. a cut buffer is not served: `printf '\e]52;0;?\e\\'` answers nothing.
-
-# 4. no helper installed: `PATH=/nonexistent uncl` → paste requests stay
-#    unanswered, and the pane is not frozen while that is decided.
-
-# 5. --doctor now ends with an `images:` line naming the platform, and says
-#    ConPTY's reason on Windows.
-```
+**Frames and speed.** Idle at a prompt → `top -p $(pgrep uncl)` shows ~0% CPU. A
+still `btop` in the float → `strace -e trace=write -c -p $(pgrep uncl)` over five
+seconds shows a handful of writes, not thousands. `seq 1 200000` in the float → no
+tearing, input stays responsive.
+
+**Geometry and the float.** `btop`, `htop`, `nvim`, `lazygit`, `less`, `fzf` all draw
+inside the border at the size `stty size` reports. Drag the border and the child
+reflows live; move it with `Alt`+arrows or a border drag and the vacated area is
+repainted with no smear. `Home` twice removes and restores it exactly. `exit` in the
+float gives a fresh prompt and leaves the owner shell untouched.
+
+**Input.** Click and wheel inside the float reach the child. Select text in `nvim`,
+drag the pointer out of the float, release → the selection ends cleanly. `i` and
+`Esc` in `nvim` switch the cursor to a beam and back. Paste 5 KB of text → it lands
+in one write, not character by character.
+
+**Links.** `printf '\e]8;;https://example.com\e\\example.com\e]8;;\e\\\n'`, then a
+plain click in the float → the browser opens. The same link in the owner pane also
+opens. `ls --hyperlink=always --color=always` → filenames are clickable. Dragging
+from a link does not open anything.
+
+**Images.** `wezterm imgcat`, `chafa --format=kitty`, `timg -pk` → the picture appears
+inside the float at the prompt cell. Move the float → kitty re-places by id (one
+line, not a re-send). `Home` twice → the image goes and comes back. Scrolling the
+float back hides it and returning to live re-sends it, once.
+
+**Scrollback.** `seq 1 500`, wheel up → the border reads `+3`, `+6`, …; typing
+returns to live. `UNCL_SCROLLBACK=10000 uncl` scrolls far past 2,000 lines;
+`UNCL_SCROLLBACK=0` makes the wheel do nothing.
+
+**Queries and environment.** `printf '\eP$qm\e\\'` → `\eP1$r0m\e\\`, and after
+`\e[1;31m` it reports that pen. `printf '\eP+q544e\e\\'` → the child's `TERM` in hex.
+`echo $TERM` in the float is the host's own (under WezTerm, alacritty, foot) and
+`xterm-256color` under kitty, screen or tmux, with `--doctor` explaining why.
+
+**The clipboard.** Copy in the browser, then `printf '\e]52;c;?\e\\'` in the float →
+the same text arrives; `vim`'s `"+p` works. Copy inside the float, paste inside the
+float → no helper process starts.
+
+**The bell and the title.** `printf '\a'` in the float is audible; in the owner shell
+while the float is visible it is not. `printf '\e]2;hello\a'` puts the title in the
+float's top border, and `nvim`/`ssh` set it themselves.

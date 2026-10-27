@@ -660,7 +660,7 @@ mod tests {
     fn an_audible_bell_only_reaches_the_host_from_the_focused_pane() {
         let (host_tx, mut host_rx) = host();
         let (mut forward, _sink, state) = ChildCallbacks::new(caps(), host_tx);
-        let mut parser = vt100::Parser::new(nz(4), nz(20), 0);
+        let parser = vt100::Parser::new(nz(4), nz(20), 0);
         let mut screen = parser.screen().clone();
 
         // Unfocused: parsed, and deliberately not heard.

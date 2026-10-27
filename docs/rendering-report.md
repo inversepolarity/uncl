@@ -1799,6 +1799,12 @@ and nothing above depends on it.
   sources and parses clean, but the first `cargo test` after it is the real signal.
   The Windows-only block is not compiled on Linux at all, so it can neither break
   this build nor be proven by it.
+- That caveat earned its keep immediately: the first build of this pass found three
+  errors — a `b"…"` byte-string literal containing UTF-8 (`byte string literal`
+  must be ASCII; a `&str` and `.as_bytes()` is the fix) and one `let mut` on a
+  parser that was only read. Both are exactly the class a parser-only check cannot
+  see, which is why every stage of this report has carried the same warning rather
+  than claiming more than it can prove.
 
 ### Acceptance script (S3.8 exit criteria)
 

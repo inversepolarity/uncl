@@ -298,7 +298,9 @@ fn a_float_replays_over_the_owner_grid() {
     let mut owner = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
     owner.process(b"owner line one\r\nowner line two\r\n$ ");
     let mut float = vt100::Parser::new(nz(5), nz(18), 0);
-    float.process(b"floating:\r\n\x1b[1;33myellow\x1b[0m\r\n日本語");
+    // A `str`, not a byte-string literal: the latter may not contain non-ASCII
+    // source text, and the wide characters are the point of this row.
+    float.process("floating:\r\n\u{1b}[1;33myellow\u{1b}[0m\r\n日本語".as_bytes());
 
     let rect = float_rect();
     let content = content_rect(rect);

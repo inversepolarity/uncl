@@ -1964,10 +1964,27 @@ mod tests {
         }
         let area = Rect::new(0, 0, 20, 3);
         let mut renderer = Renderer::new();
+        let live = |scroll: usize| Panes {
+            owner: owner.screen().clone(),
+            owner_area: area,
+            float: None,
+            float_focused: false,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: scroll > 0,
+        };
 
+        // The live screen first, in full: the newest line is on it.
+        let first = text(renderer.render(live(0)));
+        assert!(first.contains("line7"), "frame: {first:?}");
+
+        // Scrolling back shows older rows, so the frame has to change. (Rows are
+        // painted as a diff against the previous frame, so the assertion is that
+        // something was painted, not that a whole word appears.)
         let mut scrolled = owner.screen().clone();
         scrolled.set_scrollback(3);
-        renderer.render(Panes {
+        let back = text(renderer.render(Panes {
             owner: scrolled,
             owner_area: area,
             float: None,
@@ -1976,20 +1993,17 @@ mod tests {
             links: FrameLinks::default(),
             scroll: 0,
             focused_scrolled: true,
-        });
-
-        // Returning to live is a repaint that puts the newest lines back.
-        let frame = text(renderer.render(Panes {
-            owner: owner.screen().clone(),
-            owner_area: area,
-            float: None,
-            float_focused: false,
-            images: None,
-            links: FrameLinks::default(),
-            scroll: 0,
-            focused_scrolled: false,
         }));
-        assert!(frame.contains("line7"), "frame: {frame:?}");
+        assert!(!back.is_empty(), "scrolling must repaint");
+
+        // Returning to live is a repaint too…
+        let returned = text(renderer.render(live(0)));
+        assert!(!returned.is_empty(), "returning to live must repaint");
+
+        // …and afterwards the renderer's `prev` really is the live screen again,
+        // not the scrolled one: painting it a second time changes nothing.
+        let quiet = text(renderer.render(live(0)));
+        assert!(quiet.is_empty(), "quiet: {quiet:?}");
     }
 
     #[test]

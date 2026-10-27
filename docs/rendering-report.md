@@ -1237,7 +1237,7 @@ the `alacritty_terminal` engine swap (S4), and the Windows delta (§6.6) — plu
 one open S2 item (the golden-frame corpus). Images are the last thing that was
 *broken* rather than merely missing.
 
-## Appendix H — S3.6 implementation log (2026-10-27): clickable float links, scrollback in both panes
+## Appendix H — S3.6 implementation log (2026-10-27): clickable links in both panes, scrollback in both panes
 
 Two reports, one of them a bug that S3.5 shipped with a plausible-looking frame:
 
@@ -1253,7 +1253,7 @@ float's cells correctly — a hyperlink-aware host would draw it as a link. The
 sequence is never *acted on* because uncl has taken the mouse:
 
 ```
-ui::owner::sync_host_mouse()  ->  HostMouse::at_least_press() while the float is up
+ui::owner::sync_host_mouse()  ->  HostMouse::at_least_press()
                               ->  CSI ? 1000 h  (and ? 1006 h)
 ```
 
@@ -1261,9 +1261,9 @@ That is deliberate and stays: with reporting off, uncl could not drag the float,
 could not hide it on a click outside, and could not see the button at all. The
 consequence is that **the host terminal never sees the click**, so the only entity
 in the system that could resolve the link — the emulator — is the one entity that
-is never told about it. The owner pane works precisely because uncl gives the mouse
-*back* to it (`HostMouse::Off` when the background shell wants nothing), and the
-host then does what it always does.
+is never told about it. The owner pane *used to* work precisely because uncl gave
+the mouse back to it (`HostMouse::Off` when the background shell asked for
+nothing), and the host then did what it always does.
 
 So the click had to be interpreted inside uncl. That is the whole of "the float's
 links are clickable": `OSC 8` is still painted (cmd-click in the host keeps working
@@ -1290,7 +1290,7 @@ was not a rendering problem either; the history did not exist.
 |---|---|---|
 | 1 | `DEFAULT_SCROLLBACK = 2_000`, `SCROLL_STEP = 3`, `scrollback_lines()` reading `UNCL_SCROLLBACK` from the launching environment, and a private `parse_scrollback()` so the parsing is testable without touching the process environment | `src/constants.rs` (+2 tests) |
 | 2 | `new_parser` passes `scrollback_lines()` instead of `0` — both panes, same capacity | `src/app/lease.rs` |
-| 3 | `Container` gains `owner_scroll`, `tenant_scroll`, `link_press`, `images_suppressed`; `scroll/scrollback_len/reset_scroll/link_click/link_target`; the click path and `open_url()` | `src/app/ui/owner.rs` |
+| 3 | `Container` gains `owner_scroll`, `tenant_scroll` and `link_press: Option<LinkPress>` (which pane, which cell); `scroll/scrollback_len/reset_scroll/link_click/link_target`; the click path in both routes and `open_url()` | `src/app/ui/owner.rs` |
 | 4 | `Wheel::{Up, Down}` and `from_kind()` — the wheel is a *decision* only after the child declined it | `src/app/input/mouse.rs` (+1 test) |
 | 5 | `Panes` gains `scroll` and `focused_scrolled`; the border repaints when the offset changes; `emit_title` prints ` +N`; the cursor is hidden while the focused pane is scrolled; a missing image store now clears the host's image layer and marks the payloads forgotten | `src/app/render/mod.rs` (+4 tests) |
 | 6 | `Link::target()` (now genuinely called) and `allowed_url()` — the scheme allowlist a click has to pass | `src/app/term/links.rs` (+2 tests) |
@@ -1348,11 +1348,11 @@ geometry (Alt / border)  >  child mouse reporting  >  uncl (wheel, link, click-a
 
 Because the wheel now has to reach uncl in *either* pane, the host mouse grab is
 `at_least_press()` **always**, not only while the float is up. That is what makes
-`forward_owner_mouse` responsible for the owner's hyperlinks, not just its wheel. The trade-off is
-explicit: your emulator's own scrollback and click-drag selection are unavailable
-inside uncl, because uncl provides both. `Shift`+drag still selects in most
-emulators (they intercept it locally), and the keyboard chords below exist for the
-cases where the host swallows the wheel.
+`forward_owner_mouse` responsible for the owner's hyperlinks as well as its wheel.
+The trade-off is explicit: your emulator's own scrollback and click-drag selection
+are unavailable inside uncl, because uncl provides both. `Shift`+drag still selects
+in most emulators (they intercept it locally), and the keyboard chords below exist
+for the cases where the host swallows the wheel.
 
 Keyboard scrollback, for terminals without a wheel and for wheels a host eats:
 `Ctrl+Alt+Up/Down` scroll a notch, `Ctrl+Alt+PageUp/PageDown` a screenful, on

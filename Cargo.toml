@@ -1,6 +1,6 @@
 [package]
 name = "uncl"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -14,7 +14,7 @@ anyhow = "1.0.98"
 # never have to sniff the byte stream by hand (see docs/rendering-report.md §2.5)
 vt100 = "0.18.1"
 tokio = { version = "1.44.2", features = ["full"] }
-bytes = "1.10.1"
+bytes = "1.11.1"
 # tui-term/ratatui removed: the grid adapter and the pseudo-terminal widget were
 # replaced by `src/app/render` (S2), so a frame no longer passes through a
 # second, ratatui-shaped copy of the parser's grid.

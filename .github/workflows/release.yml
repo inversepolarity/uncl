@@ -133,7 +133,7 @@ jobs:
 
       # Tests come first: a red tree must not get a version number.
       - name: cargo test
-        run: cargo test --locked --all-targets
+        run: cargo test --offline --all-targets
 
       - uses: taiki-e/install-action@v2
         with:

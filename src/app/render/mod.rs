@@ -1777,11 +1777,16 @@ mod tests {
         let long = frame_for(Some(long_title.as_str()));
         assert!(long.contains(&"x".repeat(16)), "frame: {long:?}");
         assert!(!long.contains(&"x".repeat(18)), "frame: {long:?}");
-        // The pin's right bracket, colour and all: the corner it covers is gone.
+        // The pin's right bracket, colour and all — painted over the corner the
+        // border drew, not beside it, so a replay ends on `]`.
         assert!(long.contains("m]"), "frame: {long:?}");
-        assert!(!long.contains('┐'), "frame: {long:?}");
+        let corner = long.find('┐').expect("the border draws its corner first");
+        let bracket = long.find("m]").expect("then the pin covers it");
+        assert!(corner < bracket, "frame: {long:?}");
     }
 
+    #[test]
+    fn scrolling_back_clears_the_image_layer_and_returning_sends_it_again() {
     #[test]
     fn the_pin_control_is_drawn_in_the_top_right_corner() {
         let mut owner = parser(10, 40);
@@ -1802,6 +1807,7 @@ mod tests {
                 scroll: 0,
                 focused_scrolled: false,
                 float_title: None,
+                pinned: false,
                 pinned,
             }))
         };
@@ -1812,18 +1818,17 @@ mod tests {
         assert!(unpinned.contains("m]"), "frame: {unpinned:?}");
         assert!(!unpinned.contains(PIN_COLOR), "frame: {unpinned:?}");
 
-        // Pinned: the box is filled, and filled red — and the corner it covers
-        // is gone. The caller invalidates when the pin flips, which is what
-        // repaints the border it lives in.
+        // Pinned: the box is filled, and filled red — painted over the corner
+        // the border drew, so a replay ends on the box rather than the corner.
         renderer.invalidate();
         let pinned = frame_for(&mut renderer, true);
         assert!(pinned.contains("m■"), "frame: {pinned:?}");
         assert!(pinned.contains(PIN_COLOR), "frame: {pinned:?}");
-        assert!(!pinned.contains('┐'), "frame: {pinned:?}");
+        let corner = pinned.find('┐').expect("the border draws its corner first");
+        let box_at = pinned.find("m■").expect("then the pin covers it");
+        assert!(corner < box_at, "frame: {pinned:?}");
     }
 
-    #[test]
-    fn scrolling_back_clears_the_image_layer_and_returning_sends_it_again() {
         let mut owner = parser(10, 40);
         owner.process(b"owner");
         let mut float = parser(3, 10);

@@ -3,8 +3,8 @@ use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::term::callbacks::ReplySink;
 use crate::app::signal::Signal;
 use crate::constants::{
-    DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_X, DEFAULT_Y, MIN_HEIGHT, MIN_WIDTH, ResizeDirection,
-    content_rect, nz,
+    DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_X, DEFAULT_Y, MIN_HEIGHT, MIN_WIDTH, PIN_WIDTH,
+    ResizeDirection, content_rect, nz,
 };
 use crate::geometry::Rect;
 
@@ -32,6 +32,9 @@ pub struct Overlay {
     /// A gesture started inside the child's grid: it owns the pointer until the
     /// button comes up, even if the pointer leaves the float.
     pub child_grab: bool,
+    /// Sticky: the float stays on screen when the pointer leaves it, so the
+    /// owner pane can be used beside it instead of the float disappearing.
+    pub pinned: bool,
 }
 
 impl Overlay {
@@ -48,6 +51,7 @@ impl Overlay {
             },
             is_dead: true,
             child_grab: false,
+            pinned: false,
         }
     }
 
@@ -64,6 +68,29 @@ impl Overlay {
     pub fn content_size(&self) -> (u16, u16) {
         let content = self.content_rect();
         (content.height, content.width)
+    }
+
+    /// The pin control's cells, in the right end of the top border.
+    ///
+    /// `None` when the float is too narrow to hold three cells beside its
+    /// corner, so a tiny window degrades to a plain border rather than overlapping
+    /// itself.
+    pub fn pin_cell(&self) -> Option<Rect> {
+        if self.rect.width < PIN_WIDTH + 2 {
+            return None;
+        }
+        Some(Rect::new(
+            self.rect.right().saturating_sub(PIN_WIDTH),
+            self.rect.y,
+            PIN_WIDTH,
+            1,
+        ))
+    }
+
+    /// Flip the pin, reporting whether it is pinned now.
+    pub fn toggle_pin(&mut self) -> bool {
+        self.pinned = !self.pinned;
+        self.pinned
     }
 
     /// Spawn the floating shell. No terminal state is touched here: the owner
@@ -244,6 +271,35 @@ mod tests {
         let mut overlay = Overlay::new();
         overlay.rect = Rect::new(0, 0, 1, 1);
         assert_eq!(overlay.content_size(), (1, 1));
+    }
+
+    #[test]
+    fn the_pin_control_sits_in_the_top_right_corner() {
+        let overlay = Overlay::new();
+        let pin = overlay.pin_cell().expect("a default float has room for the pin");
+        assert_eq!(pin.y, overlay.rect.y);
+        assert_eq!(pin.x.saturating_add(pin.width), overlay.rect.right());
+        assert_eq!(pin.width, PIN_WIDTH);
+        assert_eq!(pin.height, 1);
+    }
+
+    #[test]
+    fn a_float_too_narrow_for_the_pin_has_none() {
+        let mut overlay = Overlay::new();
+        overlay.rect = Rect::new(0, 0, PIN_WIDTH + 1, 4);
+        assert!(overlay.pin_cell().is_none());
+        overlay.rect = Rect::new(0, 0, PIN_WIDTH + 2, 4);
+        assert!(overlay.pin_cell().is_some());
+    }
+
+    #[test]
+    fn toggling_the_pin_reports_the_new_state() {
+        let mut overlay = Overlay::new();
+        assert!(!overlay.pinned);
+        assert!(overlay.toggle_pin());
+        assert!(overlay.pinned);
+        assert!(!overlay.toggle_pin());
+        assert!(!overlay.pinned);
     }
 
     #[test]

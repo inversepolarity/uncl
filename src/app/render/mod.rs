@@ -38,13 +38,17 @@ use vt100::Screen;
 
 use crate::app::images::Store;
 use crate::app::term::links::{Link, Links, OSC8_CLOSE};
-use crate::constants::content_rect;
+use crate::constants::{content_rect, PIN_WIDTH};
 use crate::geometry::Rect;
 
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const RESET: &[u8] = b"\x1b[0m";
 const BORDER_COLOR: &[u8] = b"\x1b[32m";
+/// The pin's box while it is filled. Red, because "this float stays put" is a
+/// state worth noticing at a glance; the empty box is drawn in the border's own
+/// colour, so an unfilled toggle does not read as an error.
+const PIN_COLOR: &[u8] = b"\x1b[31m";
 const BORDER_VERTICAL: &str = "│";
 /// kitty: delete every placement (not the image data). Sent when the float goes
 /// away, because kitty images live in a layer that our own repaint cannot touch.
@@ -76,6 +80,8 @@ pub struct Panes<'a> {
     /// border, which is otherwise unused: the size and the scroll offset live in
     /// the bottom one.
     pub float_title: Option<&'a str>,
+    /// Is the float pinned? Its top-right corner shows `[■]` instead of `[ ]`.
+    pub pinned: bool,
 }
 
 /// The hyperlinks each pane drew this frame (`OSC 8`, S3.5).
@@ -174,6 +180,7 @@ impl Renderer {
             scroll,
             focused_scrolled,
             float_title,
+            pinned,
         } = panes;
         let float_at = float.as_ref().map(|(screen, rect)| (screen, *rect));
 
@@ -261,6 +268,7 @@ impl Renderer {
                 &links.float,
                 scroll,
                 float_title,
+                pinned,
             );
         }
 
@@ -592,6 +600,7 @@ fn emit_float(
     links: &Links,
     scroll: usize,
     title: Option<&str>,
+    pinned: bool,
 ) {
     let width = content.width;
 
@@ -634,9 +643,60 @@ fn emit_float(
             Corner::BottomLeft,
             Corner::BottomRight,
         );
-        emit_top_title(out, rect, title);
+        // The title is clipped to leave the pin its three cells, so a child that
+        // names itself a hundred characters long cannot paint over the toggle.
+        emit_top_title(out, rect, title, pin_room(rect));
         emit_title(out, rect, content, scroll);
+        // Last, because it lives in the corner the border already drew: it wins.
+        emit_pin(out, rect, pinned);
     }
+}
+
+/// Cells the pin control needs in the top border, or 0 when the float is too
+/// narrow for it.
+fn pin_room(rect: Rect) -> u16 {
+    if usize::from(rect.width) >= usize::from(PIN_WIDTH) + 2 {
+        PIN_WIDTH
+    } else {
+        0
+    }
+}
+
+/// Paint the pin control in the right end of the float's top border: `[ ]` while
+/// it can be unpinned by a click, `[■]` while it is pinned.
+///
+/// The box is red only when filled — an empty box is a toggle that is off, not
+/// an error, so it is drawn in the border's own colour.
+fn emit_pin(out: &mut Vec<u8>, rect: Rect, pinned: bool) {
+    if pin_room(rect) == 0 {
+        return;
+    }
+
+    let row = rect.y;
+    let start = rect.right().saturating_sub(PIN_WIDTH);
+
+    cup(out, row, start);
+    out.extend_from_slice(BORDER_COLOR);
+    out.push(b'[');
+    reset(out);
+
+    cup(out, row, start + 1);
+    if pinned {
+        out.extend_from_slice(PIN_COLOR);
+        out.push(b'■');
+        reset(out);
+    } else {
+        // In the border's own colour, so an empty box reads as part of the frame
+        // rather than a gap in it.
+        out.extend_from_slice(BORDER_COLOR);
+        out.push(b' ');
+        reset(out);
+    }
+
+    cup(out, row, start + 2);
+    out.extend_from_slice(BORDER_COLOR);
+    out.push(b']');
+    reset(out);
 }
 
 /// Paint one row of the float: both border cells, the child's cells, and — when
@@ -836,14 +896,16 @@ fn emit_horizontal_border(
 /// The child's own name, printed in the top border, left-aligned after the corner.
 ///
 /// Truncated to the room the border has, because a title comes from a child and a
-/// child can print anything. The count is of characters, not cells: the border is
-/// decoration, and a wide glyph in a title is not worth a `unicode-width`
-/// dependency in the one function that would use it.
-fn emit_top_title(out: &mut Vec<u8>, rect: Rect, title: Option<&str>) {
+/// child can print anything. The room is what is left after the pin control's
+/// cells at the right end, so a long name cannot reach into the toggle. The count
+/// is of characters, not cells: the border is decoration, and a wide glyph in a
+/// title is not worth a `unicode-width` dependency in the one function that would
+/// use it.
+fn emit_top_title(out: &mut Vec<u8>, rect: Rect, title: Option<&str>, pin: u16) {
     let Some(title) = title else {
         return;
     };
-    let available = usize::from(rect.width.saturating_sub(2));
+    let available = usize::from(rect.width.saturating_sub(2).saturating_sub(pin));
     if available == 0 {
         return;
     }
@@ -1145,6 +1207,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
 
         let frame = text(frame);
@@ -1171,6 +1234,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
 
         let second = renderer.render(Panes {
@@ -1183,6 +1247,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
         assert!(second.is_empty(), "second frame: {:?}", text(second));
     }
@@ -1204,6 +1269,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
 
         parser.process(b"\r\nchanged");
@@ -1217,6 +1283,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         assert!(frame.contains("changed"), "frame: {frame:?}");
@@ -1243,6 +1310,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         assert!(frame.contains("floating"), "frame: {frame:?}");
@@ -1271,6 +1339,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
         // The float disappearing is a repaint, but the owner's cells are intact.
         let frame = text(renderer.render(Panes {
@@ -1283,6 +1352,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
         assert!(frame.is_empty(), "frame: {frame:?}");
     }
@@ -1304,6 +1374,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         assert!(frame.contains("\x1b[?25l"), "frame: {frame:?}");
@@ -1338,6 +1409,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         let el_at = frame.find("\x1b[K").expect("the float row should erase");
@@ -1370,6 +1442,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         };
 
         let mut renderer = Renderer::new();
@@ -1397,6 +1470,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         };
 
         let mut renderer = Renderer::new();
@@ -1429,6 +1503,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
 
         // Nothing changed, so nothing is painted…
@@ -1442,6 +1517,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
         assert!(quiet.is_empty());
 
@@ -1457,6 +1533,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         assert!(frame.contains("owner"), "frame: {frame:?}");
@@ -1500,6 +1577,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         let row_at = frame.find("hi").expect("the float row is painted");
@@ -1533,6 +1611,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
 
         let second = renderer.render(Panes {
@@ -1545,6 +1624,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
         assert!(second.is_empty(), "frame: {:?}", text(second));
     }
@@ -1570,6 +1650,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
 
         // The float moved: same image, one line of placement, no payload.
@@ -1585,6 +1666,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         assert!(frame.contains("\x1b_Ga=p,i=7\x1b\\"), "frame: {frame:?}");
@@ -1612,6 +1694,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
 
         // `Home`: the kitty image lives in a layer our repaint cannot reach.
@@ -1626,6 +1709,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
         assert!(hidden.contains("\x1b_Ga=d,d=A\x1b\\"), "frame: {hidden:?}");
 
@@ -1641,6 +1725,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
         assert!(shown.contains("QUJD"), "frame: {shown:?}");
     }
@@ -1665,6 +1750,7 @@ mod tests {
                 scroll: 0,
                 focused_scrolled: false,
                 float_title: title,
+                pinned: false,
             }))
         };
 
@@ -1680,13 +1766,57 @@ mod tests {
         let renamed = frame_for(Some("nvim"));
         assert!(renamed.contains("nvim"), "frame: {renamed:?}");
 
-        // A title longer than the border is clipped inside it, and the right-hand
-        // corner survives: a child must not be able to paint over the frame.
+        // A title longer than the border is clipped inside it, and the frame
+        // survives: a child must not be able to paint over it. The float is 22
+        // cells wide, so the border leaves 17 after its two corners and the pin
+        // takes the last three of them — the title is clipped to the 16 before.
         let long_title = "x".repeat(200);
         let long = frame_for(Some(long_title.as_str()));
-        assert!(long.contains(&"x".repeat(19)), "frame: {long:?}");
-        assert!(!long.contains(&"x".repeat(21)), "frame: {long:?}");
-        assert!(long.contains('┐'), "frame: {long:?}");
+        assert!(long.contains(&"x".repeat(16)), "frame: {long:?}");
+        assert!(!long.contains(&"x".repeat(18)), "frame: {long:?}");
+        // The pin's right bracket, colour and all: the corner it covers is gone.
+        assert!(long.contains("m]"), "frame: {long:?}");
+        assert!(!long.contains('┐'), "frame: {long:?}");
+    }
+
+    #[test]
+    fn the_pin_control_is_drawn_in_the_top_right_corner() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 20);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 22, 5);
+        let mut renderer = Renderer::new();
+        let frame_for = |renderer: &mut Renderer, pinned: bool| {
+            text(renderer.render(Panes {
+                owner: owner.screen().clone(),
+                owner_area: Rect::new(0, 0, 40, 10),
+                float: Some((float.screen().clone(), rect)),
+                float_focused: true,
+                images: None,
+                links: FrameLinks::default(),
+                scroll: 0,
+                focused_scrolled: false,
+                float_title: None,
+                pinned,
+            }))
+        };
+
+        // Unpinned: an empty box in the border's own colour.
+        let unpinned = frame_for(&mut renderer, false);
+        assert!(unpinned.contains("m["), "frame: {unpinned:?}");
+        assert!(unpinned.contains("m]"), "frame: {unpinned:?}");
+        assert!(!unpinned.contains(PIN_COLOR), "frame: {unpinned:?}");
+
+        // Pinned: the box is filled, and filled red — and the corner it covers
+        // is gone. The caller invalidates when the pin flips, which is what
+        // repaints the border it lives in.
+        renderer.invalidate();
+        let pinned = frame_for(&mut renderer, true);
+        assert!(pinned.contains("m■"), "frame: {pinned:?}");
+        assert!(pinned.contains(PIN_COLOR), "frame: {pinned:?}");
+        assert!(!pinned.contains('┐'), "frame: {pinned:?}");
     }
 
     #[test]
@@ -1710,6 +1840,7 @@ mod tests {
                 scroll,
                 focused_scrolled: scroll > 0,
                 float_title: None,
+                pinned: false,
             }))
         };
 
@@ -1754,6 +1885,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
 
         // Text painted over sixel destroys it, so any repaint has to be followed
@@ -1769,6 +1901,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
         assert!(frame.contains("more"), "frame: {frame:?}");
         assert!(frame.contains("\x1bPq"), "frame: {frame:?}");
@@ -1800,6 +1933,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
         assert!(!frame.contains("QUJD"), "frame: {frame:?}");
     }
@@ -1864,6 +1998,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         assert!(frame.contains("1337;File="), "frame: {frame:?}");
@@ -1905,6 +2040,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         let open = frame.find("\x1b]8;;https://example.com\x1b\\");
@@ -1940,6 +2076,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         });
 
         // The cells do not change; only the link is added. A diff would show
@@ -1964,6 +2101,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
         assert!(
             frame.contains("\x1b]8;;https://example.com\x1b\\"),
@@ -1996,6 +2134,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
         assert!(!frame.contains("\x1b]8;"), "no link over the wrong words: {frame:?}");
     }
@@ -2023,6 +2162,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         }));
 
         let open = frame.find("\x1b]8;;file:///tmp\x1b\\").expect("opened");
@@ -2076,6 +2216,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: true,
             float_title: None,
+            pinned: false,
         }));
         assert!(frame.contains(&oldest), "frame: {frame:?}");
         assert!(!frame.contains("line9"), "frame: {frame:?}");
@@ -2101,6 +2242,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: scroll > 0,
             float_title: None,
+            pinned: false,
         };
 
         // The live screen first, in full: the newest line is on it.
@@ -2122,6 +2264,7 @@ mod tests {
             scroll: 0,
             focused_scrolled: true,
             float_title: None,
+            pinned: false,
         }));
         assert!(!back.is_empty(), "scrolling must repaint");
 
@@ -2155,6 +2298,7 @@ mod tests {
                 scroll,
                 focused_scrolled: scroll > 0,
                 float_title: None,
+                pinned: false,
             }))
         };
 

@@ -131,6 +131,7 @@ fn frame_for(renderer: &mut Renderer, screen: &vt100::Screen) -> Vec<u8> {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         })
         .to_vec()
 }
@@ -280,6 +281,7 @@ fn a_resize_repaints_and_the_result_replays() {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         })
         .to_vec();
     assert!(!frame.is_empty(), "a resize must repaint");
@@ -344,6 +346,7 @@ fn a_float_replays_over_the_owner_grid() {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         })
         .to_vec();
     assert!(!frame.is_empty());
@@ -413,6 +416,7 @@ fn a_linked_row_replays_to_the_same_cells() {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         })
         .to_vec();
 
@@ -471,6 +475,7 @@ fn an_image_does_not_disturb_the_grid() {
             scroll: 0,
             focused_scrolled: false,
             float_title: None,
+            pinned: false,
         })
         .to_vec();
 
@@ -539,6 +544,7 @@ fn a_resize_that_changes_nothing_paints_nothing_until_it_is_invalidated() {
                 scroll: 0,
                 focused_scrolled: false,
                 float_title: None,
+                pinned: false,
             })
             .to_vec()
     };

@@ -1,4 +1,4 @@
-# uncl 0.1.0b
+# uncl 0.1.1b
 
 [![release](https://github.com/inversepolarity/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/inversepolarity/uncl/actions/workflows/release.yml)
 
@@ -15,30 +15,23 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 ## features
 
 - toggle a floating terminal with a single `[Home]` key
+- pin the float in place with the `[ ]` in its top-right corner: a pinned float
+  (`[■]`, in red) does not hide when you click outside it, so the shell behind it
+  can be used at the same time
 - floating term is draggable and resizeable with mouse
 - floating term is draggable and resizeable with keyboard
 - supports most shells, tested on zsh, bash
 - supports most terminal emulators, tested on wezterm
-- images inside the float: kitty graphics and iTerm2 inline images are carried
-  through (`chafa --format=kitty`, `wezterm imgcat`, `timg -pk`, ...)
-- clickable links inside the float (`OSC 8`): `ls --hyperlink=always`, `gh`,
-  `gcc -fdiagnostics-urls` and friends work; children see `FORCE_HYPERLINK=1`.
-  a plain click opens one, in the float or in the shell behind it - `http`,
-  `https`, `mailto`, `file` and `ftp` only, and only when the program that printed
-  it is not using the mouse itself
-- scrollback in both panes - the float and the shell behind it - sized by
-  `UNCL_SCROLLBACK` from the environment you launch uncl in
-- the float's border shows the child's window title (`OSC 0/2`), so a float
-  running `nvim` or `ssh` says what it is; its size and scroll offset sit in the
-  bottom border
-- copy and paste (`OSC 52`): copies are relayed to your real clipboard, and a
-  paste request reads it back - from what a child copied in this session, or from
-  the desktop through `wl-paste`/`xclip`/`xsel`/`pbpaste`/`Get-Clipboard`
+- images inside the float
+- clickable links inside the float
+- scrollback in both panes
+- mouse support in both panes
+- copy and paste (`OSC 52`)
 - children get your terminal's `TERM` (alacritty, foot, wezterm, xterm...), and
   `xterm-256color` where uncl cannot carry what that `TERM` implies: `screen`/
   `tmux` dialects, and kitty's keyboard protocol. `uncl --doctor` prints both
 
-### images: what is, and is not, supported
+### images: caveats
 
 uncl does not decode, scale or re-encode anything. The child's bytes are carried
 through to your terminal and re-emitted inside the float, so what you get is
@@ -95,7 +88,7 @@ cargo install --path .
 
 ## auto load with shell
 
-to auto-load uncl with your shell, add the following snippet to your .{shell}rc:
+to auto-load uncl with your shell, add the following snippet to your `.{shell}rc`:
 
 ```
 if [[ -z "$UNCL_STARTED" ]]; then

@@ -50,6 +50,7 @@ pub struct Size {
 }
 
 /// What the input handler wants the loop to do next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Flow {
     Continue,
     /// Pane geometry, visibility or terminal size changed: repaint.
@@ -347,7 +348,10 @@ impl Container {
                 self.tenant_scroll = screen.scrollback();
             }
         }
-        let focused_scrolled = if visible {
+        // Which pane's scroll offset the frame is showing: the focused one. A
+        // pinned float is visible without being focused, and then the owner's
+        // offset is the one on screen.
+        let focused_scrolled = if self.float_focused() {
             self.tenant_scroll > 0
         } else {
             self.owner_scroll > 0
@@ -382,13 +386,14 @@ impl Container {
             owner,
             owner_area,
             float,
-            float_focused: visible,
+            float_focused: visible && self.lease.tenant_focused,
             images: if scrolled_away { None } else { Some(&*images) },
             links,
             // Shown in the float's bottom border while scrolled back.
             scroll: self.tenant_scroll,
             focused_scrolled,
             float_title: float_title.as_deref(),
+            pinned: self.lease.tenant.pinned,
         });
 
         if !bytes.is_empty() {
@@ -399,9 +404,22 @@ impl Container {
         Ok(())
     }
 
-    /// Is the float focused (visible and alive)?
+    /// Is the float focused: on screen, alive, and holding the pointer?
+    ///
+    /// Being on screen and owning the keyboard are separate once the float can be
+    /// pinned — a pinned float stays visible while the owner pane has the keyboard.
     fn float_focused(&self) -> bool {
-        self.lease.tenant_visible && self.tenant_running()
+        self.lease.tenant_visible && self.tenant_running() && self.lease.tenant_focused
+    }
+
+    /// Give the keyboard back to the owner pane, leaving a pinned float on
+    /// screen. Repaints so the cursor moves into the owner's grid.
+    fn unfocus_float(&mut self) {
+        if self.lease.tenant_focused {
+            self.lease.tenant_focused = false;
+            self.refocus(false);
+        }
+        self.renderer.invalidate();
     }
 
     /// The modes of whichever child currently owns the keyboard.
@@ -684,6 +702,8 @@ impl Container {
         if key.code == KeyCode::Home && key.modifiers.is_empty() {
             self.lease.tenant_visible = !self.lease.tenant_visible;
             self.lease.tenant.child_grab = false;
+            // Showing the float takes the keyboard; hiding it gives it back.
+            self.lease.tenant_focused = self.lease.tenant_visible;
             if self.lease.tenant_visible {
                 self.lease.sync_size();
             } else {
@@ -747,9 +767,30 @@ impl Container {
     fn handle_mouse(&mut self, m: MouseEvent) -> Flow {
         let term_size = (self.size.cols, self.size.rows);
 
-        if !self.float_focused() {
+        // Being on screen and owning the pointer are two different things once
+        // the float can be pinned: a pinned float stays visible while the owner
+        // pane has the keyboard.
+        if !self.lease.tenant_visible || !self.tenant_running() {
             return self.forward_owner_mouse(m);
         }
+
+        let was_focused = self.lease.tenant_focused;
+        if !self.lease.tenant_focused {
+            // The float is on screen but the owner pane has the keyboard. A press
+            // on the float takes it back; a wheel over it scrolls the float, as
+            // it does when the float has the keyboard. Anything else — a press
+            // on the owner pane, a wheel over it — is the owner's, and leaves
+            // the float exactly where it is.
+            if !self.lease.tenant.rect.contains(m.column, m.row) {
+                return self.forward_owner_mouse(m);
+            }
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.lease.tenant_focused = true;
+                self.refocus(true);
+                self.renderer.invalidate();
+            }
+        }
+        let focus_changed = was_focused != self.lease.tenant_focused;
 
         match mouse::route(&self.lease.tenant, m) {
             MouseRoute::Child { col, row } => {
@@ -781,7 +822,11 @@ impl Container {
                     _ => {}
                 }
 
-                Flow::Continue
+                if focus_changed {
+                    Flow::Redraw
+                } else {
+                    Flow::Continue
+                }
             }
 
             MouseRoute::Local => {
@@ -792,6 +837,13 @@ impl Container {
                 }
 
                 if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    // A pinned float keeps its place when the pointer leaves it:
+                    // the owner pane takes the keyboard instead of the float
+                    // disappearing. A press on the float itself is a drag, a
+                    // resize, or a click on its chrome — those keep it.
+                    if !self.lease.tenant.rect.contains(m.column, m.row) {
+                        self.unfocus_float();
+                    }
                     mouse::begin(&mut self.lease.tenant, m);
                     // A press that starts a drag or a resize is not a link click.
                     self.link_press = None;
@@ -813,10 +865,23 @@ impl Container {
                 Flow::Redraw
             }
 
+            MouseRoute::TogglePin => {
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    // Pinned floats stop hiding on click-away; that is the whole
+                    // point of the control. The border has to be repainted with
+                    // it, so the frame is invalidated rather than diffed.
+                    self.lease.tenant.toggle_pin();
+                    self.renderer.invalidate();
+                    return Flow::Redraw;
+                }
+                Flow::Continue
+            }
+
             MouseRoute::HideFloat => {
                 if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                     self.lease.tenant_visible = false;
                     self.lease.tenant.child_grab = false;
+                    self.lease.tenant_focused = false;
                     self.renderer.invalidate();
                     return Flow::Redraw;
                 }
@@ -966,11 +1031,15 @@ impl Container {
 
                 if due {
                     let was_visible = self.lease.tenant_visible;
+                    let was_pinned = self.lease.tenant.pinned;
+                    let was_focused = self.lease.tenant_focused;
                     self.lease = Lease::new(self.caps.clone(), self.host_tx.clone());
 
                     match self.init_tenant() {
                         Ok(()) => {
                             self.lease.tenant_visible = was_visible;
+                            self.lease.tenant.pinned = was_pinned;
+                            self.lease.tenant_focused = was_focused;
                             self.tenant_scroll = 0;
                             self.link_press = None;
                             self.tenant_retry_after = None;
@@ -1107,5 +1176,66 @@ fn open_url(bytes: &[u8]) {
             });
         }
         Err(err) => eprintln!("uncl: could not open {url}: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    #[test]
+    fn clicking_inside_inactive_pinned_tenant_restores_focus_and_redraws() {
+        let mut container = Container::new();
+        container.lease.attach(PtySession::dummy());
+        container.lease.tenant_visible = true;
+        container.lease.tenant.pinned = true;
+        container.lease.tenant_focused = false;
+
+        let content = container.lease.tenant.content_rect();
+        let click_x = content.x + 2;
+        let click_y = content.y + 2;
+
+        let mouse_event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: click_x,
+            row: click_y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let flow = container.handle_mouse(mouse_event);
+        assert_eq!(
+            flow,
+            Flow::Redraw,
+            "activating pinned tenant must trigger immediate redraw"
+        );
+        assert!(
+            container.lease.tenant_focused,
+            "tenant must be focused after click"
+        );
+
+        let flow2 = container.handle_mouse(mouse_event);
+        assert_eq!(
+            flow2,
+            Flow::Continue,
+            "subsequent click while focused does not force redraw"
+        );
+
+        let outside_event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let flow3 = container.handle_mouse(outside_event);
+        assert_eq!(
+            flow3,
+            Flow::Redraw,
+            "unfocusing tenant must trigger redraw"
+        );
+        assert!(
+            !container.lease.tenant_focused,
+            "tenant must be unfocused after clicking outside"
+        );
     }
 }

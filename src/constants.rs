@@ -95,6 +95,10 @@ pub const PTY_WRITE_BATCH: usize = 64 * 1024;
 /// keeps the pty, the parser and the painted area in agreement.
 pub const TENANT_BORDER: u16 = 1;
 
+/// Cells the pin control occupies in the right end of the float's top border:
+/// `[ ]` while it can be unpinned by a click, `[■]` while it is pinned.
+pub const PIN_WIDTH: u16 = 3;
+
 /// The rectangle the float's child draws into, from the float's outer rect.
 ///
 /// Used by the overlay (to size the pty and the parser) and by the renderer (to

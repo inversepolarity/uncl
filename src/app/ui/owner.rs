@@ -50,6 +50,7 @@ pub struct Size {
 }
 
 /// What the input handler wants the loop to do next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Flow {
     Continue,
     /// Pane geometry, visibility or terminal size changed: repaint.
@@ -773,6 +774,7 @@ impl Container {
             return self.forward_owner_mouse(m);
         }
 
+        let was_focused = self.lease.tenant_focused;
         if !self.lease.tenant_focused {
             // The float is on screen but the owner pane has the keyboard. A press
             // on the float takes it back; a wheel over it scrolls the float, as
@@ -782,12 +784,13 @@ impl Container {
             if !self.lease.tenant.rect.contains(m.column, m.row) {
                 return self.forward_owner_mouse(m);
             }
-            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
                 self.lease.tenant_focused = true;
                 self.refocus(true);
                 self.renderer.invalidate();
             }
         }
+        let focus_changed = was_focused != self.lease.tenant_focused;
 
         match mouse::route(&self.lease.tenant, m) {
             MouseRoute::Child { col, row } => {
@@ -819,7 +822,11 @@ impl Container {
                     _ => {}
                 }
 
-                Flow::Continue
+                if focus_changed {
+                    Flow::Redraw
+                } else {
+                    Flow::Continue
+                }
             }
 
             MouseRoute::Local => {
@@ -1169,5 +1176,66 @@ fn open_url(bytes: &[u8]) {
             });
         }
         Err(err) => eprintln!("uncl: could not open {url}: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    #[test]
+    fn clicking_inside_inactive_pinned_tenant_restores_focus_and_redraws() {
+        let mut container = Container::new();
+        container.lease.attach(PtySession::dummy());
+        container.lease.tenant_visible = true;
+        container.lease.tenant.pinned = true;
+        container.lease.tenant_focused = false;
+
+        let content = container.lease.tenant.content_rect();
+        let click_x = content.x + 2;
+        let click_y = content.y + 2;
+
+        let mouse_event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: click_x,
+            row: click_y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let flow = container.handle_mouse(mouse_event);
+        assert_eq!(
+            flow,
+            Flow::Redraw,
+            "activating pinned tenant must trigger immediate redraw"
+        );
+        assert!(
+            container.lease.tenant_focused,
+            "tenant must be focused after click"
+        );
+
+        let flow2 = container.handle_mouse(mouse_event);
+        assert_eq!(
+            flow2,
+            Flow::Continue,
+            "subsequent click while focused does not force redraw"
+        );
+
+        let outside_event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let flow3 = container.handle_mouse(outside_event);
+        assert_eq!(
+            flow3,
+            Flow::Redraw,
+            "unfocusing tenant must trigger redraw"
+        );
+        assert!(
+            !container.lease.tenant_focused,
+            "tenant must be unfocused after clicking outside"
+        );
     }
 }

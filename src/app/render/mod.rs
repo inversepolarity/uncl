@@ -38,13 +38,14 @@ use vt100::Screen;
 
 use crate::app::images::Store;
 use crate::app::term::links::{Link, Links, OSC8_CLOSE};
-use crate::constants::{content_rect, PIN_WIDTH};
+use crate::constants::{PIN_WIDTH, content_rect};
 use crate::geometry::Rect;
 
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const RESET: &[u8] = b"\x1b[0m";
 const BORDER_COLOR: &[u8] = b"\x1b[32m";
+const BORDER_COLOR_INACTIVE: &[u8] = b"\x1b[90m";
 /// The pin's box while it is filled. Red, because "this float stays put" is a
 /// state worth noticing at a glance; the empty box is drawn in the border's own
 /// colour, so an unfilled toggle does not read as an error.
@@ -123,6 +124,8 @@ pub struct Renderer {
     scroll: usize,
     /// The title the top border was last drawn with, so a rename repaints it.
     title: Option<String>,
+    /// Whether the float was drawn with the inactive pinned border color.
+    inactive_pinned: bool,
 }
 
 impl Renderer {
@@ -142,6 +145,7 @@ impl Renderer {
             images_forgotten: false,
             scroll: 0,
             title: None,
+            inactive_pinned: false,
         }
     }
 
@@ -187,8 +191,17 @@ impl Renderer {
         } = panes;
         let float_at = float.as_ref().map(|(screen, rect)| (screen, *rect));
 
+        let inactive_pinned = pinned && !float_focused;
+        let border_color_changed = self.inactive_pinned != inactive_pinned;
+        self.inactive_pinned = inactive_pinned;
+        let border_color = if inactive_pinned {
+            BORDER_COLOR_INACTIVE
+        } else {
+            BORDER_COLOR
+        };
+
         let owner_full = self.force_full || self.owner_prev.is_none();
-        let float_full = self.force_full || self.float_prev.is_none();
+        let float_full = self.force_full || self.float_prev.is_none() || border_color_changed;
 
         // The scroll offset and the title are drawn in the border, so a change to
         // either has to repaint it — a rename that never appears is worse than no
@@ -272,6 +285,7 @@ impl Renderer {
                 scroll,
                 float_title,
                 pinned,
+                border_color,
             );
         }
 
@@ -393,7 +407,11 @@ impl Renderer {
                         .unwrap_or_else(|| image.render(Some(avail))),
                     _ => image.render(Some(avail)),
                 };
-                cup(&mut self.out, content.y.saturating_add(row), content.x.saturating_add(col));
+                cup(
+                    &mut self.out,
+                    content.y.saturating_add(row),
+                    content.x.saturating_add(col),
+                );
                 self.out.extend_from_slice(&bytes);
                 emitted = true;
             }
@@ -457,12 +475,7 @@ fn rows_equal(cur: &Screen, prev: &Screen, row: u16, width: u16) -> bool {
     true
 }
 
-fn dirty_rows(
-    cur: &Screen,
-    prev: Option<&Screen>,
-    area: Rect,
-    full: bool,
-) -> Vec<u16> {
+fn dirty_rows(cur: &Screen, prev: Option<&Screen>, area: Rect, full: bool) -> Vec<u16> {
     if full {
         return (0..area.height).collect();
     }
@@ -604,6 +617,7 @@ fn emit_float(
     scroll: usize,
     title: Option<&str>,
     pinned: bool,
+    border_color: &[u8],
 ) {
     let width = content.width;
 
@@ -624,7 +638,19 @@ fn emit_float(
                 diff_at = row.saturating_add(1);
 
                 if !text.is_empty() {
-                    emit_float_row(out, owner, cur, content, rect, owner_area, row, &text, false, links);
+                    emit_float_row(
+                        out,
+                        owner,
+                        cur,
+                        content,
+                        rect,
+                        owner_area,
+                        row,
+                        &text,
+                        false,
+                        links,
+                        border_color,
+                    );
                 }
             }
             FloatRow::Full(row) => {
@@ -632,26 +658,39 @@ fn emit_float(
                     .rows_formatted(0, width)
                     .nth(usize::from(row))
                     .unwrap_or_default();
-                emit_float_row(out, owner, cur, content, rect, owner_area, row, &text, true, links);
+                emit_float_row(
+                    out,
+                    owner,
+                    cur,
+                    content,
+                    rect,
+                    owner_area,
+                    row,
+                    &text,
+                    true,
+                    links,
+                    border_color,
+                );
             }
         }
     }
 
     if borders {
-        emit_horizontal_border(out, rect, rect.y, Corner::TopLeft, Corner::TopRight);
+        emit_horizontal_border(out, rect, rect.y, Corner::TopLeft, Corner::TopRight, border_color);
         emit_horizontal_border(
             out,
             rect,
             rect.bottom().saturating_sub(1),
             Corner::BottomLeft,
             Corner::BottomRight,
+            border_color,
         );
         // The title is clipped to leave the pin its three cells, so a child that
         // names itself a hundred characters long cannot paint over the toggle.
-        emit_top_title(out, rect, title, pin_room(rect));
-        emit_title(out, rect, content, scroll);
+        emit_top_title(out, rect, title, pin_room(rect), border_color);
+        emit_title(out, rect, content, scroll, border_color);
         // Last, because it lives in the corner the border already drew: it wins.
-        emit_pin(out, rect, pinned);
+        emit_pin(out, rect, pinned, border_color);
     }
 }
 
@@ -670,16 +709,16 @@ fn pin_room(rect: Rect) -> u16 {
 ///
 /// The box is red only when filled — an empty box is a toggle that is off, not
 /// an error, so it is drawn in the border's own colour.
-fn emit_pin(out: &mut Vec<u8>, rect: Rect, pinned: bool) {
+fn emit_pin(out: &mut Vec<u8>, rect: Rect, pinned: bool, border_color: &[u8]) {
     if pin_room(rect) == 0 {
         return;
     }
 
     let row = rect.y;
-    let start = rect.right().saturating_sub(PIN_WIDTH);
+    let start = rect.right().saturating_sub(PIN_WIDTH + 1);
 
     cup(out, row, start);
-    out.extend_from_slice(BORDER_COLOR);
+    out.extend_from_slice(border_color);
     out.push(b'[');
     reset(out);
 
@@ -691,13 +730,13 @@ fn emit_pin(out: &mut Vec<u8>, rect: Rect, pinned: bool) {
     } else {
         // In the border's own colour, so an empty box reads as part of the frame
         // rather than a gap in it.
-        out.extend_from_slice(BORDER_COLOR);
+        out.extend_from_slice(border_color);
         out.push(b' ');
         reset(out);
     }
 
     cup(out, row, start + 2);
-    out.extend_from_slice(BORDER_COLOR);
+    out.extend_from_slice(border_color);
     out.push(b']');
     reset(out);
 }
@@ -716,11 +755,12 @@ fn emit_float_row(
     text: &str,
     blank_first: bool,
     links: &Links,
+    border_color: &[u8],
 ) {
     let screen_row = content.y.saturating_add(row);
 
     cup(out, screen_row, rect.x);
-    border_char(out, BORDER_VERTICAL);
+    border_char(out, BORDER_VERTICAL, border_color);
 
     cup(out, screen_row, content.x);
     reset(out);
@@ -738,7 +778,7 @@ fn emit_float_row(
 
     // After the row: an `EL` inside it would have erased the border cell.
     cup(out, screen_row, rect.right().saturating_sub(1));
-    border_char(out, BORDER_VERTICAL);
+    border_char(out, BORDER_VERTICAL, border_color);
 
     if erased {
         repair_tail(out, owner, screen_row, rect, owner_area);
@@ -877,6 +917,7 @@ fn emit_horizontal_border(
     row: u16,
     left: Corner,
     right: Corner,
+    border_color: &[u8],
 ) {
     let width = usize::from(rect.width);
     if width < 2 {
@@ -891,7 +932,7 @@ fn emit_horizontal_border(
     line.push(right.ch());
 
     cup(out, row, rect.x);
-    out.extend_from_slice(BORDER_COLOR);
+    out.extend_from_slice(border_color);
     out.extend_from_slice(line.as_bytes());
     reset(out);
 }
@@ -904,7 +945,7 @@ fn emit_horizontal_border(
 /// is of characters, not cells: the border is decoration, and a wide glyph in a
 /// title is not worth a `unicode-width` dependency in the one function that would
 /// use it.
-fn emit_top_title(out: &mut Vec<u8>, rect: Rect, title: Option<&str>, pin: u16) {
+fn emit_top_title(out: &mut Vec<u8>, rect: Rect, title: Option<&str>, pin: u16, border_color: &[u8]) {
     let Some(title) = title else {
         return;
     };
@@ -923,14 +964,14 @@ fn emit_top_title(out: &mut Vec<u8>, rect: Rect, title: Option<&str>, pin: u16) 
     }
 
     cup(out, rect.y, rect.x.saturating_add(1));
-    out.extend_from_slice(BORDER_COLOR);
+    out.extend_from_slice(border_color);
     out.extend_from_slice(painted.as_bytes());
     reset(out);
 }
 
 /// The child's size, printed in the bottom border — plus how far back the view is
 /// scrolled, if it is. ASCII only, so `len()` is the cell count.
-fn emit_title(out: &mut Vec<u8>, rect: Rect, content: Rect, scroll: usize) {
+fn emit_title(out: &mut Vec<u8>, rect: Rect, content: Rect, scroll: usize, border_color: &[u8]) {
     let title = if scroll > 0 {
         format!("s:{}:{} +{}", content.height, content.width, scroll)
     } else {
@@ -947,13 +988,13 @@ fn emit_title(out: &mut Vec<u8>, rect: Rect, content: Rect, scroll: usize) {
         .saturating_add(available as u16 - title.len() as u16);
 
     cup(out, rect.bottom().saturating_sub(1), start);
-    out.extend_from_slice(BORDER_COLOR);
+    out.extend_from_slice(border_color);
     out.extend_from_slice(title.as_bytes());
     reset(out);
 }
 
-fn border_char(out: &mut Vec<u8>, text: &str) {
-    out.extend_from_slice(BORDER_COLOR);
+fn border_char(out: &mut Vec<u8>, text: &str, border_color: &[u8]) {
+    out.extend_from_slice(border_color);
     out.extend_from_slice(text.as_bytes());
     reset(out);
 }
@@ -1424,7 +1465,9 @@ mod tests {
         assert!(cup_at > el_at, "frame: {frame:?}");
         // …and the owner's text follows it (rfind: the first TAIL is the owner's own
         // full repaint, which happens before the float is drawn).
-        let tail_at = frame.rfind("TAIL").expect("the owner tail should be repainted");
+        let tail_at = frame
+            .rfind("TAIL")
+            .expect("the owner tail should be repainted");
         assert!(tail_at > cup_at, "frame: {frame:?}");
     }
 
@@ -1590,7 +1633,10 @@ mod tests {
         // Anchored at (row 1, col 2) inside the child's grid, translated.
         let content = content_rect(rect);
         let cup_at = frame.find(&format!("\x1b[{};{}H", content.y + 2, content.x + 3));
-        assert!(cup_at.is_some_and(|cup_at| cup_at < image_at), "frame: {frame:?}");
+        assert!(
+            cup_at.is_some_and(|cup_at| cup_at < image_at),
+            "frame: {frame:?}"
+        );
     }
 
     #[test]
@@ -1673,7 +1719,10 @@ mod tests {
         }));
 
         assert!(frame.contains("\x1b_Ga=p,i=7\x1b\\"), "frame: {frame:?}");
-        assert!(!frame.contains("QUJD"), "the payload must not be re-sent: {frame:?}");
+        assert!(
+            !frame.contains("QUJD"),
+            "the payload must not be re-sent: {frame:?}"
+        );
     }
 
     #[test]
@@ -1777,16 +1826,14 @@ mod tests {
         let long = frame_for(Some(long_title.as_str()));
         assert!(long.contains(&"x".repeat(16)), "frame: {long:?}");
         assert!(!long.contains(&"x".repeat(18)), "frame: {long:?}");
-        // The pin's right bracket, colour and all — painted over the corner the
-        // border drew, not beside it, so a replay ends on `]`.
+        // The pin's right bracket ends at the penultimate cell, leaving the
+        // corner intact after it.
         assert!(long.contains("m]"), "frame: {long:?}");
         let corner = long.find('┐').expect("the border draws its corner first");
-        let bracket = long.find("m]").expect("then the pin covers it");
+        let bracket = long.find("m]").expect("then the pin is drawn");
         assert!(corner < bracket, "frame: {long:?}");
     }
 
-    #[test]
-    fn scrolling_back_clears_the_image_layer_and_returning_sends_it_again() {
     #[test]
     fn the_pin_control_is_drawn_in_the_top_right_corner() {
         let mut owner = parser(10, 40);
@@ -1807,7 +1854,6 @@ mod tests {
                 scroll: 0,
                 focused_scrolled: false,
                 float_title: None,
-                pinned: false,
                 pinned,
             }))
         };
@@ -1818,17 +1864,71 @@ mod tests {
         assert!(unpinned.contains("m]"), "frame: {unpinned:?}");
         assert!(!unpinned.contains(PIN_COLOR), "frame: {unpinned:?}");
 
-        // Pinned: the box is filled, and filled red — painted over the corner
-        // the border drew, so a replay ends on the box rather than the corner.
+        // Pinned: the box is filled, and filled red.
         renderer.invalidate();
         let pinned = frame_for(&mut renderer, true);
         assert!(pinned.contains("m■"), "frame: {pinned:?}");
         assert!(pinned.contains(PIN_COLOR), "frame: {pinned:?}");
         let corner = pinned.find('┐').expect("the border draws its corner first");
-        let box_at = pinned.find("m■").expect("then the pin covers it");
+        let box_at = pinned.find("m■").expect("then the pin is drawn");
         assert!(corner < box_at, "frame: {pinned:?}");
+
+        // Replaying into a screen shows the pin ending at the penultimate cell
+        // (col 22) and leaving the corner border block at the right edge (col 23).
+        let mut replayed = parser(10, 40);
+        replayed.process(pinned.as_bytes());
+        assert_eq!(replayed.screen().cell(2, 20).unwrap().contents(), "[");
+        assert_eq!(replayed.screen().cell(2, 21).unwrap().contents(), "■");
+        assert_eq!(replayed.screen().cell(2, 22).unwrap().contents(), "]");
+        assert_eq!(replayed.screen().cell(2, 23).unwrap().contents(), "┐");
     }
 
+    #[test]
+    fn the_float_border_is_grey_when_pinned_and_inactive_and_green_when_active() {
+        let mut owner = parser(10, 40);
+        owner.process(b"owner");
+        let mut float = parser(3, 20);
+        float.process(b"hi");
+
+        let rect = Rect::new(2, 2, 22, 5);
+        let mut renderer = Renderer::new();
+
+        let frame_for = |renderer: &mut Renderer, pinned: bool, float_focused: bool| {
+            text(renderer.render(Panes {
+                owner: owner.screen().clone(),
+                owner_area: Rect::new(0, 0, 40, 10),
+                float: Some((float.screen().clone(), rect)),
+                float_focused,
+                images: None,
+                links: FrameLinks::default(),
+                scroll: 0,
+                focused_scrolled: false,
+                float_title: None,
+                pinned,
+            }))
+        };
+
+        // Pinned and inactive: border must be grey (b"\x1b[90m"), not green (b"\x1b[32m").
+        let inactive = frame_for(&mut renderer, true, false);
+        assert!(inactive.contains("\x1b[90m"), "frame: {inactive:?}");
+        assert!(!inactive.contains("\x1b[32m"), "frame: {inactive:?}");
+        // Pin box remains red even when inactive.
+        assert!(inactive.contains(PIN_COLOR), "frame: {inactive:?}");
+
+        // Now activate: border must switch to green (b"\x1b[32m").
+        let active = frame_for(&mut renderer, true, true);
+        assert!(active.contains("\x1b[32m"), "frame: {active:?}");
+        assert!(!active.contains("\x1b[90m"), "frame: {active:?}");
+
+        // Unpinned: border is green.
+        renderer.invalidate();
+        let unpinned = frame_for(&mut renderer, false, true);
+        assert!(unpinned.contains("\x1b[32m"), "frame: {unpinned:?}");
+        assert!(!unpinned.contains("\x1b[90m"), "frame: {unpinned:?}");
+    }
+
+    #[test]
+    fn scrolling_back_clears_the_image_layer_and_returning_sends_it_again() {
         let mut owner = parser(10, 40);
         owner.process(b"owner");
         let mut float = parser(3, 10);
@@ -1968,12 +2068,13 @@ mod tests {
             for chunk in png.chunks(3) {
                 let mut block = [0u8; 3];
                 block[..chunk.len()].copy_from_slice(chunk);
-                let value = (u32::from(block[0]) << 16)
-                    | (u32::from(block[1]) << 8)
-                    | u32::from(block[2]);
+                let value =
+                    (u32::from(block[0]) << 16) | (u32::from(block[1]) << 8) | u32::from(block[2]);
                 for index in 0..4 {
                     if index <= chunk.len() {
-                        out.push(char::from(ALPHABET[((value >> (18 - index * 6)) & 0x3f) as usize]));
+                        out.push(char::from(
+                            ALPHABET[((value >> (18 - index * 6)) & 0x3f) as usize],
+                        ));
                     } else {
                         out.push('=');
                     }
@@ -2012,7 +2113,10 @@ mod tests {
         assert!(frame.contains("1337;File="), "frame: {frame:?}");
         // The header now asks for a box instead of the image's native 2000 px.
         assert!(frame.contains("preserveAspectRatio=1"), "frame: {frame:?}");
-        assert!(!frame.contains("width=2000px"), "must not draw at native size: {frame:?}");
+        assert!(
+            !frame.contains("width=2000px"),
+            "must not draw at native size: {frame:?}"
+        );
         assert!(frame.contains("px;height="), "frame: {frame:?}");
     }
 
@@ -2054,13 +2158,22 @@ mod tests {
         let open = frame.find("\x1b]8;;https://example.com\x1b\\");
         let word = frame.find("docs");
         let close = frame.find("\x1b]8;;\x1b\\");
-        assert!(open.is_some() && word.is_some() && close.is_some(), "frame: {frame:?}");
+        assert!(
+            open.is_some() && word.is_some() && close.is_some(),
+            "frame: {frame:?}"
+        );
         let (open, word, close) = (open.unwrap(), word.unwrap(), close.unwrap());
-        assert!(open < word && word < close, "the link must wrap the cells: {frame:?}");
+        assert!(
+            open < word && word < close,
+            "the link must wrap the cells: {frame:?}"
+        );
 
         // And the span starts at the child's first cell, inside the float.
         let cup_at = frame.find(&format!("\x1b[{};{}H", content.y + 1, content.x + 1));
-        assert!(cup_at.is_some_and(|cup_at| cup_at < open), "frame: {frame:?}");
+        assert!(
+            cup_at.is_some_and(|cup_at| cup_at < open),
+            "frame: {frame:?}"
+        );
     }
 
     #[test]
@@ -2144,7 +2257,10 @@ mod tests {
             float_title: None,
             pinned: false,
         }));
-        assert!(!frame.contains("\x1b]8;"), "no link over the wrong words: {frame:?}");
+        assert!(
+            !frame.contains("\x1b]8;"),
+            "no link over the wrong words: {frame:?}"
+        );
     }
 
     #[test]
@@ -2341,7 +2457,10 @@ mod tests {
         let parts = segments(&found, 10);
         // (0,3) linked, (3,1) plain, (4,2) linked, (6,4) plain.
         assert_eq!(
-            parts.iter().map(|(start, len, _)| (*start, *len)).collect::<Vec<_>>(),
+            parts
+                .iter()
+                .map(|(start, len, _)| (*start, *len))
+                .collect::<Vec<_>>(),
             vec![(0, 3), (3, 1), (4, 2), (6, 4)]
         );
         assert!(parts[0].2.is_some() && parts[1].2.is_none() && parts[2].2.is_some());

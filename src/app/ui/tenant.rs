@@ -70,7 +70,7 @@ impl Overlay {
         (content.height, content.width)
     }
 
-    /// The pin control's cells, in the right end of the top border.
+    /// The pin control's cells, ending at the penultimate cell of the top border.
     ///
     /// `None` when the float is too narrow to hold three cells beside its
     /// corner, so a tiny window degrades to a plain border rather than overlapping
@@ -80,7 +80,7 @@ impl Overlay {
             return None;
         }
         Some(Rect::new(
-            self.rect.right().saturating_sub(PIN_WIDTH),
+            self.rect.right().saturating_sub(PIN_WIDTH + 1),
             self.rect.y,
             PIN_WIDTH,
             1,
@@ -278,7 +278,7 @@ mod tests {
         let overlay = Overlay::new();
         let pin = overlay.pin_cell().expect("a default float has room for the pin");
         assert_eq!(pin.y, overlay.rect.y);
-        assert_eq!(pin.x.saturating_add(pin.width), overlay.rect.right());
+        assert_eq!(pin.x.saturating_add(pin.width), overlay.rect.right() - 1);
         assert_eq!(pin.width, PIN_WIDTH);
         assert_eq!(pin.height, 1);
     }
@@ -304,35 +304,6 @@ mod tests {
 
     #[test]
     fn resize_keeps_the_float_inside_the_screen() {
-    #[test]
-    fn the_pin_control_sits_in_the_top_right_corner() {
-        let overlay = Overlay::new();
-        let pin = overlay.pin_cell().expect("a default float has room for the pin");
-        assert_eq!(pin.y, overlay.rect.y);
-        assert_eq!(pin.x.saturating_add(pin.width), overlay.rect.right());
-        assert_eq!(pin.width, PIN_WIDTH);
-        assert_eq!(pin.height, 1);
-    }
-
-    #[test]
-    fn a_float_too_narrow_for_the_pin_has_none() {
-        let mut overlay = Overlay::new();
-        overlay.rect = Rect::new(0, 0, PIN_WIDTH + 1, 4);
-        assert!(overlay.pin_cell().is_none());
-        overlay.rect = Rect::new(0, 0, PIN_WIDTH + 2, 4);
-        assert!(overlay.pin_cell().is_some());
-    }
-
-    #[test]
-    fn toggling_the_pin_reports_the_new_state() {
-        let mut overlay = Overlay::new();
-        assert!(!overlay.pinned);
-        assert!(overlay.toggle_pin());
-        assert!(overlay.pinned);
-        assert!(!overlay.toggle_pin());
-        assert!(!overlay.pinned);
-    }
-
         let mut overlay = Overlay::new();
         overlay.resize_to(100, 100, 500, 500, (120, 40));
         assert!(overlay.rect.x + overlay.rect.width <= 120);

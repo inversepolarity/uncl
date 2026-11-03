@@ -68,6 +68,34 @@ impl Drop for PtySession {
     }
 }
 
+#[cfg(test)]
+impl PtySession {
+    pub fn dummy() -> Self {
+        #[derive(Debug)]
+        struct NoopKiller {
+            _rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+        }
+        impl ChildKiller for NoopKiller {
+            fn kill(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+                let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+                Box::new(NoopKiller { _rx: rx })
+            }
+        }
+        let (writer, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resize, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_exit_tx, exited) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            writer,
+            resize,
+            exited,
+            killer: Box::new(NoopKiller { _rx: rx }),
+        }
+    }
+}
+
 /// Spawn `cmd` on a fresh PTY of the given size.
 ///
 /// `parser` receives everything the child writes; `signal` is raised after each

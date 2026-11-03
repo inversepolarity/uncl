@@ -48,7 +48,10 @@ const BORDER_COLOR: &[u8] = b"\x1b[32m";
 /// The pin's box while it is filled. Red, because "this float stays put" is a
 /// state worth noticing at a glance; the empty box is drawn in the border's own
 /// colour, so an unfilled toggle does not read as an error.
-const PIN_COLOR: &[u8] = b"\x1b[31m";
+const PIN_COLOR: &str = "\x1b[31m";
+/// The filled box. A `&str`, not a byte literal: byte literals are ASCII-only
+/// and this glyph is three bytes on the wire, like every other one here.
+const PIN_BOX: &str = "■";
 const BORDER_VERTICAL: &str = "│";
 /// kitty: delete every placement (not the image data). Sent when the float goes
 /// away, because kitty images live in a layer that our own repaint cannot touch.
@@ -682,8 +685,8 @@ fn emit_pin(out: &mut Vec<u8>, rect: Rect, pinned: bool) {
 
     cup(out, row, start + 1);
     if pinned {
-        out.extend_from_slice(PIN_COLOR);
-        out.push(b'■');
+        out.extend_from_slice(PIN_COLOR.as_bytes());
+        out.extend_from_slice(PIN_BOX.as_bytes());
         reset(out);
     } else {
         // In the border's own colour, so an empty box reads as part of the frame
@@ -1803,7 +1806,7 @@ mod tests {
             }))
         };
 
-        // Unpinned: an empty box in the border's own colour.
+        // Unpinned: an empty box in the border's own colour, and no red anywhere.
         let unpinned = frame_for(&mut renderer, false);
         assert!(unpinned.contains("m["), "frame: {unpinned:?}");
         assert!(unpinned.contains("m]"), "frame: {unpinned:?}");

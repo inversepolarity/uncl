@@ -6,10 +6,14 @@
 //!
 //! * `Alt` held → uncl owns the event (move the float).
 //! * on the 1-cell border → uncl owns the event (resize from that edge/corner).
+//! * on the pin control in the border's right end → uncl owns the event (toggle
+//!   the pin), so a click there is never read as a corner grab.
 //! * inside the content area → the child owns it, encoded for its own protocol.
-//! * outside the float → uncl owns it (click-away to hide) — unless a gesture
-//!   started inside the child's grid, in which case the child keeps it until the
-//!   button comes up. Losing that `Up` is what leaves a selection stuck.
+//! * outside the float → uncl owns it: click-away to hide, or — while the float
+//!   is pinned — to give the keyboard to the owner pane beside it — unless a
+//!   gesture started inside the child's grid, in which case the child keeps it
+//!   until the button comes up. Losing that `Up` is what leaves a selection
+//!   stuck.
 //!
 //! Everything here is pure geometry plus a little drag state, which keeps the
 //! routing decisions testable.
@@ -27,6 +31,8 @@ pub enum MouseRoute {
     Child { col: u16, row: u16 },
     /// uncl handled it (geometry, drag) — the child must not see it.
     Local,
+    /// The press landed on the float's pin control: flip it.
+    TogglePin,
     /// A click outside the float: hide it.
     HideFloat,
 }
@@ -59,11 +65,23 @@ pub fn route(overlay: &Overlay, m: MouseEvent) -> MouseRoute {
         MouseEventKind::Down(MouseButton::Left) => {
             if alt && on_float {
                 MouseRoute::Local
+            } else if overlay
+                .pin_cell()
+                .is_some_and(|pin| pin.contains(m.column, m.row))
+            {
+                // The pin control sits on the border, which every other press
+                // there reads as a resize grab. Checked before the border rule
+                // so a plain click on it flips the pin instead of starting one.
+                MouseRoute::TogglePin
             } else if on_float && !inside {
                 MouseRoute::Local
             } else if inside {
                 let (col, row) = local_point(content, m.column, m.row);
                 MouseRoute::Child { col, row }
+            } else if overlay.pinned {
+                // A pinned float keeps its place: the owner pane takes the press
+                // instead of the float disappearing.
+                MouseRoute::Local
             } else {
                 MouseRoute::HideFloat
             }
@@ -143,9 +161,17 @@ pub fn begin(overlay: &mut Overlay, m: MouseEvent) {
         return;
     }
 
+    let alt = m.modifiers.contains(KeyModifiers::ALT);
+
+    // The pin control is uncl's, not a resize handle: a plain press there is a
+    // click on the toggle. `Alt` still drags, as it does everywhere else on the
+    // border.
+    if !alt && overlay.pin_cell().is_some_and(|pin| pin.contains(m.column, m.row)) {
+        return;
+    }
+
     let content = overlay.content_rect();
     let inside = content.contains(m.column, m.row);
-    let alt = m.modifiers.contains(KeyModifiers::ALT);
 
     if alt && overlay.rect.contains(m.column, m.row) {
         overlay.dragging = true;
@@ -363,6 +389,52 @@ mod tests {
         let overlay = overlay();
         let route = route(&overlay, mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
         assert_eq!(route, MouseRoute::HideFloat);
+    }
+
+    #[test]
+    fn clicks_on_the_pin_toggle_it_instead_of_resizing() {
+        let overlay = overlay();
+        let pin = overlay.pin_cell().expect("a default float has room for the pin");
+        let route = route(
+            &overlay,
+            mouse(MouseEventKind::Down(MouseButton::Left), pin.x + 1, pin.y),
+        );
+        assert_eq!(route, MouseRoute::TogglePin);
+    }
+
+    #[test]
+    fn alt_click_on_the_pin_still_moves_the_float() {
+        let overlay = overlay();
+        let pin = overlay.pin_cell().expect("a default float has room for the pin");
+        // `Alt` drags from anywhere on the border, the pin included.
+        let route = route(
+            &overlay,
+            alt_mouse(MouseEventKind::Down(MouseButton::Left), pin.x + 1, pin.y),
+        );
+        assert_eq!(route, MouseRoute::Local);
+    }
+
+    #[test]
+    fn a_pinned_float_stays_when_the_pointer_leaves_it() {
+        let mut overlay = overlay();
+        overlay.pinned = true;
+        let route = route(&overlay, mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        // The press belongs to the owner pane, not to a click-away that hides.
+        assert_eq!(route, MouseRoute::Local);
+    }
+
+    #[test]
+    fn begin_does_not_start_a_resize_on_the_pin() {
+        let mut overlay = overlay();
+        let pin = overlay.pin_cell().expect("a default float has room for the pin");
+        // The right-hand cell is the corner, which is the grab `begin` would
+        // otherwise take.
+        begin(
+            &mut overlay,
+            mouse(MouseEventKind::Down(MouseButton::Left), pin.x + 2, pin.y),
+        );
+        assert!(!overlay.resizing, "the pin is not a resize handle");
+        assert!(!overlay.dragging);
     }
 
     #[test]

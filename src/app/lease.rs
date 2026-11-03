@@ -22,6 +22,10 @@ pub struct Lease {
     /// What the float's child told us about itself: hyperlinks, focus reporting.
     pub tenant_state: Arc<ChildState>,
     pub tenant_visible: bool,
+    /// The float is on screen *and* owns the pointer. A pinned float stays on
+    /// screen after the pointer leaves it, so the two are kept apart: the pointer
+    /// is what moves, not the window.
+    pub tenant_focused: bool,
     /// Kept whole (not just its channels) so that dropping the lease kills the
     /// child and unblocks its reader thread.
     session: Option<PtySession>,
@@ -35,6 +39,7 @@ impl Lease {
         let (parser, sink, state) = new_parser(caps, host);
         Self {
             tenant_visible: false,
+            tenant_focused: true,
             tenant: Overlay::new(),
             tenant_parser: parser,
             tenant_sink: sink,

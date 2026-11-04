@@ -1,6 +1,6 @@
 # uncl 0.1.1b
 
-[![release](https://github.com/inversepolarity/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/inversepolarity/uncl/actions/workflows/release.yml)
+[![release](https://github.com/even-zero/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/even-zero/uncl/actions/workflows/release.yml)
 
 ## inspiration
 
@@ -82,7 +82,7 @@ unpack it and put `uncl` somewhere on your `PATH`.
 or build it, with a rust toolchain (edition 2024, so rust 1.85 or newer):
 
 ```sh
-git clone https://github.com/inversepolarity/uncl && cd uncl
+git clone https://github.com/even-zero/uncl && cd uncl
 cargo install --path .
 ```
 

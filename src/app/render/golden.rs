@@ -386,6 +386,137 @@ fn a_float_replays_over_the_owner_grid() {
     assert!(text.contains('┌') && text.contains('┘'), "{text:?}");
 }
 
+/// The cell a border glyph is to a terminal, asked of `vt100` rather than
+/// written out: the border's own colour on the default background, and nothing
+/// else. Comparing against it is how a frame can be held to the *pen* it leaves
+/// behind, which no string-level assertion can see.
+fn border_cell() -> vt100::Cell {
+    let mut painted = Vec::new();
+    painted.extend_from_slice(BORDER_COLOR);
+    painted.extend_from_slice(BORDER_VERTICAL.as_bytes());
+    painted.extend_from_slice(RESET);
+
+    let mut parser = vt100::Parser::new(nz(1), nz(1), 0);
+    parser.process(&painted);
+    parser
+        .screen()
+        .cell(0, 0)
+        .expect("one cell was painted")
+        .clone()
+}
+
+/// A status bar must not leave its pen on the frame.
+///
+/// `vt100` sets the pen for a run of cells and never takes it back, so a row of
+/// a reverse-video bar (`nano`) ends on reverse video and a row of a bar with a
+/// background of its own (`btop`, `zellij`) ends on that background — and the
+/// float's border is painted immediately after the row, in a colour pair that
+/// only sets the foreground. The bar then showed through the frame, one cell
+/// past where the child's own grid ends. Both halves of the frame are checked,
+/// because reverse video and a plain background leak differently.
+#[test]
+fn a_status_bar_does_not_bleed_into_the_border() {
+    let mut owner = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    owner.process(b"owner line one\r\nowner line two");
+
+    let rect = float_rect();
+    let content = content_rect(rect);
+
+    let mut float = vt100::Parser::new(nz(content.height), nz(content.width), 0);
+    // Both bars fill their row, which is what makes the row end on the pen.
+    let fill = " ".repeat(usize::from(content.width));
+    float.process(format!("\x1b[1;1H\x1b[7m{fill}").as_bytes());
+    float.process(format!("\x1b[2;1H\x1b[0m\x1b[48;5;22m{fill}").as_bytes());
+
+    let mut renderer = Renderer::new();
+    let frame = renderer
+        .render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: owner_area(),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
+            float_title: None,
+            pinned: false,
+        })
+        .to_vec();
+    assert!(!frame.is_empty());
+
+    let mut replayed = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    replayed.process(&frame);
+
+    let want = border_cell();
+    for row in 0..content.height {
+        for col in [rect.x, rect.right() - 1] {
+            let got = replayed
+                .screen()
+                .cell(content.y + row, col)
+                .expect("inside the grid");
+            assert_eq!(
+                *got, want,
+                "the border cell ({}, {col}) wears the child's pen\n  frame: {:?}",
+                content.y + row,
+                String::from_utf8_lossy(&frame)
+            );
+        }
+    }
+}
+
+/// The other half of the same leak, past the border: a tail the owner has drawn
+/// nothing on.
+///
+/// `repair_tail` asks `vt100` for the owner's cells and paints them back, and
+/// `vt100` emits nothing at all for a run of default cells — so a tail with no
+/// text on it kept the colour the child's `EL` had just erased it with, and the
+/// child's bar ran out past the frame into the owner's screen.
+#[test]
+fn an_empty_owner_tail_is_repaired_too() {
+    let mut owner = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    owner.process(b"owner");
+
+    let rect = float_rect();
+    let content = content_rect(rect);
+
+    // A styled-but-empty row: `vt100` emits `EL` for it, and `EL` is unbounded
+    // to the right — it erases the border and every owner cell past it.
+    let mut float = vt100::Parser::new(nz(content.height), nz(content.width), 0);
+    float.process(b"\x1b[44m\x1b[K");
+
+    let mut renderer = Renderer::new();
+    let frame = renderer
+        .render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: owner_area(),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
+            float_title: None,
+            pinned: false,
+        })
+        .to_vec();
+    assert!(!frame.is_empty());
+
+    let mut replayed = vt100::Parser::new(nz(ROWS), nz(COLS), 0);
+    replayed.process(&frame);
+
+    // The erased row, from the first column past the float to the screen's edge.
+    for col in rect.right()..COLS {
+        assert_eq!(
+            owner.screen().cell(content.y, col),
+            replayed.screen().cell(content.y, col),
+            "owner cell ({}, {col}) kept the child's colour\n  frame: {:?}",
+            content.y,
+            String::from_utf8_lossy(&frame)
+        );
+    }
+}
+
 #[test]
 fn a_linked_row_replays_to_the_same_cells() {
     // `OSC 8` is emitted *inside* a row, between column-ranged segments. If those

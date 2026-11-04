@@ -17,8 +17,8 @@
 //!   blinks at the position and in the shape the child asked for, with no cell
 //!   ever styled to imitate it.
 //!
-//! Two things go wrong when a `vt100` row encoder is reused for a pane that is
-//! *not* at the top-left of the screen, and both are handled here:
+//! Three things go wrong when a `vt100` row encoder is reused for a pane that is
+//! *not* at the top-left of the screen, and all three are handled here:
 //!
 //! 1. `vt100` emits **pane-local absolute** cursor moves (`CSI r;cH`) for
 //!    backwards jumps within a row. Inside the float those addresses are wrong,
@@ -28,6 +28,14 @@
 //!    that is only wasteful; inside a float it erases the float's border *and*
 //!    everything to the right of it. Such rows are followed by `repair_tail`,
 //!    which repaints the owner's tail segment for that row.
+//! 3. `vt100` **leaves the pen set**. It writes the attributes for a run of
+//!    cells and never restores them, so a row that ends on a styled cell ends
+//!    the row on that style: a full-width status bar leaves the terminal on its
+//!    background colour, and `nano`'s leaves it on reverse video. The float's
+//!    border is painted right after the row, and a colour pair sets only the
+//!    foreground — so the border cell inherited the child's background, which
+//!    is how a `btop` or `zellij` bar ends up showing through the frame. Every
+//!    border cell is therefore painted by `border_text`, which resets first.
 //!
 //! Input modes (`?1000`, `?2004`, `DECCKM`) are deliberately **never** replayed
 //! from the child's screen: uncl owns the host terminal's modes (see
@@ -722,23 +730,13 @@ fn emit_pin(out: &mut Vec<u8>, rect: Rect, pinned: bool, border_color: &[u8]) {
     let start = rect.right().saturating_sub(PIN_WIDTH + 1);
 
     cup(out, row, start);
-    out.extend_from_slice(border_color);
-    out.push(b'[');
-    reset(out);
+    border_text(out, "[", border_color);
 
     cup(out, row, start + 1);
-    out.extend_from_slice(border_color);
-    if pinned {
-        out.extend_from_slice(PIN_BOX.as_bytes());
-    } else {
-        out.push(b' ');
-    }
-    reset(out);
+    border_text(out, if pinned { PIN_BOX } else { " " }, border_color);
 
     cup(out, row, start + 2);
-    out.extend_from_slice(border_color);
-    out.push(b']');
-    reset(out);
+    border_text(out, "]", border_color);
 }
 
 /// Paint one row of the float: both border cells, the child's cells, and — when
@@ -760,7 +758,7 @@ fn emit_float_row(
     let screen_row = content.y.saturating_add(row);
 
     cup(out, screen_row, rect.x);
-    border_char(out, BORDER_VERTICAL, border_color);
+    border_text(out, BORDER_VERTICAL, border_color);
 
     cup(out, screen_row, content.x);
     reset(out);
@@ -776,9 +774,11 @@ fn emit_float_row(
         append_row(out, text, content.y, content.x)
     };
 
-    // After the row: an `EL` inside it would have erased the border cell.
+    // After the row: an `EL` inside it would have erased the border cell, and
+    // the row's own pen is still set — `border_text` clears it, so the frame
+    // never wears the child's colours.
     cup(out, screen_row, rect.right().saturating_sub(1));
-    border_char(out, BORDER_VERTICAL, border_color);
+    border_text(out, BORDER_VERTICAL, border_color);
 
     if erased {
         repair_tail(out, owner, screen_row, rect, owner_area);
@@ -888,6 +888,12 @@ fn repair_tail(out: &mut Vec<u8>, owner: &Screen, row: u16, rect: Rect, owner_ar
         // its pane-local jumps shift by exactly that.
         cup(out, row, start);
         reset(out);
+        // Blank the whole tail first, not just the cells the owner has drawn
+        // on: `rows_formatted` skips default cells, so a tail that is empty (or
+        // empty after its text) would otherwise keep the colour the child's `EL`
+        // painted it, and the child's bar would run out past the border.
+        // Bounded by the screen, like every other erase here.
+        erase_chars(out, width);
         append_row(out, &text, row, start);
     }
 }
@@ -932,9 +938,7 @@ fn emit_horizontal_border(
     line.push(right.ch());
 
     cup(out, row, rect.x);
-    out.extend_from_slice(border_color);
-    out.extend_from_slice(line.as_bytes());
-    reset(out);
+    border_text(out, &line, border_color);
 }
 
 /// The child's own name, printed in the top border, left-aligned after the corner.
@@ -970,9 +974,7 @@ fn emit_top_title(
     }
 
     cup(out, rect.y, rect.x.saturating_add(1));
-    out.extend_from_slice(border_color);
-    out.extend_from_slice(painted.as_bytes());
-    reset(out);
+    border_text(out, &painted, border_color);
 }
 
 /// The child's size, printed in the bottom border — plus how far back the view is
@@ -994,12 +996,27 @@ fn emit_title(out: &mut Vec<u8>, rect: Rect, content: Rect, scroll: usize, borde
         .saturating_add(available as u16 - title.len() as u16);
 
     cup(out, rect.bottom().saturating_sub(1), start);
-    out.extend_from_slice(border_color);
-    out.extend_from_slice(title.as_bytes());
-    reset(out);
+    border_text(out, &title, border_color);
 }
 
-fn border_char(out: &mut Vec<u8>, text: &str, border_color: &[u8]) {
+/// Paint `text` in the border's own colour, from a pen that is known to be
+/// clean.
+///
+/// The reset *before* the colour is the point of this function. A row uncl has
+/// just painted comes from `vt100`, which sets the pen once per run of cells and
+/// never restores it: a full-width status bar ends on the background it was
+/// drawn with, and `nano`'s ends on reverse video. `border_color` only sets the
+/// foreground, so a border cell drawn right after such a row inherited the
+/// child's background — or its reverse, which swaps the two and paints the cell
+/// with the *border's* colour as its background. That is how a `btop` or
+/// `zellij` bar ends up showing through the frame, one cell past where the
+/// child's own cells end.
+///
+/// The reset after it keeps everything else in the frame (the next row's left
+/// border, the horizontal borders, the title) from inheriting the frame's own
+/// colour in turn.
+fn border_text(out: &mut Vec<u8>, text: &str, border_color: &[u8]) {
+    reset(out);
     out.extend_from_slice(border_color);
     out.extend_from_slice(text.as_bytes());
     reset(out);
@@ -1475,6 +1492,62 @@ mod tests {
             .rfind("TAIL")
             .expect("the owner tail should be repainted");
         assert!(tail_at > cup_at, "frame: {frame:?}");
+    }
+
+    /// The bug the float's border used to have: a full-width status bar leaking
+    /// one cell into the frame.
+    ///
+    /// `vt100` sets the pen for a run of cells and never takes it back, so a row
+    /// of a reverse-video bar (what `nano` draws) ends on reverse video, and a
+    /// row of a bar with a background of its own (what `btop` and `zellij`
+    /// draw) ends on that background. The border is painted immediately after
+    /// the row, and `border_color` is a foreground on its own — so without a
+    /// reset the border cell wears the child's colours, one cell past the child's
+    /// own grid. That is the bar protruding into the right edge of the float.
+    #[test]
+    fn a_bar_does_not_leave_its_pen_on_the_border() {
+        let rect = Rect::new(2, 1, 14, 5);
+        let content = content_rect(rect);
+
+        let mut owner = parser(8, 30);
+        owner.process(b"owner");
+
+        // Two bars, because they leak in two different ways: reverse video
+        // swaps the two colours, a background paints the cell outright. Both
+        // fill the whole row, which is what makes the row end on the pen.
+        let mut float = parser(content.height, content.width);
+        let fill = " ".repeat(usize::from(content.width));
+        float.process(format!("\x1b[1;1H\x1b[7m{fill}").as_bytes());
+        float.process(format!("\x1b[2;1H\x1b[0m\x1b[44m{fill}").as_bytes());
+
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: owner.screen().clone(),
+            owner_area: Rect::new(0, 0, 30, 8),
+            float: Some((float.screen().clone(), rect)),
+            float_focused: true,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
+            float_title: None,
+            pinned: false,
+        }));
+
+        // Every right-hand border cell is addressed on a clean pen: reset, then
+        // the border's own colour, then the glyph.
+        let painted = format!("{}{}{BORDER_VERTICAL}", text(RESET), text(BORDER_COLOR));
+        for row in 0..content.height {
+            let cup = format!("\x1b[{};{}H", content.y + row + 1, rect.right());
+            let at = frame
+                .find(&cup)
+                .unwrap_or_else(|| panic!("row {row} painted no right border: {frame:?}"));
+            let want = format!("{cup}{painted}");
+            assert!(
+                frame[at..].starts_with(want.as_str()),
+                "the border of row {row} inherited the child's pen: {frame:?}"
+            );
+        }
     }
 
     #[test]

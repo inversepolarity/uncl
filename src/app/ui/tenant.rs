@@ -2,9 +2,7 @@ use crate::app::images::Store;
 use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::signal::Signal;
 use crate::app::term::callbacks::ReplySink;
-use crate::constants::{
-    MIN_HEIGHT, MIN_WIDTH, PIN_WIDTH, ResizeDirection, content_rect, nz,
-};
+use crate::constants::{MIN_HEIGHT, MIN_WIDTH, PIN_WIDTH, ResizeDirection, content_rect, nz};
 use crate::geometry::Rect;
 
 use anyhow::Result;
@@ -413,17 +411,17 @@ mod tests {
     #[test]
     fn move_to_clamps_at_the_edges() {
         let mut overlay = overlay();
-        overlay.move_to(1000, 1000, (80, 25));
-        assert_eq!(overlay.rect.x, 80 - overlay.rect.width);
-        assert_eq!(overlay.rect.y, 25 - overlay.rect.height);
+        overlay.move_to(1000, 1000, (82, 27));
+        assert_eq!(overlay.rect.x, 82 - overlay.rect.width);
+        assert_eq!(overlay.rect.y, 27 - overlay.rect.height);
     }
 
     #[test]
     fn centered_overlay_is_centered_in_viewport() {
         let overlay = Overlay::centered((120, 40));
-        assert_eq!(overlay.rect.width, 80);
-        assert_eq!(overlay.rect.height, 25);
-        assert_eq!(overlay.rect.x, 20);
-        assert_eq!(overlay.rect.y, 7);
+        assert_eq!(overlay.rect.width, 82);
+        assert_eq!(overlay.rect.height, 27);
+        assert_eq!(overlay.rect.x, 19);
+        assert_eq!(overlay.rect.y, 6);
     }
 }

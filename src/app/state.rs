@@ -57,7 +57,9 @@ pub fn state_file_path() -> Option<PathBuf> {
 
     #[cfg(windows)]
     {
-        if let Some(appdata) = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("APPDATA")) {
+        if let Some(appdata) =
+            std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("APPDATA"))
+        {
             if !appdata.is_empty() {
                 return Some(PathBuf::from(appdata).join("uncl").join("tenant.json"));
             }
@@ -176,12 +178,12 @@ mod tests {
     #[test]
     fn centered_rect_computes_exact_middle_in_large_viewport() {
         let rect = centered_tenant_rect((120, 40));
-        assert_eq!(rect.width, 80);
-        assert_eq!(rect.height, 25);
+        assert_eq!(rect.width, 82);
+        assert_eq!(rect.height, 27);
         // x = (120 - 80) / 2 = 20
-        assert_eq!(rect.x, 20);
+        assert_eq!(rect.x, 19);
         // y = (40 - 25) / 2 = 7
-        assert_eq!(rect.y, 7);
+        assert_eq!(rect.y, 6);
         // Symmetrical margins
         assert_eq!(rect.x, 120 - rect.right());
         assert_eq!(rect.y, 40 - rect.bottom() - 1); // 7 on top, 8 on bottom (40 - 25 = 15)

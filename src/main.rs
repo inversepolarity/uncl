@@ -109,10 +109,13 @@ fn doctor() {
 fn help() {
     println!(
         "uncl {}\n\
-         a terminal monoplexer: one floating terminal window over your shell\n\n\
+         unified nuclear cli layer\n\n\
          usage: uncl [--fresh|--doctor|--version|--help]\n\n\
          flags:\n  \
-         --fresh            ignore saved position/size; spawn the float centred at 80x25\n\n\
+         --fresh            ignore saved position/size; spawn the float centred at 80x25\n  \
+         --doctor           diagnose current pty compatibility\n  \
+         --version          print current version\n  \
+         --help             display this help screen\n\n\
          keys:\n  \
          Home               toggle the floating terminal\n  \
          Alt+arrows         move it\n  \

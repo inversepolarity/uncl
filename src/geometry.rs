@@ -47,6 +47,7 @@ impl Rect {
     /// This is the float's border: the child's PTY is sized to the result, the
     /// parser is sized to the result, and the renderer paints into the result.
     /// One definition, three call sites — which is the whole point.
+    /// NOTE: there is a protrudence from inset in zellij not seen elsewhere.
     pub fn inset(self, n: u16) -> Self {
         Self {
             x: self.x.saturating_add(n),

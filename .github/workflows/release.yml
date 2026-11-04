@@ -12,6 +12,10 @@ name: release
 
 # The release branch is `master`: it is named here, and again in the `if:` of
 # the publish job at the bottom.
+#
+# Before testing or bumping, the prepare job rebases onto the latest tip of the
+# branch it is working on, so a release build never has to wait on a manual
+# pull/rebase between pushes.
 on:
   push:
     branches: [dev, master]
@@ -163,6 +167,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: rebase on the latest tip of the branch
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force origin "+refs/heads/${GITHUB_REF_NAME}:refs/remotes/origin/${GITHUB_REF_NAME}"
+          git rebase "origin/${GITHUB_REF_NAME}"
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -216,6 +226,13 @@ jobs:
           if [ "$bumped" = true ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            # Keep the version banner in the readme in step with the bump: the
+            # version lives on line 5, inside the ascii art fence, and the
+            # commit below picks this edit up.
+            sed -i -E "s/^v[0-9]+\.[0-9]+\.[0-9]+$/v$version/" readme.md
+            grep -n "^v[0-9]" readme.md
+
             # The marker stops this workflow from treating its own push as a
             # code change. `cargo set-version` keeps Cargo.lock in step, so the
             # `--locked` build below stays valid.
@@ -319,6 +336,9 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
           if-no-files-found: error
+          # Release staging only needs to live as long as the release itself;
+          # don't let the default 90 day retention linger in the artifacts tab.
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Replace the draft. Older drafts are removed so that "publish the newest

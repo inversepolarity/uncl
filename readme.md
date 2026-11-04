@@ -1,6 +1,11 @@
-# uncl 0.1.3
+```
+░█░█░█▀█░█▀▀░█░░
+░█░█░█░█░█░░░█░░
+░▀▀▀░▀░▀░▀▀▀░▀▀▀
+v0.1.3
+```
 
-[![release](https://github.com/even-zero/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/even-zero/uncl/actions/workflows/release.yml)
+[![release-badge](https://github.com/even-zero/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/even-zero/uncl/actions/workflows/release.yml)
 
 ## inspiration
 
@@ -15,14 +20,12 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 ## features
 
 - toggle a floating terminal with a single `[Home]` key
-- pin the float in place with the `[ ]` in its top-right corner: a pinned float
-  (`[■]`) does not hide when you click outside it, so the shell behind it
-  can be used at the same time
+- pin the float in place with the `[ ]` 
 - floating term is draggable and resizeable with mouse
 - floating term is draggable and resizeable with keyboard
 - supports most shells, tested on zsh, bash
-- supports most terminal emulators, tested on wezterm
-- images inside the float
+- supports most terminal emulators, tested on Wezterm, Xfce Terminal
+- images render inside the float
 - clickable links inside the float
 - scrollback in both panes
 - mouse support in both panes

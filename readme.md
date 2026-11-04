@@ -16,7 +16,7 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 
 - toggle a floating terminal with a single `[Home]` key
 - pin the float in place with the `[ ]` in its top-right corner: a pinned float
-  (`[■]`, in red) does not hide when you click outside it, so the shell behind it
+  (`[■]`) does not hide when you click outside it, so the shell behind it
   can be used at the same time
 - floating term is draggable and resizeable with mouse
 - floating term is draggable and resizeable with keyboard

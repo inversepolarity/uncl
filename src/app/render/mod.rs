@@ -46,10 +46,6 @@ const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const RESET: &[u8] = b"\x1b[0m";
 const BORDER_COLOR: &[u8] = b"\x1b[32m";
 const BORDER_COLOR_INACTIVE: &[u8] = b"\x1b[90m";
-/// The pin's box while it is filled. Red, because "this float stays put" is a
-/// state worth noticing at a glance; the empty box is drawn in the border's own
-/// colour, so an unfilled toggle does not read as an error.
-const PIN_COLOR: &str = "\x1b[31m";
 /// The filled box. A `&str`, not a byte literal: byte literals are ASCII-only
 /// and this glyph is three bytes on the wire, like every other one here.
 const PIN_BOX: &str = "■";
@@ -676,7 +672,14 @@ fn emit_float(
     }
 
     if borders {
-        emit_horizontal_border(out, rect, rect.y, Corner::TopLeft, Corner::TopRight, border_color);
+        emit_horizontal_border(
+            out,
+            rect,
+            rect.y,
+            Corner::TopLeft,
+            Corner::TopRight,
+            border_color,
+        );
         emit_horizontal_border(
             out,
             rect,
@@ -707,8 +710,9 @@ fn pin_room(rect: Rect) -> u16 {
 /// Paint the pin control in the right end of the float's top border: `[ ]` while
 /// it can be unpinned by a click, `[■]` while it is pinned.
 ///
-/// The box is red only when filled — an empty box is a toggle that is off, not
-/// an error, so it is drawn in the border's own colour.
+/// The box is drawn in the border's own colour, filled or not, so the pin never
+/// adds a colour of its own: the border already shifts to reflect the pinned state,
+/// and the filled box should read as part of the frame rather than as a marker.
 fn emit_pin(out: &mut Vec<u8>, rect: Rect, pinned: bool, border_color: &[u8]) {
     if pin_room(rect) == 0 {
         return;
@@ -723,17 +727,13 @@ fn emit_pin(out: &mut Vec<u8>, rect: Rect, pinned: bool, border_color: &[u8]) {
     reset(out);
 
     cup(out, row, start + 1);
+    out.extend_from_slice(border_color);
     if pinned {
-        out.extend_from_slice(PIN_COLOR.as_bytes());
         out.extend_from_slice(PIN_BOX.as_bytes());
-        reset(out);
     } else {
-        // In the border's own colour, so an empty box reads as part of the frame
-        // rather than a gap in it.
-        out.extend_from_slice(border_color);
         out.push(b' ');
-        reset(out);
     }
+    reset(out);
 
     cup(out, row, start + 2);
     out.extend_from_slice(border_color);
@@ -945,7 +945,13 @@ fn emit_horizontal_border(
 /// is of characters, not cells: the border is decoration, and a wide glyph in a
 /// title is not worth a `unicode-width` dependency in the one function that would
 /// use it.
-fn emit_top_title(out: &mut Vec<u8>, rect: Rect, title: Option<&str>, pin: u16, border_color: &[u8]) {
+fn emit_top_title(
+    out: &mut Vec<u8>,
+    rect: Rect,
+    title: Option<&str>,
+    pin: u16,
+    border_color: &[u8],
+) {
     let Some(title) = title else {
         return;
     };
@@ -1862,13 +1868,13 @@ mod tests {
         let unpinned = frame_for(&mut renderer, false);
         assert!(unpinned.contains("m["), "frame: {unpinned:?}");
         assert!(unpinned.contains("m]"), "frame: {unpinned:?}");
-        assert!(!unpinned.contains(PIN_COLOR), "frame: {unpinned:?}");
+        assert!(!unpinned.contains("\x1b[31m"), "frame: {unpinned:?}");
 
-        // Pinned: the box is filled, and filled red.
+        // Pinned: the box is filled, in the border's own colour.
         renderer.invalidate();
         let pinned = frame_for(&mut renderer, true);
         assert!(pinned.contains("m■"), "frame: {pinned:?}");
-        assert!(pinned.contains(PIN_COLOR), "frame: {pinned:?}");
+        assert!(pinned.contains("\x1b[32m■"), "frame: {pinned:?}");
         let corner = pinned.find('┐').expect("the border draws its corner first");
         let box_at = pinned.find("m■").expect("then the pin is drawn");
         assert!(corner < box_at, "frame: {pinned:?}");
@@ -1912,8 +1918,8 @@ mod tests {
         let inactive = frame_for(&mut renderer, true, false);
         assert!(inactive.contains("\x1b[90m"), "frame: {inactive:?}");
         assert!(!inactive.contains("\x1b[32m"), "frame: {inactive:?}");
-        // Pin box remains red even when inactive.
-        assert!(inactive.contains(PIN_COLOR), "frame: {inactive:?}");
+        // Pin box follows the border's colour even when inactive.
+        assert!(inactive.contains("\x1b[90m■"), "frame: {inactive:?}");
 
         // Now activate: border must switch to green (b"\x1b[32m").
         let active = frame_for(&mut renderer, true, true);

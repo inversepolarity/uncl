@@ -8,7 +8,8 @@ use std::time::Duration;
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        None => run(),
+        None => run(false),
+        Some("--fresh") => run(true),
         Some("--doctor") => {
             doctor();
             Ok(())
@@ -55,7 +56,7 @@ fn ensure_ansi() -> Result<()> {
     Ok(())
 }
 
-fn run() -> Result<()> {
+fn run(fresh: bool) -> Result<()> {
     ensure_ansi()?;
 
     // A hand-built runtime (instead of `#[tokio::main]`) so we can bound how
@@ -66,7 +67,7 @@ fn run() -> Result<()> {
         .enable_all()
         .build()?;
 
-    let result = runtime.block_on(app::run());
+    let result = runtime.block_on(app::run(fresh));
 
     // The terminal has already been restored by the guard inside `app::run`.
     runtime.shutdown_timeout(Duration::from_millis(250));
@@ -109,7 +110,9 @@ fn help() {
     println!(
         "uncl {}\n\
          a terminal monoplexer: one floating terminal window over your shell\n\n\
-         usage: uncl [--doctor|--version|--help]\n\n\
+         usage: uncl [--fresh|--doctor|--version|--help]\n\n\
+         flags:\n  \
+         --fresh            ignore saved position/size; spawn the float centred at 80x25\n\n\
          keys:\n  \
          Home               toggle the floating terminal\n  \
          Alt+arrows         move it\n  \

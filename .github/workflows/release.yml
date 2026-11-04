@@ -48,7 +48,7 @@ jobs:
   guard:
     name: is this a code change?
     if: >-
-      github.repository_owner == 'inversepolarity'
+      !github.event.repository.fork
       && ((github.event_name == 'push' && github.ref == 'refs/heads/dev')
           || (github.event_name == 'workflow_dispatch' && inputs.publish != true))
     runs-on: ubuntu-22.04
@@ -63,6 +63,8 @@ jobs:
       - name: filter
         id: filter
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
         run: |
@@ -80,26 +82,59 @@ jobs:
           # filter below looks for, so it marks itself. GITHUB_TOKEN pushes do
           # not re-trigger workflows either: this is the second of two brakes on
           # the same loop.
-          if git log -1 --pretty=%B "$AFTER" | grep -qF '[skip release]'; then
+          if grep -qF '[skip release]' <<< "$(git log -1 --pretty=%B "$AFTER")"; then
             echo "::notice::commit is marked [skip release]"
             echo "run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          git fetch --tags --force --quiet origin
+
+          # Compare against the commit already built in a waiting draft release
+          # (or, when no draft exists, the newest release tag) before falling
+          # back to github.event.before. That way an earlier code push whose run
+          # failed or was skipped is still picked up on the next push.
+          base=""
+          draft_tag="$(gh release list --json tagName,isDraft --limit 100 \
+                         -q 'first(.[] | select(.isDraft)) | .tagName // empty' 2>/dev/null || true)"
+          if [ -n "$draft_tag" ] && [ "$draft_tag" != "null" ]; then
+            draft_sha="$(gh release view "$draft_tag" --json targetCommitish \
+                           -q '.targetCommitish // empty' 2>/dev/null || true)"
+            if [[ "$draft_sha" =~ ^[0-9a-f]{40}$ ]] \
+               && git cat-file -e "$draft_sha^{commit}" 2>/dev/null; then
+              base="$draft_sha"
+              echo "comparing against current draft $draft_tag ($base)"
+            fi
+          fi
+
+          if [ -z "$base" ]; then
+            last_tag="$(git describe --tags --abbrev=0 --match 'v*' "$AFTER" 2>/dev/null || true)"
+            if [ -n "$last_tag" ] && git cat-file -e "$last_tag^{commit}" 2>/dev/null; then
+              base="$last_tag"
+              echo "comparing against latest tag $base"
+            fi
+          fi
+
+          if [ -z "$base" ] && [ -n "$BEFORE" ] \
+             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            base="$BEFORE"
+            echo "comparing against push parent $base"
+          fi
+
           # A brand new branch, or a force-push whose parent we never saw, has no
           # usable diff. Releasing is the safe assumption.
-          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-            echo "no parent commit to compare against; assuming code changed"
+          if [ -z "$base" ]; then
+            echo "no baseline commit to compare against; assuming code changed"
             echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          changed="$(git diff --name-only "$BEFORE" "$AFTER")"
-          echo "changed files:"
+          changed="$(git diff --name-only "$base" "$AFTER")"
+          echo "changed files ($base..$AFTER):"
           printf '%s\n' "$changed" | sed 's/^/  /'
 
-          if printf '%s\n' "$changed" | grep -qE '^(src/|Cargo\.toml$|Cargo\.lock$)'; then
+          if grep -qE '^(src/|Cargo\.toml$|Cargo\.lock$)' <<< "$changed"; then
             echo "code changed"
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -204,7 +239,11 @@ jobs:
   # shipped is what the platform's own linker produced.
   # ---------------------------------------------------------------------------
   build:
-    name: build ${{ matrix.slug }}
+    # Keep `${{ matrix.slug }}` out of `name:`: when `build` is skipped (e.g. on
+    # `master` or docs-only pushes), GitHub Actions skips matrix expansion and
+    # renders any `matrix.*` expression in `name:` verbatim. Making `slug` the
+    # matrix axis names active jobs `build (<slug>)` and skipped ones `build`.
+    name: build
     needs: prepare
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -212,15 +251,20 @@ jobs:
       # A missing platform is a broken download, not a smaller release.
       fail-fast: true
       matrix:
+        slug:
+          - linux-x86_64
+          - windows-x86_64
+          - macos-aarch64
+          - macos-x86_64
         include:
           # 22.04 on purpose: a binary built against a newer glibc refuses to
           # start on every older distribution.
-          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, slug: linux-x86_64 }
-          - { os: windows-2022, target: x86_64-pc-windows-msvc, slug: windows-x86_64 }
+          - { slug: linux-x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { slug: windows-x86_64, os: windows-2022, target: x86_64-pc-windows-msvc }
           # Both macOS targets build on an arm64 runner: the SDK is universal,
           # so the Intel slice is a cross-compile with no extra setup.
-          - { os: macos-14, target: aarch64-apple-darwin, slug: macos-aarch64 }
-          - { os: macos-14, target: x86_64-apple-darwin, slug: macos-x86_64 }
+          - { slug: macos-aarch64, os: macos-14, target: aarch64-apple-darwin }
+          - { slug: macos-x86_64, os: macos-14, target: x86_64-apple-darwin }
     steps:
       # The release commit, not the triggering one: after a bump, the version in
       # Cargo.toml and Cargo.lock only agree on the new commit.
@@ -332,7 +376,7 @@ jobs:
   publish:
     name: publish the newest draft
     if: >-
-      github.repository_owner == 'inversepolarity'
+      !github.event.repository.fork
       && ((github.event_name == 'push' && github.ref == 'refs/heads/master')
           || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
     runs-on: ubuntu-22.04

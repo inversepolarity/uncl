@@ -338,9 +338,10 @@ pub fn end(overlay: &mut Overlay) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
 
     fn overlay() -> Overlay {
-        Overlay::new()
+        Overlay::with_rect(Rect::new(10, 5, DEFAULT_WIDTH, DEFAULT_HEIGHT))
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {

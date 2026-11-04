@@ -1,6 +1,6 @@
 # uncl 0.1.1b
 
-[![release](https://github.com/inversepolarity/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/inversepolarity/uncl/actions/workflows/release.yml)
+[![release](https://github.com/even-zero/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/even-zero/uncl/actions/workflows/release.yml)
 
 ## inspiration
 
@@ -16,7 +16,7 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 
 - toggle a floating terminal with a single `[Home]` key
 - pin the float in place with the `[ ]` in its top-right corner: a pinned float
-  (`[■]`, in red) does not hide when you click outside it, so the shell behind it
+  (`[■]`) does not hide when you click outside it, so the shell behind it
   can be used at the same time
 - floating term is draggable and resizeable with mouse
 - floating term is draggable and resizeable with keyboard
@@ -82,7 +82,7 @@ unpack it and put `uncl` somewhere on your `PATH`.
 or build it, with a rust toolchain (edition 2024, so rust 1.85 or newer):
 
 ```sh
-git clone https://github.com/inversepolarity/uncl && cd uncl
+git clone https://github.com/even-zero/uncl && cd uncl
 cargo install --path .
 ```
 

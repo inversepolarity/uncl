@@ -1,11 +1,8 @@
 use crate::app::images::Store;
 use crate::app::pty::{self, ChildParser, PtySession};
-use crate::app::term::callbacks::ReplySink;
 use crate::app::signal::Signal;
-use crate::constants::{
-    DEFAULT_HEIGHT, DEFAULT_WIDTH, DEFAULT_X, DEFAULT_Y, MIN_HEIGHT, MIN_WIDTH, PIN_WIDTH,
-    ResizeDirection, content_rect, nz,
-};
+use crate::app::term::callbacks::ReplySink;
+use crate::constants::{MIN_HEIGHT, MIN_WIDTH, PIN_WIDTH, ResizeDirection, content_rect, nz};
 use crate::geometry::Rect;
 
 use anyhow::Result;
@@ -38,21 +35,28 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    pub fn new() -> Self {
+    /// Construct an overlay with a specific rectangle.
+    pub fn with_rect(rect: Rect) -> Self {
         Self {
-            rect: Rect::new(DEFAULT_X, DEFAULT_Y, DEFAULT_WIDTH, DEFAULT_HEIGHT),
+            rect,
             dragging: false,
             drag_offset: (0, 0),
             resizing: false,
             resize_direction: None,
             size: Size {
-                cols: DEFAULT_WIDTH,
-                rows: DEFAULT_HEIGHT,
+                cols: rect.width,
+                rows: rect.height,
             },
             is_dead: true,
             child_grab: false,
             pinned: false,
         }
+    }
+
+    /// An overlay positioned in the center of `viewport` (cols, rows),
+    /// defaulting to 80 (width) x 25 (height).
+    pub fn centered(viewport: (u16, u16)) -> Self {
+        Self::with_rect(crate::app::state::centered_tenant_rect(viewport))
     }
 
     /// The area the child actually draws into: the rect minus its border.
@@ -168,7 +172,10 @@ impl Overlay {
         let height = height.clamp(MIN_HEIGHT.min(max_height), max_height);
 
         let (x, y) = match direction {
-            ResizeDirection::TopLeft => (x.min(bounds.0.saturating_sub(width)), y.min(bounds.1.saturating_sub(height))),
+            ResizeDirection::TopLeft => (
+                x.min(bounds.0.saturating_sub(width)),
+                y.min(bounds.1.saturating_sub(height)),
+            ),
             ResizeDirection::TopRight => (x, y.min(bounds.1.saturating_sub(height))),
             ResizeDirection::BottomLeft => (x.min(bounds.0.saturating_sub(width)), y),
             ResizeDirection::BottomRight => (x, y),
@@ -220,7 +227,9 @@ impl Overlay {
                 rect.height,
                 bounds,
             ),
-            (true, KeyCode::Right) => self.resize_to(rect.x, rect.y, rect.width + 1, rect.height, bounds),
+            (true, KeyCode::Right) => {
+                self.resize_to(rect.x, rect.y, rect.width + 1, rect.height, bounds)
+            }
             (true, KeyCode::Up) => self.resize_to(
                 rect.x,
                 rect.y,
@@ -228,7 +237,9 @@ impl Overlay {
                 rect.height.saturating_sub(1),
                 bounds,
             ),
-            (true, KeyCode::Down) => self.resize_to(rect.x, rect.y, rect.width, rect.height + 1, bounds),
+            (true, KeyCode::Down) => {
+                self.resize_to(rect.x, rect.y, rect.width, rect.height + 1, bounds)
+            }
 
             _ => return false,
         }
@@ -248,35 +259,51 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
+
+    fn overlay() -> Overlay {
+        Overlay::with_rect(Rect::new(10, 5, DEFAULT_WIDTH, DEFAULT_HEIGHT))
+    }
 
     #[test]
     fn content_rect_is_inset_by_the_border() {
-        let overlay = Overlay::new();
+        let overlay = overlay();
         let content = overlay.content_rect();
         assert_eq!(content.x, overlay.rect.x + crate::constants::TENANT_BORDER);
         assert_eq!(content.y, overlay.rect.y + crate::constants::TENANT_BORDER);
-        assert_eq!(content.width, overlay.rect.width - crate::constants::TENANT_BORDER * 2);
-        assert_eq!(content.height, overlay.rect.height - crate::constants::TENANT_BORDER * 2);
+        assert_eq!(
+            content.width,
+            overlay.rect.width - crate::constants::TENANT_BORDER * 2
+        );
+        assert_eq!(
+            content.height,
+            overlay.rect.height - crate::constants::TENANT_BORDER * 2
+        );
     }
 
     #[test]
     fn content_size_is_derived_from_content_rect() {
-        let overlay = Overlay::new();
+        let overlay = overlay();
         let (rows, cols) = overlay.content_size();
-        assert_eq!((cols, rows), (overlay.content_rect().width, overlay.content_rect().height));
+        assert_eq!(
+            (cols, rows),
+            (overlay.content_rect().width, overlay.content_rect().height)
+        );
     }
 
     #[test]
     fn content_size_never_reaches_zero() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.rect = Rect::new(0, 0, 1, 1);
         assert_eq!(overlay.content_size(), (1, 1));
     }
 
     #[test]
     fn the_pin_control_sits_in_the_top_right_corner() {
-        let overlay = Overlay::new();
-        let pin = overlay.pin_cell().expect("a default float has room for the pin");
+        let overlay = overlay();
+        let pin = overlay
+            .pin_cell()
+            .expect("a default float has room for the pin");
         assert_eq!(pin.y, overlay.rect.y);
         assert_eq!(pin.x.saturating_add(pin.width), overlay.rect.right() - 1);
         assert_eq!(pin.width, PIN_WIDTH);
@@ -285,7 +312,7 @@ mod tests {
 
     #[test]
     fn a_float_too_narrow_for_the_pin_has_none() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.rect = Rect::new(0, 0, PIN_WIDTH + 1, 4);
         assert!(overlay.pin_cell().is_none());
         overlay.rect = Rect::new(0, 0, PIN_WIDTH + 2, 4);
@@ -294,7 +321,7 @@ mod tests {
 
     #[test]
     fn toggling_the_pin_reports_the_new_state() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         assert!(!overlay.pinned);
         assert!(overlay.toggle_pin());
         assert!(overlay.pinned);
@@ -304,7 +331,7 @@ mod tests {
 
     #[test]
     fn resize_keeps_the_float_inside_the_screen() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.resize_to(100, 100, 500, 500, (120, 40));
         assert!(overlay.rect.x + overlay.rect.width <= 120);
         assert!(overlay.rect.y + overlay.rect.height <= 40);
@@ -312,7 +339,7 @@ mod tests {
 
     #[test]
     fn resizing_never_goes_below_the_minimum() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.resize_to(0, 0, 1, 1, (80, 25));
         assert_eq!(overlay.rect.width, MIN_WIDTH);
         assert_eq!(overlay.rect.height, MIN_HEIGHT);
@@ -323,7 +350,7 @@ mod tests {
         // The old code returned early for any request under MIN_HEIGHT, so
         // dragging the bottom edge upwards appeared to stop responding. The
         // width must still track the pointer.
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         let before = overlay.rect;
         // Bounds larger than the float, so the clamp is not what is under test.
         overlay.resize_to(before.x, before.y, before.width + 5, 2, (200, 60));
@@ -333,7 +360,7 @@ mod tests {
 
     #[test]
     fn corner_resize_keeps_the_anchor_corner_in_place() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         let anchor_right = overlay.rect.right();
         let anchor_bottom = overlay.rect.bottom();
         let (x, y) = (overlay.rect.x + 4, overlay.rect.y + 2);
@@ -347,7 +374,7 @@ mod tests {
 
     #[test]
     fn clamp_to_pulls_the_float_back_on_screen() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.resize_to(30, 15, 40, 20, (200, 80));
         overlay.clamp_to((50, 20));
         assert!(overlay.rect.right() <= 50);
@@ -358,7 +385,7 @@ mod tests {
 
     #[test]
     fn modifiers_alone_are_not_geometry_chords() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         let before = overlay.rect;
         let key = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
         assert!(!overlay.geometry_key(key, (120, 60)));
@@ -367,7 +394,7 @@ mod tests {
 
     #[test]
     fn alt_arrows_move_and_alt_shift_arrows_resize() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         let before = overlay.rect;
 
         let key = KeyEvent::new(KeyCode::Right, KeyModifiers::ALT);
@@ -383,9 +410,18 @@ mod tests {
 
     #[test]
     fn move_to_clamps_at_the_edges() {
-        let mut overlay = Overlay::new();
-        overlay.move_to(1000, 1000, (80, 25));
-        assert_eq!(overlay.rect.x, 80 - overlay.rect.width);
-        assert_eq!(overlay.rect.y, 25 - overlay.rect.height);
+        let mut overlay = overlay();
+        overlay.move_to(1000, 1000, (82, 27));
+        assert_eq!(overlay.rect.x, 82 - overlay.rect.width);
+        assert_eq!(overlay.rect.y, 27 - overlay.rect.height);
+    }
+
+    #[test]
+    fn centered_overlay_is_centered_in_viewport() {
+        let overlay = Overlay::centered((120, 40));
+        assert_eq!(overlay.rect.width, 82);
+        assert_eq!(overlay.rect.height, 27);
+        assert_eq!(overlay.rect.x, 19);
+        assert_eq!(overlay.rect.y, 6);
     }
 }

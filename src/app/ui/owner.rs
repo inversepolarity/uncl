@@ -35,12 +35,14 @@ use crate::app::input::encode::{ChildModes, encode_key, encode_mouse};
 use crate::app::input::mouse::{self, MouseRoute, Wheel};
 use crate::app::lease::{Lease, new_parser};
 use crate::app::pty::{self, ChildParser, PtySession};
+use crate::app::state::{load_tenant_geometry, save_tenant_geometry};
 use crate::app::term::callbacks::ChildState;
 use crate::app::term::dcs;
 use crate::app::signal::Signal;
 use crate::app::render::{FrameLinks, Panes, Renderer};
 use crate::app::term::callbacks::ReplySink;
 use crate::app::term::caps::Capabilities;
+use crate::app::ui::tenant::Overlay;
 use crate::constants::*;
 use crate::geometry::Rect;
 
@@ -183,7 +185,7 @@ struct LinkPress {
 }
 
 impl Container {
-    pub fn new() -> Self {
+    pub fn new(fresh: bool) -> Self {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
 
         // Ask the host for its pixel geometry once, before any child can ask us
@@ -195,6 +197,23 @@ impl Container {
         let (host_tx, host_rx) = unbounded_channel::<Vec<u8>>();
         let (parser, parser_sink, parser_state) = new_parser(caps.clone(), host_tx.clone());
 
+        // Starting afresh (first run, --fresh, or no saved state): centre the
+        // float at 80x25 in the current viewport.  On restart, recover the
+        // position and size the user left it at, clamped to whatever the
+        // terminal happens to be right now.
+        let overlay = if fresh {
+            Overlay::centered((cols, rows))
+        } else {
+            match load_tenant_geometry() {
+                Some(rect) => {
+                    let mut o = Overlay::with_rect(rect);
+                    o.clamp_to((cols, rows));
+                    o
+                }
+                None => Overlay::centered((cols, rows)),
+            }
+        };
+
         Self {
             rect: Rect::new(0, 0, cols, rows),
             size: Size { cols, rows },
@@ -203,7 +222,7 @@ impl Container {
             parser_state,
             parser_sink,
             session: None,
-            lease: Lease::new(caps, host_tx.clone()),
+            lease: Lease::new(caps, host_tx.clone(), overlay),
             signal: Signal::new(),
             stop: Arc::new(AtomicBool::new(false)),
             host_mouse: HostMouse::Off,
@@ -301,6 +320,10 @@ impl Container {
         // still up, so their teardown cannot smear the user's real screen.
         self.stop.store(true, Ordering::Release);
         self.shutdown_children();
+
+        // Persist the float's final position/size so the next launch starts
+        // where this one left off.
+        let _ = save_tenant_geometry(self.lease.tenant.rect);
 
         // `_guard` restores raw mode / mouse capture / alt screen / cursor here.
         result
@@ -748,6 +771,7 @@ impl Container {
         if self.float_focused() && self.lease.tenant.geometry_key(key, term_size) {
             self.lease.sync_size();
             self.renderer.invalidate();
+            let _ = save_tenant_geometry(self.lease.tenant.rect);
             return Flow::Redraw;
         }
 
@@ -855,6 +879,9 @@ impl Container {
                         // A finished resize changes the child's grid size.
                         self.lease.sync_size();
                         self.renderer.invalidate();
+                        // Persist the user's chosen geometry so the next session
+                        // can restore it.
+                        let _ = save_tenant_geometry(self.lease.tenant.rect);
                     }
                 } else if mouse::drag(&mut self.lease.tenant, m, term_size) {
                     // Live-resize the child while the pointer moves, so a
@@ -1033,12 +1060,16 @@ impl Container {
                     let was_visible = self.lease.tenant_visible;
                     let was_pinned = self.lease.tenant.pinned;
                     let was_focused = self.lease.tenant_focused;
-                    self.lease = Lease::new(self.caps.clone(), self.host_tx.clone());
+                    // Preserve the geometry the user left the float at so the
+                    // respawned child comes up at the same size and position.
+                    let was_rect = self.lease.tenant.rect;
+                    let mut overlay = Overlay::with_rect(was_rect);
+                    overlay.pinned = was_pinned;
+                    self.lease = Lease::new(self.caps.clone(), self.host_tx.clone(), overlay);
 
                     match self.init_tenant() {
                         Ok(()) => {
                             self.lease.tenant_visible = was_visible;
-                            self.lease.tenant.pinned = was_pinned;
                             self.lease.tenant_focused = was_focused;
                             self.tenant_scroll = 0;
                             self.link_press = None;
@@ -1186,11 +1217,15 @@ mod tests {
 
     #[test]
     fn clicking_inside_inactive_pinned_tenant_restores_focus_and_redraws() {
-        let mut container = Container::new();
+        let mut container = Container::new(true);
         container.lease.attach(PtySession::dummy());
         container.lease.tenant_visible = true;
         container.lease.tenant.pinned = true;
         container.lease.tenant_focused = false;
+        // Fix the float at a known position with guaranteed space to the top-left
+        // so the click-outside at (0,0) is always outside the float, regardless
+        // of what crossterm::terminal::size() reports in a headless test.
+        container.lease.tenant.rect = crate::geometry::Rect::new(10, 5, DEFAULT_WIDTH, DEFAULT_HEIGHT);
 
         let content = container.lease.tenant.content_rect();
         let click_x = content.x + 2;

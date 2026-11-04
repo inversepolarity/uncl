@@ -35,12 +35,13 @@ impl Lease {
     pub fn new(
         caps: Arc<crate::app::term::caps::Capabilities>,
         host: UnboundedSender<Vec<u8>>,
+        tenant: Overlay,
     ) -> Self {
         let (parser, sink, state) = new_parser(caps, host);
         Self {
             tenant_visible: false,
             tenant_focused: true,
-            tenant: Overlay::new(),
+            tenant,
             tenant_parser: parser,
             tenant_sink: sink,
             tenant_images: Arc::new(Mutex::new(Store::new())),

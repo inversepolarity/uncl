@@ -251,7 +251,7 @@ bytes by `src/app/render/`, written once.
    `CUP` into its content rect → borders and titles if the rect is new or was
    overpainted → one `CUP` + `?25h` for the focused child's cursor → one `write_all`.
 
-Three rules make that correct, and each was discovered the hard way:
+Four rules make that correct, and each was discovered the hard way:
 
 **`vt100`'s row encoders are pane-local.** `rows_formatted`/`rows_diff` address the
 row as if the pane sat at the screen origin, and emit a bare `CSI H` for that origin
@@ -262,7 +262,21 @@ explicit, `H` or `f`) into screen coordinates and leaves every other sequence al
 chrome — ends in `CSI K`, which erases to the end of the *screen*: the float's right
 border, the owner's cells beside it, and the frame gutter. So the right border is
 painted *after* the row, and a row that emitted `EL` triggers `repair_tail`, which
-repaints the owner's cells from the border to the screen edge.
+repaints the owner's cells from the border to the screen edge. That repaint has to
+`ECH(width)` before it writes them, for the same reason a full row repaint does:
+`rows_formatted` emits nothing at all for a run of default cells, so a tail the owner
+has drawn nothing on would otherwise keep the colour the child erased it with.
+
+**`vt100` leaves the pen set.** It writes the attributes for a run of cells and never
+restores them, so a row that ends on a styled cell ends the row on that style: a
+full-width status bar ends on the background it was drawn with, and nano's ends on
+reverse video. The border is painted immediately after the row, and a colour pair sets
+only the *foreground* — so the border cell inherited the child's background, or worse
+its reverse video, which swaps the two and paints the cell with the border's own green
+as its background and the child's text colour as the glyph. A bar showing through the
+right-hand edge of the frame, one cell past where the child's grid ends. Every border
+cell — the two verticals, both horizontal rules, the title and the pin — is therefore
+painted by `border_text`, which resets *before* setting the frame's colour.
 
 **`rows_formatted` never blanks.** It skips default cells and relies on what is
 already on screen, so a full repaint must `ECH(width)` first — bounded to the

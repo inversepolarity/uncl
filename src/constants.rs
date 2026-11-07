@@ -1,11 +1,3 @@
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResizeDirection {
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-}
-
 pub const MIN_WIDTH: u16 = 10;
 pub const MIN_HEIGHT: u16 = 10;
 
@@ -25,6 +17,34 @@ pub const DEFAULT_SCROLLBACK: usize = 2_000;
 
 /// How many lines one wheel notch scrolls.
 pub const SCROLL_STEP: usize = 3;
+
+/// How many cells one ctrl+mouse-wheel notch grows or contracts the float.
+pub const RESIZE_STEP: u16 = 1;
+
+/// Which edges of the float a resize gesture grabbed.
+///
+/// A press on a plain border edge anchors a single axis — only that dimension
+/// follows the pointer — while a press on a corner anchors both, so a corner drag
+/// resizes diagonally and an edge drag only resizes its own axis.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct ResizeEdges {
+    pub left: bool,
+    pub right: bool,
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl ResizeEdges {
+    /// Which edges a pointer press landed on; a corner sets both of its axes.
+    pub fn from_point(rect: crate::geometry::Rect, x: u16, y: u16) -> Self {
+        Self {
+            left: x == rect.x,
+            right: x == rect.right().saturating_sub(1),
+            top: y == rect.y,
+            bottom: y == rect.bottom().saturating_sub(1),
+        }
+    }
+}
 
 /// The scrollback capacity to use, from `UNCL_SCROLLBACK` or the default.
 ///

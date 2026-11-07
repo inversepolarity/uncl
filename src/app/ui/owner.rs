@@ -120,10 +120,19 @@ impl HostMouse {
     }
 
     /// uncl always needs press events while the float is up, so it can drag it
-    /// and hide it on a click outside; motion only if the child asked.
+    /// and hide it on a click outside; and the motion tracking that turns a held
+    /// button into a drag, so dragging the float's border is really a drag.
+    ///
+    /// The floor is therefore *button motion*, not bare press reporting: the
+    /// `Press` sequence disables `?1002` (button motion) and `?1003` (any motion)
+    /// before enabling `?1000h`, which reports the press and release but never a
+    /// drag. A shell reports no mouse mode at all (`Off`), which used to lift to
+    /// exactly that press-only state, so a basic prompt could scroll with the
+    /// wheel but never be moved by dragging its border. Lifting to
+    /// `ButtonMotion` keeps the wheel working and starts delivering drags.
     fn at_least_press(self) -> Self {
         match self {
-            HostMouse::Off => HostMouse::Press,
+            HostMouse::Off | HostMouse::Press => HostMouse::ButtonMotion,
             other => other,
         }
     }
@@ -472,10 +481,11 @@ impl Container {
         // Always at least press: uncl has to see the wheel to give either pane a
         // scrollback (a host that never reports the wheel is a host uncl cannot
         // scroll), and while the float is up it has to see the press to drag it
-        // and to resolve its own hyperlinks. The cost is real and deliberate: the
-        // *host's* scrollback and mouse selection are unavailable unless the host
-        // overrides the grab (Shift+drag in most of them), because uncl now
-        // provides both itself.
+        // and to resolve its own hyperlinks. The floor is button motion, not bare
+        // press, so a held border drag really arrives as a drag. The cost is real
+        // and deliberate: the *host's* scrollback and mouse selection are
+        // unavailable unless the host overrides the grab (Shift+drag in most of
+        // them), because uncl now provides both itself.
         let desired = HostMouse::for_modes(self.focused_modes()).at_least_press();
 
         if desired == self.host_mouse {
@@ -855,6 +865,27 @@ impl Container {
 
             MouseRoute::Local => {
                 if let Some(wheel) = Wheel::from_kind(m.kind) {
+                    // A ctrl+scroll over the float expands/contracts it; anything
+                    // else scrolls (the owner pane when the float is not in play).
+                    if m.modifiers.contains(KeyModifiers::CONTROL) && self.lease.tenant.rect.contains(m.column, m.row) {
+                        let rect = self.lease.tenant.rect;
+                        let (width, height) = match wheel {
+                            Wheel::Up => (
+                                rect.width.saturating_add(crate::constants::RESIZE_STEP),
+                                rect.height.saturating_add(crate::constants::RESIZE_STEP),
+                            ),
+                            Wheel::Down => (
+                                rect.width.saturating_sub(crate::constants::RESIZE_STEP),
+                                rect.height.saturating_sub(crate::constants::RESIZE_STEP),
+                            ),
+                        };
+                        self.lease.tenant.resize_to(rect.x, rect.y, width, height, term_size);
+                        self.lease.sync_size();
+                        self.renderer.invalidate();
+                        let _ = save_tenant_geometry(self.lease.tenant.rect);
+                        return Flow::Redraw;
+                    }
+
                     // Outside the float (or on its border): the owner pane.
                     self.scroll(false, wheel, SCROLL_STEP);
                     return Flow::Redraw;
@@ -1272,5 +1303,169 @@ mod tests {
             !container.lease.tenant_focused,
             "tenant must be unfocused after clicking outside"
         );
+    }
+
+    #[test]
+    fn ctrl_wheel_over_the_float_resizes_it() {
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        container.lease.tenant_visible = true;
+        container.lease.tenant_focused = true;
+        container.lease.tenant.rect = crate::geometry::Rect::new(10, 5, 20, 12);
+        container.size = Size { cols: 80, rows: 24 };
+
+        let before = container.lease.tenant.rect;
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 12,
+            row: 8,
+            modifiers: KeyModifiers::CONTROL,
+        };
+
+        let flow = container.handle_mouse(event);
+        assert_eq!(flow, Flow::Redraw);
+        assert!(container.lease.tenant.rect.height < before.height);
+        assert!(container.lease.tenant.rect.width < before.width);
+
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 12,
+            row: 8,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        let flow = container.handle_mouse(event);
+        assert_eq!(flow, Flow::Redraw);
+        assert_eq!(container.lease.tenant.rect.height, before.height);
+        assert_eq!(container.lease.tenant.rect.width, before.width);
+    }
+
+    #[test]
+    fn plain_border_drag_moves_the_float_regardless_of_the_child() {
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        container.lease.tenant_visible = true;
+        container.lease.tenant_focused = true;
+        container.lease.tenant.rect = crate::geometry::Rect::new(10, 5, 20, 12);
+        container.size = Size { cols: 80, rows: 24 };
+
+        let before = container.lease.tenant.rect;
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: before.right() - 1,
+            row: before.bottom() - 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let flow = container.handle_mouse(press);
+        assert_eq!(flow, Flow::Redraw);
+
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: before.right() + 2,
+            row: before.bottom() + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let flow = container.handle_mouse(drag);
+        assert_eq!(flow, Flow::Redraw);
+        assert_ne!(
+            container.lease.tenant.rect,
+            before,
+            "a plain border drag must move the float"
+        );
+
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: before.right() + 2,
+            row: before.bottom() + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let flow = container.handle_mouse(release);
+        assert_eq!(flow, Flow::Redraw);
+    }
+
+    #[test]
+    fn ctrl_drag_on_the_border_resizes_the_float_regardless_of_the_child() {
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        container.lease.tenant_visible = true;
+        container.lease.tenant_focused = true;
+        container.lease.tenant.rect = crate::geometry::Rect::new(10, 5, 20, 12);
+        container.size = Size { cols: 80, rows: 24 };
+
+        let before = container.lease.tenant.rect;
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: before.right() - 1,
+            row: before.bottom() - 1,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        let flow = container.handle_mouse(press);
+        assert_eq!(flow, Flow::Redraw);
+
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: before.right() + 2,
+            row: before.bottom() + 1,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        let flow = container.handle_mouse(drag);
+        assert_eq!(flow, Flow::Redraw);
+        assert!(
+            container.lease.tenant.rect.width > before.width
+                || container.lease.tenant.rect.height > before.height,
+            "a ctrl+drag must resize the float"
+        );
+
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: before.right() + 2,
+            row: before.bottom() + 1,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        let flow = container.handle_mouse(release);
+        assert_eq!(flow, Flow::Redraw);
+    }
+
+    #[test]
+    fn the_press_floor_always_includes_drag_motion_tracking() {
+        // A plain shell reports no mouse mode, so the floor used to lift it to a
+        // bare `Press` state — which *disables* button-motion tracking (`?1002`)
+        // before enabling press reporting (`?1000h`). The host then delivered
+        // presses and releases but never a drag, so a basic prompt could scroll
+        // with the wheel but never be moved by dragging its border. The floor has
+        // to be button motion.
+        for mode in [
+            MouseProtocolMode::None,
+            MouseProtocolMode::Press,
+            MouseProtocolMode::PressRelease,
+        ] {
+            let modes = ChildModes {
+                mouse_mode: mode,
+                ..ChildModes::default()
+            };
+            assert_eq!(
+                HostMouse::for_modes(modes).at_least_press(),
+                HostMouse::ButtonMotion,
+                "mouse mode {mode:?} must keep drag tracking available to uncl"
+            );
+        }
+
+        // A child that asked for any-motion keeps it: uncl still receives drags.
+        assert_eq!(
+            HostMouse::for_modes(ChildModes {
+                mouse_mode: MouseProtocolMode::AnyMotion,
+                ..ChildModes::default()
+            })
+            .at_least_press(),
+            HostMouse::AnyMotion
+        );
+    }
+
+    #[test]
+    fn the_button_motion_sequence_enables_press_and_drag_tracking() {
+        // Enable press reporting and SGR encoding, and turn on button-motion
+        // tracking so a held press produces drag events. Disabling any-motion
+        // first keeps a previous `?1003` state from leaking through.
+        let expected: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1000h\x1b[?1006h";
+        assert_eq!(HostMouse::ButtonMotion.sequence(), expected);
     }
 }

@@ -1,7 +1,5 @@
 name: release
 
-# One workflow, two halves:
-#
 #   dev  -> test, bump the patch version, build every platform, replace the
 #           *draft* release. The draft is not visible until someone publishes it.
 # master -> publish the newest draft. Publishing is the only step that creates
@@ -280,8 +278,8 @@ jobs:
           - { slug: windows-x86_64, os: windows-2022, target: x86_64-pc-windows-msvc }
           # Both macOS targets build on an arm64 runner: the SDK is universal,
           # so the Intel slice is a cross-compile with no extra setup.
-          - { slug: macos-aarch64, os: macos-14, target: aarch64-apple-darwin }
-          - { slug: macos-x86_64, os: macos-14, target: x86_64-apple-darwin }
+          - { slug: macos-aarch64, os: macos-15, target: aarch64-apple-darwin }
+          - { slug: macos-x86_64, os: macos-15, target: x86_64-apple-darwin }
     steps:
       # The release commit, not the triggering one: after a bump, the version in
       # Cargo.toml and Cargo.lock only agree on the new commit.

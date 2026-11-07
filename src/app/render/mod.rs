@@ -52,7 +52,10 @@ use crate::geometry::Rect;
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const RESET: &[u8] = b"\x1b[0m";
-const BORDER_COLOR: &[u8] = b"\x1b[32m";
+/// The float's border while the float is up and focused: `#9acd32` (an RGB
+/// green), sent as a truecolor SGR sequence. Grey while the float is pinned and
+/// therefore unfocused.
+const BORDER_COLOR: &[u8] = b"\x1b[38;2;154;205;50m";
 const BORDER_COLOR_INACTIVE: &[u8] = b"\x1b[90m";
 /// The filled box. A `&str`, not a byte literal: byte literals are ASCII-only
 /// and this glyph is three bytes on the wire, like every other one here.
@@ -1947,7 +1950,7 @@ mod tests {
         renderer.invalidate();
         let pinned = frame_for(&mut renderer, true);
         assert!(pinned.contains("m■"), "frame: {pinned:?}");
-        assert!(pinned.contains("\x1b[32m■"), "frame: {pinned:?}");
+        assert!(pinned.contains("\x1b[38;2;154;205;50m■"), "frame: {pinned:?}");
         let corner = pinned.find('┐').expect("the border draws its corner first");
         let box_at = pinned.find("m■").expect("then the pin is drawn");
         assert!(corner < box_at, "frame: {pinned:?}");
@@ -1987,22 +1990,22 @@ mod tests {
             }))
         };
 
-        // Pinned and inactive: border must be grey (b"\x1b[90m"), not green (b"\x1b[32m").
+        // Pinned and inactive: border must be grey (b"\x1b[90m"), not #9acd32.
         let inactive = frame_for(&mut renderer, true, false);
         assert!(inactive.contains("\x1b[90m"), "frame: {inactive:?}");
-        assert!(!inactive.contains("\x1b[32m"), "frame: {inactive:?}");
+        assert!(!inactive.contains("\x1b[38;2;154;205;50m"), "frame: {inactive:?}");
         // Pin box follows the border's colour even when inactive.
         assert!(inactive.contains("\x1b[90m■"), "frame: {inactive:?}");
 
-        // Now activate: border must switch to green (b"\x1b[32m").
+        // Now activate: border must switch to #9acd32.
         let active = frame_for(&mut renderer, true, true);
-        assert!(active.contains("\x1b[32m"), "frame: {active:?}");
+        assert!(active.contains("\x1b[38;2;154;205;50m"), "frame: {active:?}");
         assert!(!active.contains("\x1b[90m"), "frame: {active:?}");
 
-        // Unpinned: border is green.
+        // Unpinned: border is #9acd32.
         renderer.invalidate();
         let unpinned = frame_for(&mut renderer, false, true);
-        assert!(unpinned.contains("\x1b[32m"), "frame: {unpinned:?}");
+        assert!(unpinned.contains("\x1b[38;2;154;205;50m"), "frame: {unpinned:?}");
         assert!(!unpinned.contains("\x1b[90m"), "frame: {unpinned:?}");
     }
 

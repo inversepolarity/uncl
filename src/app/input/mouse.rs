@@ -5,7 +5,10 @@
 //! never saw a click. The rule now is:
 //!
 //! * `Alt` held → uncl owns the event (move the float).
-//! * on the 1-cell border → uncl owns the event (resize from that edge/corner).
+//! * `Ctrl` held → uncl owns the event (resize the float from the border it
+//!   grabbed).
+//! * on the 1-cell border → uncl owns the event; a plain drag there moves the
+//!   float, a `Ctrl` drag there resizes it.
 //! * on the pin control in the border's right end → uncl owns the event (toggle
 //!   the pin), so a click there is never read as a corner grab.
 //! * inside the content area → the child owns it, encoded for its own protocol.
@@ -19,7 +22,7 @@
 //! routing decisions testable.
 
 use crate::app::ui::tenant::Overlay;
-use crate::constants::{MIN_HEIGHT, MIN_WIDTH, ResizeDirection};
+use crate::constants::{MIN_HEIGHT, MIN_WIDTH, ResizeEdges};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crate::geometry::Rect;
 
@@ -43,6 +46,7 @@ pub fn route(overlay: &Overlay, m: MouseEvent) -> MouseRoute {
     let inside = content.contains(m.column, m.row);
     let on_float = overlay.rect.contains(m.column, m.row);
     let alt = m.modifiers.contains(KeyModifiers::ALT);
+    let ctrl = m.modifiers.contains(KeyModifiers::CONTROL);
 
     // An in-progress gesture inside the child's grid outranks everything: the
     // child saw the press, so it must see the drag and the release even when the
@@ -65,13 +69,14 @@ pub fn route(overlay: &Overlay, m: MouseEvent) -> MouseRoute {
         MouseEventKind::Down(MouseButton::Left) => {
             if alt && on_float {
                 MouseRoute::Local
-            } else if overlay
+            } else if !alt && !ctrl && overlay
                 .pin_cell()
                 .is_some_and(|pin| pin.contains(m.column, m.row))
             {
                 // The pin control sits on the border, which every other press
                 // there reads as a resize grab. Checked before the border rule
-                // so a plain click on it flips the pin instead of starting one.
+                // so a plain click on it flips the pin instead of starting one;
+                // ctrl+drag reads it as a resize like any other border press.
                 MouseRoute::TogglePin
             } else if on_float && !inside {
                 MouseRoute::Local
@@ -98,7 +103,9 @@ pub fn route(overlay: &Overlay, m: MouseEvent) -> MouseRoute {
         | MouseEventKind::ScrollDown
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => {
-            if inside && !alt {
+            // A ctrl+scroll over the float is uncl's to resize with; anything
+            // else over content belongs to the child.
+            if inside && !alt && !ctrl {
                 let (col, row) = local_point(content, m.column, m.row);
                 MouseRoute::Child { col, row }
             } else {
@@ -107,7 +114,12 @@ pub fn route(overlay: &Overlay, m: MouseEvent) -> MouseRoute {
         }
 
         MouseEventKind::Drag(_) | MouseEventKind::Up(_) | MouseEventKind::Moved => {
-            if inside && !alt {
+            // While a local drag or resize owns the pointer it keeps owning the
+            // motion, even when it started on the border and the pointer has
+            // already travelled over the content area.
+            if overlay.dragging || overlay.resizing {
+                MouseRoute::Local
+            } else if inside && !alt && !ctrl {
                 let (col, row) = local_point(content, m.column, m.row);
                 MouseRoute::Child { col, row }
             } else {
@@ -162,11 +174,12 @@ pub fn begin(overlay: &mut Overlay, m: MouseEvent) {
     }
 
     let alt = m.modifiers.contains(KeyModifiers::ALT);
+    let ctrl = m.modifiers.contains(KeyModifiers::CONTROL);
 
     // The pin control is uncl's, not a resize handle: a plain press there is a
     // click on the toggle. `Alt` still drags, as it does everywhere else on the
-    // border.
-    if !alt && overlay.pin_cell().is_some_and(|pin| pin.contains(m.column, m.row)) {
+    // border; `Ctrl` still resizes, so only a plain press toggles.
+    if !alt && !ctrl && overlay.pin_cell().is_some_and(|pin| pin.contains(m.column, m.row)) {
         return;
     }
 
@@ -182,140 +195,80 @@ pub fn begin(overlay: &mut Overlay, m: MouseEvent) {
         return;
     }
 
-    if inside {
+    if !overlay.rect.contains(m.column, m.row) {
+        // Routed here while the float is pinned and the press fell outside it:
+        // that belongs to the owner pane, and there is no float geometry to grab.
         return;
     }
 
-    if let Some(direction) = direction_for(overlay.rect, m.column, m.row) {
+    if ctrl {
+        // Ctrl+drag owns the float and turns it into a resize from the border.
+        // The anchors say which edges were grabbed: a corner press sets both of
+        // its axes, a plain edge press just the one it landed on.
         overlay.resizing = true;
-        overlay.resize_direction = Some(direction);
-    }
-}
-
-/// Which edge or corner of `rect` is the point `(x, y)` on?
-///
-/// Returns `None` when the point is not on the border at all (i.e. it is in the
-/// content area or outside the float entirely).
-pub fn direction_for(rect: Rect, x: u16, y: u16) -> Option<ResizeDirection> {
-    if !rect.contains(x, y) {
-        return None;
+        overlay.resize_anchored = ResizeEdges::from_point(overlay.rect, m.column, m.row);
+        return;
     }
 
-    let left = x == rect.x;
-    let right = x == rect.right().saturating_sub(1);
-    let top = y == rect.y;
-    let bottom = y == rect.bottom().saturating_sub(1);
-
-    // A corner wins over an edge.
-    match (left, right, top, bottom) {
-        (true, _, true, _) => Some(ResizeDirection::TopLeft),
-        (_, true, true, _) => Some(ResizeDirection::TopRight),
-        (true, _, _, true) => Some(ResizeDirection::BottomLeft),
-        (_, true, _, true) => Some(ResizeDirection::BottomRight),
-        // Edges: pick the corner nearest the pointer's other axis, so dragging
-        // the left border feels like resizing from that side whichever way you
-        // pull.
-        (true, _, _, _) | (_, true, _, _) => {
-            if y <= rect.y.saturating_add(rect.height / 2) {
-                Some(if left {
-                    ResizeDirection::TopLeft
-                } else {
-                    ResizeDirection::TopRight
-                })
-            } else {
-                Some(if left {
-                    ResizeDirection::BottomLeft
-                } else {
-                    ResizeDirection::BottomRight
-                })
-            }
-        }
-        (_, _, true, _) | (_, _, _, true) => {
-            if x <= rect.x.saturating_add(rect.width / 2) {
-                Some(if top {
-                    ResizeDirection::TopLeft
-                } else {
-                    ResizeDirection::BottomLeft
-                })
-            } else {
-                Some(if top {
-                    ResizeDirection::TopRight
-                } else {
-                    ResizeDirection::BottomRight
-                })
-            }
-        }
-        _ => None,
+    if inside {
+        // Plain press inside the content area: the child owns it, so uncl
+        // starts no local gesture of its own.
+        return;
     }
+
+    // Plain press on the float's border: it only moves the float now; growing
+    // and shrinking are the `Ctrl` drag's job.
+    overlay.dragging = true;
+    overlay.drag_offset = (
+        m.column.saturating_sub(overlay.rect.x),
+        m.row.saturating_sub(overlay.rect.y),
+    );
 }
 
 /// Apply an in-progress drag/resize. Returns whether anything changed.
 pub fn drag(overlay: &mut Overlay, m: MouseEvent, bounds: (u16, u16)) -> bool {
-    let MouseEventKind::Drag(MouseButton::Left) = m.kind else {
-        // Motion without a button still moves a drag if one is active (some
-        // terminals report plain motion during a grab).
-        if overlay.dragging && matches!(m.kind, MouseEventKind::Moved) {
-            let max_x = bounds.0.saturating_sub(overlay.rect.width);
-            let max_y = bounds.1.saturating_sub(overlay.rect.height);
-            let new_x = m.column.saturating_sub(overlay.drag_offset.0).min(max_x);
-            let new_y = m.row.saturating_sub(overlay.drag_offset.1).min(max_y);
-            overlay.rect.x = new_x;
-            overlay.rect.y = new_y;
-            return true;
-        }
-        return false;
-    };
+    let moved = matches!(
+        m.kind,
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved
+    );
 
-    if overlay.resizing {
-        let Some(direction) = overlay.resize_direction else {
-            return false;
-        };
+    if overlay.resizing && moved {
+        // Only the grabbed axis moves: an edge drag resizes that one dimension,
+        // a corner drag both. The anchors were fixed when the press began, so
+        // dragging past an edge keeps resizing the anchored dimension.
         let rect = overlay.rect;
-        let right = rect.right();
-        let bottom = rect.bottom();
+        let mut new_x = rect.x;
+        let mut new_y = rect.y;
+        let mut new_width = rect.width;
+        let mut new_height = rect.height;
 
-        let (new_x, new_y, new_width, new_height) = match direction {
-            ResizeDirection::TopLeft => {
-                let new_x = m.column.min(right.saturating_sub(MIN_WIDTH));
-                let new_y = m.row.min(bottom.saturating_sub(MIN_HEIGHT));
-                (
-                    new_x,
-                    new_y,
-                    right.saturating_sub(new_x).max(MIN_WIDTH),
-                    bottom.saturating_sub(new_y).max(MIN_HEIGHT),
-                )
+        if overlay.resize_anchored.left || overlay.resize_anchored.right {
+            if overlay.resize_anchored.right {
+                // The right edge is anchored: the width follows the pointer.
+                new_width = m.column.saturating_sub(rect.x).max(MIN_WIDTH);
+            } else {
+                // The left edge is anchored: it follows the pointer.
+                new_width = rect.right().saturating_sub(m.column).max(MIN_WIDTH);
+                new_x = m.column;
             }
-            ResizeDirection::TopRight => {
-                let new_y = m.row.min(bottom.saturating_sub(MIN_HEIGHT));
-                (
-                    rect.x,
-                    new_y,
-                    m.column.saturating_sub(rect.x).max(MIN_WIDTH),
-                    bottom.saturating_sub(new_y).max(MIN_HEIGHT),
-                )
-            }
-            ResizeDirection::BottomLeft => {
-                let new_x = m.column.min(right.saturating_sub(MIN_WIDTH));
-                (
-                    new_x,
-                    rect.y,
-                    right.saturating_sub(new_x).max(MIN_WIDTH),
-                    m.row.saturating_sub(rect.y).max(MIN_HEIGHT),
-                )
-            }
-            ResizeDirection::BottomRight => (
-                rect.x,
-                rect.y,
-                m.column.saturating_sub(rect.x).max(MIN_WIDTH),
-                m.row.saturating_sub(rect.y).max(MIN_HEIGHT),
-            ),
-        };
+        }
 
-        overlay.resize_to_corner(new_x, new_y, new_width, new_height, direction, bounds);
+        if overlay.resize_anchored.top || overlay.resize_anchored.bottom {
+            if overlay.resize_anchored.bottom {
+                // The bottom edge is anchored: the height follows the pointer.
+                new_height = m.row.saturating_add(1).saturating_sub(rect.y).max(MIN_HEIGHT);
+            } else {
+                // The top edge is anchored: it follows the pointer.
+                new_height = rect.bottom().saturating_sub(m.row).max(MIN_HEIGHT);
+                new_y = m.row;
+            }
+        }
+
+        overlay.resize_to(new_x, new_y, new_width, new_height, bounds);
         return true;
     }
 
-    if overlay.dragging {
+    if overlay.dragging && moved {
         let max_x = bounds.0.saturating_sub(overlay.rect.width);
         let max_y = bounds.1.saturating_sub(overlay.rect.height);
         overlay.rect.x = m.column.saturating_sub(overlay.drag_offset.0).min(max_x);
@@ -331,7 +284,7 @@ pub fn end(overlay: &mut Overlay) -> bool {
     let was_active = overlay.dragging || overlay.resizing;
     overlay.dragging = false;
     overlay.resizing = false;
-    overlay.resize_direction = None;
+    overlay.resize_anchored = ResizeEdges::default();
     was_active
 }
 
@@ -359,6 +312,15 @@ mod tests {
             column,
             row,
             modifiers: KeyModifiers::ALT,
+        }
+    }
+
+    fn ctrl_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::CONTROL,
         }
     }
 
@@ -447,6 +409,31 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_scroll_over_the_float_is_local_so_it_can_resize() {
+        let overlay = overlay();
+        let content = overlay.content_rect();
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: content.x,
+            row: content.y,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        assert_eq!(route(&overlay, event), MouseRoute::Local);
+    }
+
+    #[test]
+    fn ctrl_scroll_on_the_border_is_local() {
+        let overlay = overlay();
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: overlay.rect.x,
+            row: overlay.rect.y,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        assert_eq!(route(&overlay, event), MouseRoute::Local);
+    }
+
+    #[test]
     fn drags_inside_are_forwarded_when_no_local_drag_is_active() {
         let overlay = overlay();
         let content = overlay.content_rect();
@@ -468,23 +455,16 @@ mod tests {
     }
 
     #[test]
-    fn corners_are_detected_before_edges() {
-        let rect = Rect::new(2, 2, 10, 6);
-        assert_eq!(direction_for(rect, 2, 2), Some(ResizeDirection::TopLeft));
-        assert_eq!(direction_for(rect, 11, 2), Some(ResizeDirection::TopRight));
-        assert_eq!(direction_for(rect, 2, 7), Some(ResizeDirection::BottomLeft));
-        assert_eq!(direction_for(rect, 11, 7), Some(ResizeDirection::BottomRight));
-        // middle of the left edge, upper half
-        assert_eq!(direction_for(rect, 2, 3), Some(ResizeDirection::TopLeft));
-        // middle of the top edge, right half
-        assert_eq!(direction_for(rect, 9, 2), Some(ResizeDirection::TopRight));
-        // interior and exterior are not handles
-        assert_eq!(direction_for(rect, 5, 5), None);
-        assert_eq!(direction_for(rect, 0, 0), None);
+    fn motion_during_a_local_drag_stays_local_even_over_content() {
+        let mut overlay = overlay();
+        overlay.dragging = true;
+        let content = overlay.content_rect();
+        let moving = route(&overlay, mouse(MouseEventKind::Moved, content.x + 1, content.y + 1));
+        assert_eq!(moving, MouseRoute::Local);
     }
 
     #[test]
-    fn begin_starts_a_move_on_alt_and_a_resize_on_the_border() {
+    fn begin_starts_a_move_on_alt_and_a_resize_on_ctrl() {
         let mut moving = overlay();
         let content = moving.content_rect();
         let press = alt_mouse(MouseEventKind::Down(MouseButton::Left), content.x + 2, content.y + 2);
@@ -494,10 +474,18 @@ mod tests {
         let mut resized = overlay();
         let corner_x = resized.rect.right() - 1;
         let corner_y = resized.rect.bottom() - 1;
-        let press = mouse(MouseEventKind::Down(MouseButton::Left), corner_x, corner_y);
+        let press = ctrl_mouse(MouseEventKind::Down(MouseButton::Left), corner_x, corner_y);
         begin(&mut resized, press);
         assert!(resized.resizing);
-        assert_eq!(resized.resize_direction, Some(ResizeDirection::BottomRight));
+        assert!(resized.resize_anchored.right && resized.resize_anchored.bottom);
+        assert!(!resized.resize_anchored.left && !resized.resize_anchored.top);
+
+        // A plain press on the border moves the float now; only ctrl resizes.
+        let mut moved = overlay();
+        let press = mouse(MouseEventKind::Down(MouseButton::Left), moved.rect.x, moved.rect.y);
+        begin(&mut moved, press);
+        assert!(moved.dragging);
+        assert!(!moved.resizing);
 
         // A plain click inside starts nothing locally.
         let mut plain = overlay();
@@ -508,11 +496,69 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_border_drag_moves_the_float_instead_of_resizing() {
+        let mut overlay = overlay();
+        let before = overlay.rect;
+        let press_x = overlay.rect.right() - 1;
+        let press_y = overlay.rect.bottom() - 1;
+        begin(&mut overlay, mouse(MouseEventKind::Down(MouseButton::Left), press_x, press_y));
+        assert!(overlay.dragging);
+        assert!(!overlay.resizing);
+
+        let moved = drag(
+            &mut overlay,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                before.right() + 2,
+                before.bottom() + 1,
+            ),
+            (120, 60),
+        );
+        assert!(moved);
+        assert_eq!(overlay.rect.width, before.width);
+        assert_eq!(overlay.rect.height, before.height);
+        assert_ne!(overlay.rect, before);
+        assert!(!overlay.resizing);
+    }
+
+    #[test]
+    fn ctrl_drag_on_the_border_resizes_the_float() {
+        let mut overlay = overlay();
+        let before = overlay.rect;
+        let press_x = overlay.rect.right() - 1;
+        let press_y = overlay.rect.bottom() - 1;
+        begin(
+            &mut overlay,
+            ctrl_mouse(MouseEventKind::Down(MouseButton::Left), press_x, press_y),
+        );
+        assert!(overlay.resizing);
+        assert!(overlay.resize_anchored.right && overlay.resize_anchored.bottom);
+
+        let resized = drag(
+            &mut overlay,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                before.right() + 4,
+                before.bottom() + 2,
+            ),
+            (120, 60),
+        );
+        assert!(resized);
+        assert!(overlay.rect.width > before.width);
+        assert!(overlay.rect.height > before.height);
+    }
+
+    #[test]
     fn dragging_the_bottom_right_corner_grows_the_float() {
         let mut overlay = overlay();
         let before = overlay.rect;
         overlay.resizing = true;
-        overlay.resize_direction = Some(ResizeDirection::BottomRight);
+        overlay.resize_anchored = ResizeEdges {
+            left: false,
+            right: true,
+            top: false,
+            bottom: true,
+        };
         drag(
             &mut overlay,
             mouse(
@@ -525,6 +571,50 @@ mod tests {
         assert!(overlay.rect.width > before.width);
         assert!(overlay.rect.height > before.height);
         assert_eq!(overlay.rect.x, before.x);
+    }
+
+    #[test]
+    fn dragging_the_bottom_edge_only_resizes_vertically() {
+        let mut overlay = overlay();
+        overlay.resizing = true;
+        overlay.resize_anchored = ResizeEdges {
+            left: false,
+            right: false,
+            top: false,
+            bottom: true,
+        };
+        let before = overlay.rect;
+        let resized = drag(
+            &mut overlay,
+            mouse(MouseEventKind::Drag(MouseButton::Left), before.right(), before.bottom() + 2),
+            (120, 60),
+        );
+        assert!(resized);
+        // Only the height follows the pointer; the width is untouched.
+        assert_eq!(overlay.rect.width, before.width);
+        assert!(overlay.rect.height > before.height);
+    }
+
+    #[test]
+    fn dragging_the_left_edge_only_resizes_horizontally() {
+        let mut overlay = overlay();
+        overlay.resizing = true;
+        overlay.resize_anchored = ResizeEdges {
+            left: true,
+            right: false,
+            top: false,
+            bottom: false,
+        };
+        let before = overlay.rect;
+        let resized = drag(
+            &mut overlay,
+            mouse(MouseEventKind::Drag(MouseButton::Left), before.x - 2, before.bottom() - 1),
+            (120, 60),
+        );
+        assert!(resized);
+        // Only the width follows the pointer; the height is untouched.
+        assert_eq!(overlay.rect.height, before.height);
+        assert!(overlay.rect.width > before.width);
     }
 
     #[test]

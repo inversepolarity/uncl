@@ -2,7 +2,7 @@ use crate::app::images::Store;
 use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::signal::Signal;
 use crate::app::term::callbacks::ReplySink;
-use crate::constants::{MIN_HEIGHT, MIN_WIDTH, PIN_WIDTH, ResizeDirection, content_rect, nz};
+use crate::constants::{MIN_HEIGHT, MIN_WIDTH, PIN_WIDTH, ResizeEdges, content_rect, nz};
 use crate::geometry::Rect;
 
 use anyhow::Result;
@@ -23,7 +23,9 @@ pub struct Overlay {
     pub dragging: bool,
     pub drag_offset: (u16, u16),
     pub resizing: bool,
-    pub resize_direction: Option<ResizeDirection>,
+    /// Which edges of the float a resize gesture grabbed; an edge press anchors
+    /// one axis, a corner press both.
+    pub resize_anchored: ResizeEdges,
     pub size: Size,
     pub is_dead: bool,
     /// A gesture started inside the child's grid: it owns the pointer until the
@@ -42,7 +44,7 @@ impl Overlay {
             dragging: false,
             drag_offset: (0, 0),
             resizing: false,
-            resize_direction: None,
+            resize_anchored: ResizeEdges::default(),
             size: Size {
                 cols: rect.width,
                 rows: rect.height,
@@ -152,36 +154,6 @@ impl Overlay {
         self.rect.height = height;
         self.size.cols = width;
         self.size.rows = height;
-    }
-
-    /// Keep a resize anchored at the opposite corner: `resize_to` clamps the
-    /// origin to keep the rect on screen, which is wrong when the caller is
-    /// dragging the top-left corner *outwards*.
-    pub fn resize_to_corner(
-        &mut self,
-        x: u16,
-        y: u16,
-        width: u16,
-        height: u16,
-        direction: ResizeDirection,
-        bounds: (u16, u16),
-    ) {
-        let max_width = bounds.0.max(1);
-        let max_height = bounds.1.max(1);
-        let width = width.clamp(MIN_WIDTH.min(max_width), max_width);
-        let height = height.clamp(MIN_HEIGHT.min(max_height), max_height);
-
-        let (x, y) = match direction {
-            ResizeDirection::TopLeft => (
-                x.min(bounds.0.saturating_sub(width)),
-                y.min(bounds.1.saturating_sub(height)),
-            ),
-            ResizeDirection::TopRight => (x, y.min(bounds.1.saturating_sub(height))),
-            ResizeDirection::BottomLeft => (x.min(bounds.0.saturating_sub(width)), y),
-            ResizeDirection::BottomRight => (x, y),
-        };
-
-        self.resize_to(x, y, width, height, bounds);
     }
 
     /// Keep the float inside a terminal that just changed size.
@@ -356,20 +328,6 @@ mod tests {
         overlay.resize_to(before.x, before.y, before.width + 5, 2, (200, 60));
         assert_eq!(overlay.rect.width, before.width + 5);
         assert_eq!(overlay.rect.height, MIN_HEIGHT);
-    }
-
-    #[test]
-    fn corner_resize_keeps_the_anchor_corner_in_place() {
-        let mut overlay = overlay();
-        let anchor_right = overlay.rect.right();
-        let anchor_bottom = overlay.rect.bottom();
-        let (x, y) = (overlay.rect.x + 4, overlay.rect.y + 2);
-        let (width, height) = (overlay.rect.width - 4, overlay.rect.height - 2);
-        // Bounds are generous so the clamp cannot move the anchor; that is what
-        // resize_to_corner exists for.
-        overlay.resize_to_corner(x, y, width, height, ResizeDirection::TopLeft, (200, 80));
-        assert_eq!(overlay.rect.right(), anchor_right);
-        assert_eq!(overlay.rect.bottom(), anchor_bottom);
     }
 
     #[test]
